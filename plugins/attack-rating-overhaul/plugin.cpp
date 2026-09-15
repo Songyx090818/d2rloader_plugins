@@ -16,7 +16,7 @@
 //   Shared by every attacker and defender. Player attackers: AR = 3483C0
 //   (tohit + 5*dex - 35 + charstats ToHitFactor), 4503C0 applies stats
 //   115/116/123/124, then the AR% bucket (skill ToHit, mastery, stat 119 and
-//   the stat 179 per-monster-type loop at 44BB94). Monster attackers:
+//   the stat 179 per-monster-type bonus at 44BBC4). Monster attackers:
 //   skillAr + tohit + 5*dex, times stat 119.
 //
 //     44BD0E  lea eax,[rdx+rbp]         AR
@@ -94,8 +94,42 @@
 //   (+0), class (+4), MonsterData (+10h, null-checked) and data-table
 //   context (+1BDh), through 38E870, 3AEFF0, 3AF240, 3AF190 and 3AF2C0. A
 //   zeroed stand-in with type 1, the screen's class and the player's context
-//   byte is therefore a plain monster of that class. The stat 179 loop is
-//   44BB94..44BC08 replayed: layer matched against monstats +50h by 449FB0.
+//   byte is therefore a plain monster of that class. Checked again against
+//   D2RLoader 1.3.0: the five callees still read nothing else of the
+//   defender, and the attacker stats go through the loader's stat reader.
+//
+//   The stat 179 bonus is taken from the same place the hit roll takes it.
+//   D2RLoader 1.3.0 replaced the vanilla layer loop (2F84B0 + 449FB0) with
+//   one call into D2RCore; the old loop after it is dead code:
+//
+//     44BBA8  movsx eax,word [rax+50h]    monstats MonType
+//     44BBAF  jle   44BC0A                no bonus when MonType <= 0
+//     44BBB1  mov   r9d,eax               MonType
+//     44BBB4  movzx ecx,byte [rsi+1BDh]   attacker data-table context
+//     44BBBB  mov   rdx,rsi               attacker
+//     44BBBE  mov   r8d,0B3h              stat 179
+//     44BBC4  call  [rip+disp32]          D2RCore!ReadWideMonsterTypeBonus
+//     44BBCA  add   edi,eax               into the AR% bucket
+//     44BBCC  jmp   loader trampoline     which jumps back to 44BC0A
+//
+//   disp32 and the trampoline rel32 belong to the loader and move between
+//   loader builds, so the witness skips them. In the dumped 1.3.0 process
+//   the slot that call reads holds D2RCore!ReadWideMonsterTypeBonus.
+//
+//   The plugin does not read that slot. At plugin load Windows does not
+//   report it as part of the game image's mapping (1.1.1 refused with exactly
+//   that, D2RLoader log 2026-09-15), so its memory state at load is not
+//   something to rely on. The plugin calls the same export directly instead:
+//   it resolves ReadWideMonsterTypeBonus from D2RCore.dll by name, follows
+//   the export's jmp to the implementation, and checks the implementation's
+//   entry byte for byte before the character screen part is armed. That
+//   entry proves the four argument registers the hit roll loads:
+//
+//     push r15 / r14 / r13 / r12 / rsi / rdi / rbx, sub rsp,20h
+//     mov  esi,r9d         MonType, 32 bits
+//     mov  ebx,ecx         data-table context, 32 bits
+//     test rdx,rdx         unit
+//     cmp  r8d,8000h       stat id, 32 bits
 //
 //   AR = slotAr * (B + flat) / B + (B + flat) * p179 / 100 with B = 3483C0,
 //   which drops the doubled ToHitFactor and adds what the roll adds.
@@ -254,9 +288,20 @@ constexpr std::uint64_t GetUnitStatRva            = 0x2F5020;  // 1514997
 constexpr std::uint64_t PlayerBaseAttackRatingRva = 0x3483C0;  // 44BB13
 constexpr std::uint64_t ApplyTargetModifiersRva   = 0x4503C0;  // 44BB2C
 constexpr std::uint64_t GetMonStatsRecordRva      = 0x0976E0;  // 44BB9E, 15147CB
-constexpr std::uint64_t GetLayeredStatsRva        = 0x2F84B0;  // 44BBC6
-constexpr std::uint64_t MonTypeMatchesRva         = 0x449FB0;  // 44BBF5
 constexpr std::uint64_t GetDataTablesRva          = 0x300A90;  // 15148CD, 0977A2
+
+// The stat 179 bonus the hit roll calls at 44BBC4 (witnessed by the helper
+// window at 44BB13), resolved from D2RCore.dll by name.
+constexpr wchar_t      CoreModuleName[]         = L"D2RCore.dll";
+constexpr char         MonsterTypeBonusExport[] = "ReadWideMonsterTypeBonus";
+constexpr std::uint8_t JmpRel32Opcode           = 0xE9;
+
+// Entry of D2RCore's ReadWideMonsterTypeBonus implementation, 33 bytes.
+constexpr std::uint8_t MonsterTypeBonusEntry[]{
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x53,
+    0x48, 0x83, 0xEC, 0x20, 0x44, 0x89, 0xCE, 0x89, 0xCB, 0x48, 0x85,
+    0xD2, 0x0F, 0x94, 0xC0, 0x41, 0x81, 0xF8, 0x00, 0x80, 0x00, 0x00,
+};
 
 constexpr std::size_t   UnitTypeOffset        = 0x000;
 constexpr std::size_t   UnitClassOffset       = 0x004;
@@ -273,17 +318,16 @@ constexpr std::size_t CharStatsToHitFactorOffset = 0x38;
 
 constexpr std::int32_t  StatLevel                 = 12;
 constexpr std::uint32_t StatAttackRatingVsMonType = 179;
-constexpr std::uint32_t LayeredStatCapacity       = 128;
-constexpr std::size_t   LayeredStatEntryBytes     = 8;
 
-using GetUnitStatFn = std::int32_t (*)(void* unit, std::int32_t statId, std::uint16_t layer);
+// D2RCore's stat reader builds its lookup key from the full 32-bit layer register.
+using GetUnitStatFn = std::int32_t (*)(void* unit, std::int32_t statId, std::uint32_t layer);
 using PlayerBaseAttackRatingFn = std::int32_t (*)(void* player);
 using ApplyTargetModifiersFn =
     void (*)(void* attacker, void* defender, std::int32_t* attackRating, std::int32_t* defense);
 using GetMonStatsRecordFn = void* (*)(std::uint8_t context, std::int32_t monsterClass);
-using GetLayeredStatsFn =
-    std::int32_t (*)(void* unit, std::uint32_t statId, void* entries, std::uint32_t capacity);
-using MonTypeMatchesFn = std::uint32_t (*)(std::uint8_t context, std::int32_t layer, std::int32_t monType);
+// The context goes in as the full zero-extended ecx the hit roll loads.
+using ReadMonsterTypeBonusFn = std::int32_t (*)(std::uint32_t context, void* unit,
+    std::uint32_t statId, std::int32_t monType);
 using GetDataTablesFn = void* (*)(std::uint8_t context);
 
 // ---------------------------------------------------------------------------
@@ -302,8 +346,10 @@ constexpr std::uint8_t CombatSiteWindow[95]{
     0x0F, 0x4C, 0xF9, 0x48, 0x8B, 0xCE, 0xE8, 0x73, 0xE4, 0xEF, 0xFF,
 };
 
-// RVA 0x44BB13, 247 bytes. Player AR, 4503C0 and the stat 179 loop (proves the natives).
-constexpr std::uint8_t CombatHelpersWindow[247]{
+// RVA 0x44BB13, 190 bytes. Player AR, 4503C0, mastery, stat 119, the monstats
+// MonType and the D2RCore stat 179 call (proves the natives). Ends on the loader's
+// jump back; the dead vanilla loop after it is not checked.
+constexpr std::uint8_t CombatHelpersWindow[190]{
     0xE8, 0xA8, 0xC8, 0xEF, 0xFF, 0x4C, 0x8D, 0x4C, 0x24, 0x30, 0x89, 0x44,
     0x24, 0x34, 0x4C, 0x8D, 0x44, 0x24, 0x34, 0x49, 0x8B, 0xD6, 0x48, 0x8B,
     0xCE, 0xE8, 0x8F, 0x48, 0x00, 0x00, 0x85, 0xED, 0x75, 0x20, 0x48, 0x8B,
@@ -317,14 +363,9 @@ constexpr std::uint8_t CombatHelpersWindow[247]{
     0xD1, 0xDC, 0xEF, 0xFF, 0x49, 0x8B, 0xCE, 0x8B, 0xD8, 0xE8, 0x47, 0xE5,
     0xEF, 0xFF, 0x8B, 0xD3, 0x0F, 0xB6, 0xC8, 0xE8, 0x3D, 0xBB, 0xC4, 0xFF,
     0x48, 0x85, 0xC0, 0x74, 0x62, 0x0F, 0xBF, 0x40, 0x50, 0x66, 0x85, 0xC0,
-    0x7E, 0x59, 0x41, 0xB9, 0x80, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x44, 0x24,
-    0x70, 0x48, 0x8B, 0xCE, 0x44, 0x8B, 0xE0, 0x41, 0x8D, 0x51, 0x33, 0xE8,
-    0xE5, 0xC8, 0xEA, 0xFF, 0x4C, 0x63, 0xF8, 0x85, 0xC0, 0x7E, 0x38, 0x33,
-    0xED, 0x0F, 0x1F, 0x40, 0x00, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x0F, 0xB7, 0x5C, 0xEC, 0x70, 0x48, 0x8B, 0xCE, 0xE8, 0xF3, 0xE4,
-    0xEF, 0xFF, 0x45, 0x8B, 0xC4, 0x8B, 0xD3, 0x0F, 0xB6, 0xC8, 0xE8, 0xB6,
-    0xE3, 0xFF, 0xFF, 0x85, 0xC0, 0x74, 0x04, 0x03, 0x7C, 0xEC, 0x74, 0x48,
-    0xFF, 0xC5, 0x49, 0x3B, 0xEF, 0x7C, 0xD6,
+    0x7E, 0x59, 0x44, 0x8B, 0xC8, 0x0F, 0xB6, 0x8E, 0xBD, 0x01, 0x00, 0x00,
+    0x48, 0x8B, 0xD6, 0x41, 0xB8, 0xB3, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x3E,
+    0xE5, 0x9D, 0x03, 0x03, 0xF8, 0xE9, 0x4F, 0x19, 0x9E, 0x03,
 };
 
 // RVA 0x1514700, 701 bytes. Average chance to hit calculator up to its clamp.
@@ -544,6 +585,9 @@ struct Window {
 // Fields other patches may already own: the combat clamp immediates and the
 // Character Screen clamp fields rewritten by Hit Chance Bounds.
 constexpr Skip CombatSiteSkips[]{ { 0x37, 4 }, { 0x49, 4 } };
+// The loader-owned rel32s: the import slot displacement at 44BBC6 and the
+// trampoline jump at 44BBCD.
+constexpr Skip CombatHelpersSkips[]{ { 0xB3, 4 }, { 0xBA, 4 } };
 constexpr Skip ChanceToHitFormatSkips[]{ { 0x1A, 1 }, { 0x68, 1 }, { 0x6C, 4 }, { 0x73, 4 } };
 constexpr Skip ChanceToBeHitFormatSkips[]{ { 0x1F, 1 }, { 0x23, 4 }, { 0x2A, 4 } };
 
@@ -558,7 +602,7 @@ constexpr std::array<Witness, 7> Witnesses{{
     { Part::Combat, { "combat hit roll", 0x44BD0E, CombatSiteWindow,
         sizeof(CombatSiteWindow), CombatSiteSkips, 2 } },
     { Part::CharacterScreen, { "attack rating helper calls", 0x44BB13, CombatHelpersWindow,
-        sizeof(CombatHelpersWindow), nullptr, 0 } },
+        sizeof(CombatHelpersWindow), CombatHelpersSkips, 2 } },
     { Part::CharacterScreen, { "chance to hit calculator", 0x1514700, ChanceToHitWindow,
         sizeof(ChanceToHitWindow), nullptr, 0 } },
     { Part::CharacterScreen, { "chance to hit epilogue", 0x15149D6, ChanceToHitTailWindow,
@@ -777,8 +821,7 @@ GetUnitStatFn            GetUnitStat{};
 PlayerBaseAttackRatingFn PlayerBaseAttackRating{};
 ApplyTargetModifiersFn   ApplyTargetModifiers{};
 GetMonStatsRecordFn      GetMonStatsRecord{};
-GetLayeredStatsFn        GetLayeredStats{};
-MonTypeMatchesFn         MonTypeMatches{};
+ReadMonsterTypeBonusFn   ReadMonsterTypeBonus{};
 GetDataTablesFn          GetDataTables{};
 
 template <typename T>
@@ -982,21 +1025,9 @@ auto MonsterTypeAttackRatingPercent(void* player, std::int32_t monsterClass) noe
     const auto monType = ReadAt<std::int16_t>(record, MonStatsMonTypeOffset);
     if (monType <= 0) return 0;
 
-    std::array<std::uint8_t, LayeredStatCapacity * LayeredStatEntryBytes> entries{};
-    const std::int32_t count = GetLayeredStats(player, StatAttackRatingVsMonType,
-        entries.data(), LayeredStatCapacity);
-    const std::int32_t bounded = std::clamp<std::int32_t>(count, 0,
-        static_cast<std::int32_t>(LayeredStatCapacity));
-
-    std::int64_t total = 0;
-    for (std::int32_t i = 0; i < bounded; ++i) {
-        const std::size_t entry = static_cast<std::size_t>(i) * LayeredStatEntryBytes;
-        const auto layer = ReadAt<std::uint16_t>(entries.data(), entry);
-        if (MonTypeMatches(context, layer, monType) != 0) {
-            total += ReadAt<std::int32_t>(entries.data(), entry + 4);
-        }
-    }
-    return total;
+    if (!ReadMonsterTypeBonus) return 0;
+    return ReadMonsterTypeBonus(static_cast<std::uint32_t>(context), player,
+        StatAttackRatingVsMonType, static_cast<std::int32_t>(monType));
 }
 
 void ApplyServerInputs(void* player, std::int32_t monsterClass, std::int32_t slotAttackRating,
@@ -1117,6 +1148,49 @@ auto WindowMatches(const Window& window) noexcept -> bool {
     return std::memcmp(live + cursor, window.bytes + cursor, window.size - cursor) == 0;
 }
 
+// True when [address, address + size) is committed executable memory of the
+// module whose base is moduleBase.
+auto IsModuleCode(const std::uint8_t* address, std::size_t size, HMODULE moduleBase) noexcept
+        -> bool {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info)) return false;
+    if (info.State != MEM_COMMIT || info.AllocationBase != moduleBase) return false;
+    const auto regionEnd = static_cast<const std::uint8_t*>(info.BaseAddress) + info.RegionSize;
+    if (address + size > regionEnd) return false;
+    const DWORD executable = PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE
+        | PAGE_EXECUTE_WRITECOPY;
+    return (info.Protect & executable) != 0 && (info.Protect & PAGE_GUARD) == 0;
+}
+
+// Resolves D2RCore!ReadWideMonsterTypeBonus by name and checks its entry.
+auto ResolveMonsterTypeBonus() noexcept -> bool {
+    const HMODULE core = GetModuleHandleW(CoreModuleName);
+    if (!core) {
+        Context->LogError("AttackRating: D2RCore.dll is not loaded. Refusing to load.");
+        return false;
+    }
+    auto* function = reinterpret_cast<const std::uint8_t*>(
+        GetProcAddress(core, MonsterTypeBonusExport));
+    if (!function || !IsModuleCode(function, 5, core)) {
+        Context->LogError(
+            "AttackRating: D2RCore.dll does not export ReadWideMonsterTypeBonus. "
+            "Refusing to load.");
+        return false;
+    }
+    if (function[0] == JmpRel32Opcode) {
+        function += 5 + ReadAt<std::int32_t>(function, 1);
+    }
+    if (!IsModuleCode(function, sizeof(MonsterTypeBonusEntry), core)
+            || std::memcmp(function, MonsterTypeBonusEntry, sizeof(MonsterTypeBonusEntry)) != 0) {
+        Context->LogError(
+            "AttackRating: D2RCore's ReadWideMonsterTypeBonus no longer takes the verified "
+            "arguments. Refusing to load.");
+        return false;
+    }
+    ReadMonsterTypeBonus = reinterpret_cast<ReadMonsterTypeBonusFn>(function);
+    return true;
+}
+
 auto VerifyNativeContract() noexcept -> bool {
     for (const auto& witness : Witnesses) {
         if (!PartEnabled(witness.part) || WindowMatches(witness.window)) continue;
@@ -1128,6 +1202,7 @@ auto VerifyNativeContract() noexcept -> bool {
         Context->LogError(message);
         return false;
     }
+    if (Settings.characterScreen && !ResolveMonsterTypeBonus()) return false;
     if (Settings.characterScreen) {
         const std::uint8_t jump = Base[Fields[0].rva];
         if (jump != JneOpcode && jump != JmpShortOpcode) {
@@ -1348,8 +1423,6 @@ void ResolveNatives() noexcept {
     PlayerBaseAttackRating = reinterpret_cast<PlayerBaseAttackRatingFn>(at(PlayerBaseAttackRatingRva));
     ApplyTargetModifiers   = reinterpret_cast<ApplyTargetModifiersFn>(at(ApplyTargetModifiersRva));
     GetMonStatsRecord      = reinterpret_cast<GetMonStatsRecordFn>(at(GetMonStatsRecordRva));
-    GetLayeredStats        = reinterpret_cast<GetLayeredStatsFn>(at(GetLayeredStatsRva));
-    MonTypeMatches         = reinterpret_cast<MonTypeMatchesFn>(at(MonTypeMatchesRva));
     GetDataTables          = reinterpret_cast<GetDataTablesFn>(at(GetDataTablesRva));
 }
 
@@ -1456,7 +1529,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.attack-rating",
     .name = "Attack Rating",
-    .version = "1.1.0",
+    .version = "1.1.3",
     .author = "CelestialRayOne",
     .description =
         "Configurable attack rating hit-chance curve and hit chance limits, applied to the "

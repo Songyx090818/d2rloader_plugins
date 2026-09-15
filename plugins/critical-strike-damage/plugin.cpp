@@ -47,7 +47,28 @@
 // volatile register, the flags and xmm0-5, scales [rdi+0x18], then reproduces
 // the original "mov eax,0x2000 / or word [rdi+4],ax" pair verbatim so RAX and
 // EFLAGS on exit are bit-identical to vanilla. With the stat at 0 the result
-// is exactly the vanilla x2.
+// is exactly the vanilla x2. The scale is computed in 64 bits and saturated
+// to the int32 range, so this block needs no separate overflow fix.
+//
+// D2RLoader 1.3.0 (re-checked against its D2RLoader.exe image and D2RCore.dll):
+//
+//   The critical sequence above is unchanged. Its three readers now run the
+//   loader's wide stat store: 0x33D4F0 (weapon mastery) jumps to
+//   D2RCore!ReadWideWeaponMastery, 0x2F5020 to ReadWideUnitStat and 0x2F5C60
+//   to ReadWideItemEventStat, and all three paths still converge on 0x44C3C8.
+//   Both builders, both doubling blocks, both reader call sites and the owner
+//   resolver match byte for byte.
+//
+//   0x2F5020's first two instructions are replaced by an import thunk
+//   (jmp [rip+disp32] and four nops); the rest of the old body is still in
+//   place. The check pins the thunk shape and that remainder, not disp32,
+//   which locates the loader's import slot and moves between loader builds.
+//
+//   ReadWideUnitStat and ReadWideItemEventStat share one reader that takes
+//   the stat id and the layer as full 32-bit registers (key = stat << 32 |
+//   r8d) and rejects stat ids from 0x8000 up. The vanilla getter only used
+//   r8w. The native call sites pass xor r8d,r8d, so the probes forward the
+//   layer as 32 bits too, and stat_id accepts the 1.3.0 range 0..32767.
 
 #include <D2RLPlugin/api.h>
 
@@ -98,6 +119,10 @@ constexpr std::uint32_t CriticalDoubleSize      = 17;
 constexpr std::int32_t PassiveCriticalStrikeStatId = 337;
 constexpr std::int32_t DeadlyStrikeStatId          = 141;
 
+// D2RLoader 1.3.0 ItemStatCost holds 32,768 rows; its stat reader returns 0
+// for any id from 0x8000 up.
+constexpr std::int64_t MaximumStatId = 32'767;
+
 constexpr std::size_t MaximumConfigBytes = 32'768;
 constexpr std::size_t RelayBytes         = 4'096;
 
@@ -128,12 +153,26 @@ constexpr auto DeadlyStrikeReadExpected = std::to_array<std::uint8_t>({
     0xE8, 0xDC, 0x98, 0xEA, 0xFF,
 });
 
-// 0x2F5020 entry, 32 bytes. (unit in rcx, statId in edx, layer in r8w)
-constexpr auto GetUnitStatExpected = std::to_array<std::uint8_t>({
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C,
-    0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57,
-    0x48, 0x83, 0xEC, 0x20, 0x41, 0x0F, 0xB7, 0xE8,
-    0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9,
+// 0x2F5020 entry (unit in rcx, statId in edx, layer in r8d). In D2RLoader
+// 1.3.0 a thunk to D2RCore!ReadWideUnitStat:
+//   2F5020  FF 25 xx xx xx xx   jmp   [rip+disp32]
+//   2F5026  90 90 90 90         nop x4
+//   2F502A  48 89 74 24 20 ...  the untouched remainder of the old body
+constexpr std::uintptr_t GetUnitStatThunkNopsRva = GetUnitStatRva + 6;
+constexpr std::uintptr_t GetUnitStatBodyRva      = GetUnitStatRva + 10;
+
+constexpr auto GetUnitStatThunkJump = std::to_array<std::uint8_t>({ 0xFF, 0x25 });
+
+constexpr auto GetUnitStatThunkNops = std::to_array<std::uint8_t>({
+    0x90, 0x90, 0x90, 0x90,
+});
+
+// mov [rsp+20h],rsi / push rdi / sub rsp,20h / movzx ebp,r8w / mov edi,edx /
+// mov rbx,rcx / test rcx,rcx
+constexpr auto GetUnitStatBody = std::to_array<std::uint8_t>({
+    0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83,
+    0xEC, 0x20, 0x41, 0x0F, 0xB7, 0xE8, 0x8B, 0xFA,
+    0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9,
 });
 
 // 0x465420 entry, 32 bytes. MISSMODE_FillDamageParams.
@@ -155,8 +194,10 @@ constexpr auto GetUnitOwnerExpected = std::to_array<std::uint8_t>({
 
 using FillDamageValuesFn = void(__fastcall*)(
     void*, void*, void*, void*, std::int32_t, std::uint8_t) noexcept;
+// The layer is a full 32-bit argument: D2RCore's reader builds its lookup key
+// from r8d.
 using GetUnitStatFn = std::int32_t(__fastcall*)(
-    void*, std::int32_t, std::uint16_t) noexcept;
+    void*, std::int32_t, std::uint32_t) noexcept;
 using MissileFillDamageFn = void(__fastcall*)(
     void*, void*, void*, void*, void*) noexcept;
 using GetUnitOwnerFn = void*(__fastcall*)(void*, void*) noexcept;
@@ -311,7 +352,7 @@ void ApplyConfigLine(std::string_view key, std::string_view value) noexcept {
     if (key == "enabled") {
         ParseBool(value, Settings.enabled);
     } else if (key == "stat_id") {
-        if (ParseInteger(value, number) && number >= 0 && number <= 510) {
+        if (ParseInteger(value, number) && number >= 0 && number <= MaximumStatId) {
             Settings.statId = static_cast<std::int32_t>(number);
         }
     } else if (key == "base_percent") {
@@ -493,7 +534,7 @@ void __fastcall MissileFillDamageDetour(
 }
 
 std::int32_t __fastcall PassiveCriticalReadProbe(
-        void* unit, std::int32_t statId, std::uint16_t layer) noexcept {
+        void* unit, std::int32_t statId, std::uint32_t layer) noexcept {
     Pending.source = CriticalSource::PassiveCritical;
     return GetUnitStat(unit, statId, layer);
 }
@@ -501,7 +542,7 @@ std::int32_t __fastcall PassiveCriticalReadProbe(
 GetUnitStatFn OriginalUnitGetStatValue{};
 
 std::int32_t __fastcall DeadlyStrikeReadProbe(
-        void* unit, std::int32_t statId, std::uint16_t layer) noexcept {
+        void* unit, std::int32_t statId, std::uint32_t layer) noexcept {
     Pending.source = CriticalSource::DeadlyStrike;
     return OriginalUnitGetStatValue(unit, statId, layer);
 }
@@ -621,20 +662,61 @@ auto BuildCriticalRelay(std::uint8_t* out, const void* callback,
 // Verification and installation
 // ---------------------------------------------------------------------------
 
+// Asks D2RLoader's diagnostics service which plugin, if any, already changed
+// a range that failed its check. Empty when the loader does not track it.
+void DescribeOwner(std::uintptr_t rva, const std::uint8_t* expected,
+        std::uint32_t expectedSize, char* out, std::size_t outSize) noexcept {
+    out[0] = '\0';
+    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
+    if (Context->QueryService(D2RL::ServiceId::Diagnostics,
+            D2RL::DiagnosticsServiceV1Version, &diagnostics)
+                != D2RL::ServiceQueryResult::Success
+            || !D2RL::HasDiagnosticsServiceV1Field(diagnostics,
+                D2RL::DiagnosticsServiceV1RequiredSize)
+            || diagnostics->queryHookStatus == nullptr) {
+        return;
+    }
+    D2RL::Diagnostics::HookQuery query{};
+    query.structSize   = D2RL::Diagnostics::HookQuerySize;
+    query.rva          = rva;
+    query.expected     = expected;
+    query.expectedSize = expectedSize;
+    D2RL::Diagnostics::HookStatus status{};
+    status.structSize = D2RL::Diagnostics::HookStatusSize;
+    if (diagnostics->queryHookStatus(Context, &query, &status)
+            != D2RL::Diagnostics::Result::Success
+            || status.state != D2RL::Diagnostics::ModificationState::Tracked) {
+        return;
+    }
+    status.ownerPluginId[sizeof(status.ownerPluginId) - 1] = '\0';
+    if (status.ownerPluginId[0] != '\0') {
+        std::snprintf(out, outSize, " It is patched by %s.", status.ownerPluginId);
+    } else {
+        std::snprintf(out, outSize, " It is patched by %u plugins.", status.ownerCount);
+    }
+}
+
+auto VerifyBytes(std::uintptr_t rva, const std::uint8_t* expected,
+        std::uint32_t expectedSize, const char* label) noexcept -> bool {
+    if (Context->CheckExpectedBytes(rva, expected, expectedSize)) {
+        return true;
+    }
+    char owner[112];
+    DescribeOwner(rva, expected, expectedSize, owner, sizeof(owner));
+    char message[320];
+    std::snprintf(message, sizeof(message),
+        "CriticalStrikeDamage: %s at 0x%llX does not match the D2RLoader 1.3.0 "
+        "image, or is already owned by another plugin.%s Refusing to load.",
+        label, static_cast<unsigned long long>(rva), owner);
+    Context->LogError(message);
+    return false;
+}
+
 template <std::size_t Size>
 auto Verify(std::uintptr_t rva, const std::array<std::uint8_t, Size>& expected,
         const char* label) noexcept -> bool {
-    if (Context->CheckExpectedBytes(rva, expected.data(),
-            static_cast<std::uint32_t>(expected.size()))) {
-        return true;
-    }
-    char message[192];
-    std::snprintf(message, sizeof(message),
-        "CriticalStrikeDamage: %s at 0x%llX does not match build 92777, or is "
-        "already owned by another plugin. Refusing to load.",
-        label, static_cast<unsigned long long>(rva));
-    Context->LogError(message);
-    return false;
+    return VerifyBytes(rva, expected.data(),
+        static_cast<std::uint32_t>(expected.size()), label);
 }
 
 auto VerifyNativeContract() noexcept -> bool {
@@ -645,7 +727,10 @@ auto VerifyNativeContract() noexcept -> bool {
                    "passive critical strike read")
         || !Verify(DeadlyStrikeReadRva, DeadlyStrikeReadExpected,
                    "deadly strike read")
-        || !Verify(GetUnitStatRva, GetUnitStatExpected, "unit stat getter")) {
+        || !Verify(GetUnitStatRva, GetUnitStatThunkJump, "unit stat getter thunk")
+        || !Verify(GetUnitStatThunkNopsRva, GetUnitStatThunkNops,
+                   "unit stat getter thunk padding")
+        || !Verify(GetUnitStatBodyRva, GetUnitStatBody, "unit stat getter body")) {
         return false;
     }
     if (Settings.applyToMissiles
@@ -829,7 +914,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.critical-strike-damage",
     .name = "Critical Strike Damage",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description =
         "Adds a configurable stat that increases the damage multiplier of "

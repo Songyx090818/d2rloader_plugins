@@ -15,11 +15,34 @@
 // ---------------------------------------------------------------------------
 //   STATLIST_GetUnitStat @ 0x2F5020, int32 (unit, statId, layer).
 //
-//     2F5020  48 89 5C 24 10      mov   [rsp+10h], rbx
+//   D2RLoader 1.3.0 widened the stat store and forwards this entry to
+//   D2RCore's ReadWideUnitStat. Its first two instructions (10 bytes) are
+//   replaced by an import thunk; the rest of the old body is still in place,
+//   unreachable:
+//
+//     2F5020  FF 25 xx xx xx xx   jmp   [rip+disp32]   ; D2RCore!ReadWideUnitStat
+//     2F5026  90 90 90 90         nop x4
+//     2F502A  48 89 74 24 20      mov   [rsp+20h], rsi ; old body from here on
 //     ...
 //     2F5034  41 0F B7 E8         movzx ebp, r8w       ; layer, 16 bits
 //     2F5038  8B FA               mov   edi, edx       ; stat id, raw
 //     2F503A  48 8B D9            mov   rbx, rcx       ; unit
+//
+//   A jump through a pointer changes no register and no stack slot, so
+//   ReadWideUnitStat receives exactly what the caller passed. The game's own
+//   callers, the five sites below included, still call 0x2F5020 with this
+//   ABI, and the relays call the same entry. Capped and uncapped reads both
+//   run the loader's implementation.
+//
+//   disp32 locates the loader's import slot for ReadWideUnitStat. That slot
+//   belongs to the loader and moves between loader builds, and this plugin
+//   never reads it, so the check does not pin it. It pins the thunk shape and
+//   the untouched remainder of the old body, which identifies the function.
+//
+//   ReadWideUnitStat builds its lookup key from the full 32-bit r8d (key =
+//   stat << 32 | r8d), where the vanilla getter only used r8w. Every call site
+//   below passes xor r8d,r8d, and the relayed reads forward the layer as 32
+//   bits, so no stale upper half can reach the loader.
 //
 //   2.4 passed a packed key (statId << 16) in edx. In 3.3 edx carries the raw
 //   stat id, so the stat check below compares it directly.
@@ -122,12 +145,20 @@ namespace {
 // Native anchors
 // ---------------------------------------------------------------------------
 
-constexpr std::uint64_t GetUnitStatRva = 0x2F5020;
+constexpr std::uint64_t GetUnitStatRva         = 0x2F5020;
+constexpr std::uint64_t GetUnitStatThunkNopsRva = GetUnitStatRva + 6;
+constexpr std::uint64_t GetUnitStatBodyRva      = GetUnitStatRva + 10;
 
-constexpr std::array<std::uint8_t, 32> GetUnitStatExpected{
-    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89,
-    0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x41, 0x0F, 0xB7, 0xE8,
-    0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9,
+// jmp qword ptr [rip+disp32], opcode and ModRM only.
+constexpr std::array<std::uint8_t, 2> GetUnitStatThunkJump{ 0xFF, 0x25 };
+
+constexpr std::array<std::uint8_t, 4> GetUnitStatThunkNops{ 0x90, 0x90, 0x90, 0x90 };
+
+// mov [rsp+20h],rsi / push rdi / sub rsp,20h / movzx ebp,r8w / mov edi,edx /
+// mov rbx,rcx / test rcx,rcx
+constexpr std::array<std::uint8_t, 22> GetUnitStatBody{
+    0x48, 0x89, 0x74, 0x24, 0x20, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x41, 0x0F,
+    0xB7, 0xE8, 0x8B, 0xFA, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9,
 };
 
 constexpr std::int32_t StatDodge = 338;
@@ -295,7 +326,7 @@ enum class HookState : std::uint8_t {
 };
 
 using GetUnitStatFn =
-    std::int32_t(__fastcall*)(void* unit, std::int32_t statId, std::uint16_t layer);
+    std::int32_t(__fastcall*)(void* unit, std::int32_t statId, std::uint32_t layer);
 
 const D2RL::PluginContext* Context{};
 std::uint8_t*              Base{};
@@ -449,14 +480,14 @@ auto CapRead(SiteKind kind, std::int32_t statId, std::int32_t value) noexcept
 
 // The three roll sites. The stat id is the immediate proven by the witness.
 std::int32_t __fastcall GameplayStatRead(void* unit, std::int32_t statId,
-                                         std::uint16_t layer) noexcept {
+                                         std::uint32_t layer) noexcept {
     return CapRead(SiteKind::Gameplay, statId, GetUnitStat(unit, statId, layer));
 }
 
 // The two panel sites. They read every stat on the panel; CapRead leaves
 // anything outside 338..340 untouched.
 std::int32_t __fastcall DisplayStatRead(void* unit, std::int32_t statId,
-                                        std::uint16_t layer) noexcept {
+                                        std::uint32_t layer) noexcept {
     return CapRead(SiteKind::Display, statId, GetUnitStat(unit, statId, layer));
 }
 
@@ -550,11 +581,16 @@ auto RestoreSites() noexcept -> bool {
 // ---------------------------------------------------------------------------
 
 auto VerifyNativeContract() noexcept -> bool {
-    if (!Context->CheckExpectedBytes(GetUnitStatRva, GetUnitStatExpected.data(),
-            static_cast<std::uint32_t>(GetUnitStatExpected.size()))) {
+    if (!Context->CheckExpectedBytes(GetUnitStatRva, GetUnitStatThunkJump.data(),
+            static_cast<std::uint32_t>(GetUnitStatThunkJump.size()))
+            || !Context->CheckExpectedBytes(GetUnitStatThunkNopsRva,
+                GetUnitStatThunkNops.data(),
+                static_cast<std::uint32_t>(GetUnitStatThunkNops.size()))
+            || !Context->CheckExpectedBytes(GetUnitStatBodyRva, GetUnitStatBody.data(),
+                static_cast<std::uint32_t>(GetUnitStatBody.size()))) {
         Context->LogError(
-            "DodgeAvoidEvadeCap: STATLIST_GetUnitStat at 0x2F5020 does not match "
-            "the verified D2R image. Refusing to load.");
+            "DodgeAvoidEvadeCap: STATLIST_GetUnitStat at 0x2F5020 is not the "
+            "D2RLoader 1.3.0 thunk to D2RCore ReadWideUnitStat. Refusing to load.");
         return false;
     }
     for (const auto& site : Sites) {
@@ -715,7 +751,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.dodge-avoid-evade-cap",
     .name = "Dodge Avoid Evade Cap",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description =
         "Caps the chance to dodge, avoid and evade at a configurable percent, "

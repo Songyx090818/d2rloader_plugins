@@ -7,8 +7,33 @@
 // Port of the ESR D2R 2.4 cloneitem memory patches (parser hook 2618FC,
 // generator dispatch 307645, clone hook 307796, output store 3077A5, cave
 // 3632F6) to D2R 3.3. Everything below was read out of the live D2RLoader.exe
-// image and disassembled before being relied on. The RuffnecKk corpus
-// documents this image as identical for 3.2.92777 and 3.3.93847.
+// image and disassembled before being relied on, and re-derived for
+// D2RLoader 1.3.0 together with the D2RCore.dll it ships.
+//
+// ---------------------------------------------------------------------------
+// D2RLoader 1.3.0: wider cube recipes
+// ---------------------------------------------------------------------------
+//   1.3.0 widened the cubemain inputs from 8 to 10 bytes and each output
+//   record from 59h to 5Bh bytes (a 16-bit item row moved to +59h). A recipe
+//   row is now 16Ch bytes: 7 inputs from +14h, outputs from +5Ah. Every
+//   runtime offset of an output below is therefore 0Eh higher than in 1.2.x,
+//   and the output type byte is +67h from the output base instead of +59h.
+//
+//   The cubemain columns are compiled by D2RCore now. The table definition
+//   sub_1403E3FF0 points output, output b and output c at
+//   D2RCore!CompileCubeOutputField, which is only:
+//
+//     cmp   r9d, 3                         ; output index
+//     imul  rdx, rdx, 5Bh / add rdx, r8 / add rdx, 5Ah   ; row + 5Ah + i*5Bh
+//     mov   r8, cell / mov r9d, row
+//     call  [game function table]          ; exe base + 3E5E60
+//
+//   The table slot is filled with exe base + 3E5E60 by D2RCore's resolver
+//   (add rdx,[rcx+8] / mov [rcx],rdx), so the call lands on the native parser
+//   entry and therefore on the inline hook below, with the same four
+//   arguments as before. MoveCubeRows copies compiled rows with a plain
+//   memcpy of 16Ch bytes each, so the FBh type survives into the runtime
+//   table the binder and the generator read.
 //
 // ---------------------------------------------------------------------------
 // The copy: sub_14043D660 (game, sourceItem) -> item
@@ -25,14 +50,22 @@
 //     43D689  48 8B E9                mov   rbp, rcx         ; game
 //     43D68C  48 89 54 24 50          mov   [rsp+50h], rdx   ; source item
 //     43D6B2  41 B8 00 04 00 00       mov   r8d, 400h        ; buffer size
-//     43D6D5  E8 06 88 F3 FF          call  375EE0           ; serialize
+//     43D6D5  E8 xx xx xx xx          call  serialize
+//
+//   D2RLoader 1.3.0 routes the serialize call to D2RCore!SerializeItem and
+//   the decode in sub_14043D900 to D2RCore!DecodeItem, so the copy stays
+//   consistent with the extended save format. The witness stops before the
+//   serialize call; its rel32 targets a loader thunk that moves between
+//   loader builds.
 //
 // ---------------------------------------------------------------------------
 // 1. Parser: sub_1403E5E60 (dataContext, output, cell, row)
 // ---------------------------------------------------------------------------
-//   Parses one output, output b or output c cell into a 0x59-byte output
-//   record. The TXT field callback sub_1403E5E20 tail-jumps here with
-//   output = recipe + 4Ch + index * 59h. The output type is the byte at +0Dh:
+//   Parses one output, output b or output c cell into an output record.
+//   D2RCore!CompileCubeOutputField calls it with
+//   output = recipe + 5Ah + index * 5Bh (1.2.x: the vanilla callback
+//   sub_1403E5E20, recipe + 4Ch + index * 59h). The output type is the byte
+//   at +0Dh of the record:
 //   usetype FFh, useitem FEh, itemtype FDh, item FCh, portals 1 to 4. FBh is
 //   unused, so cloneitem keeps its 2.4 value.
 //
@@ -57,10 +90,10 @@
 //   never advances, so all three passes test output (A)'s type.
 //
 //     52A79D  41 BF 03 00 00 00       mov   r15d, 3
-//     52A7B2  41 F6 45 50 01          test  byte ptr [r13+50h], 1     ; mod
+//     52A7B2  41 F6 45 5E 01          test  byte ptr [r13+5Eh], 1     ; mod
 //     52A7B7  74 04                   je    52A7BD
 //     52A7B9  4C 89 77 F8             mov   [rdi-8], r14            ; bind
-//     52A7BD  41 0F B6 45 59          movzx eax, byte ptr [r13+59h]  ; <- hook
+//     52A7BD  41 0F B6 45 67          movzx eax, byte ptr [r13+67h]  ; <- hook
 //     52A7C2  3C FF                   cmp   al, 0FFh                ; usetype
 //     52A7C4  75 2E                   jne   52A7F4
 //     ...
@@ -81,12 +114,15 @@
 //   Runs output (A), b and c in turn. Its frame sets rbp = rsp + 100h and
 //   keeps game at [rbp-80h], player at [rsp+60h], the bound entries at
 //   [rsp+68h], the output index at [rsp+54h], the current output base at
-//   [rsp+78h] (type at +59h) and the unique row at [rbp-70h]. A type that is
+//   [rsp+78h] (type at +67h) and the unique row at [rbp-70h]. A type that is
 //   not usetype, item or itemtype leaves the switch with esi = 0 and skips
 //   the output:
 //
-//     52745A  45 0F B6 67 56          movzx r12d, byte ptr [r15+56h]
-//     527466  8B F1                   mov   esi, ecx                ; 0
+//     52745A  45 0F B6 67 64          movzx r12d, byte ptr [r15+64h]
+//     52745F  33 C9                   xor   ecx, ecx
+//     527461  E9 xx xx xx xx          jmp   loader stub             ; loads the
+//                                                                   ; +B3h item row
+//                                                                   ; and esi = 0
 //     527468  C7 45 90 FF FF FF FF    mov   dword ptr [rbp-70h], -1
 //     527472  3C FF                   cmp   al, 0FFh
 //     ...
@@ -167,6 +203,7 @@ constexpr std::uint64_t ItemCloneRva              = 0x43D660;
 constexpr std::uint64_t GeneratorFrameRva         = 0x5269C0;
 constexpr std::uint64_t GeneratorUseItemBranchRva = 0x527104;
 constexpr std::uint64_t GeneratorSwitchHeadRva    = 0x52745A;
+constexpr std::uint64_t GeneratorSwitchCompareRva = 0x527466;
 constexpr std::uint64_t GeneratorNoBuildBranchRva = 0x52751C;
 constexpr std::uint64_t GeneratorNoBuildJumpRva   = 0x527520;
 constexpr std::uint64_t GeneratorDefaultCaseRva   = 0x527654;
@@ -207,7 +244,7 @@ constexpr std::uint8_t ParserUseItemBranchWitness[]{
     0x0D, 0xFE, 0xE8, 0xBF, 0xAA, 0xF1, 0xFF, 0xE9, 0xC2, 0x01, 0x00, 0x00,
 };
 
-// item copy, 122 bytes at 0x43D660
+// item copy, 117 bytes at 0x43D660, up to the serialize call
 constexpr std::uint8_t ItemCloneWitness[]{
     0x48, 0x89, 0x5C, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55,
     0x41, 0x56, 0x41, 0x57, 0x48, 0x81, 0xEC, 0x80, 0x04, 0x00, 0x00, 0x48,
@@ -218,8 +255,7 @@ constexpr std::uint8_t ItemCloneWitness[]{
     0x91, 0x8D, 0x01, 0x33, 0xF6, 0x48, 0x89, 0x44, 0x24, 0x48, 0x41, 0xB8,
     0x00, 0x04, 0x00, 0x00, 0x48, 0x8D, 0x44, 0x24, 0x48, 0x48, 0x8B, 0xCF,
     0x48, 0x89, 0x44, 0x24, 0x30, 0x89, 0x74, 0x24, 0x28, 0x44, 0x8D, 0x4E,
-    0x01, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00, 0xE8, 0x06, 0x88,
-    0xF3, 0xFF,
+    0x01, 0xC7, 0x44, 0x24, 0x20, 0x01, 0x00, 0x00, 0x00,
 };
 
 // generator frame, 88 bytes at 0x5269C0
@@ -236,16 +272,20 @@ constexpr std::uint8_t GeneratorFrameWitness[]{
 
 // generator useitem branch, 39 bytes at 0x527104
 constexpr std::uint8_t GeneratorUseItemBranchWitness[]{
-    0x41, 0x0F, 0xB6, 0x47, 0x59, 0x3C, 0xFE, 0x0F, 0x85, 0x49, 0x03, 0x00,
+    0x41, 0x0F, 0xB6, 0x47, 0x67, 0x3C, 0xFE, 0x0F, 0x85, 0x49, 0x03, 0x00,
     0x00, 0x48, 0x63, 0x4C, 0x24, 0x54, 0x48, 0x8B, 0x44, 0x24, 0x68, 0x48,
     0x03, 0xC9, 0x48, 0x8B, 0x0C, 0xC8, 0x48, 0x85, 0xC9, 0x0F, 0x84, 0x1D,
     0xFF, 0xFF, 0xFF,
 };
 
-// generator type switch, 32 bytes at 0x52745A
+// generator type switch head, 8 bytes at 0x52745A, up to the loader's jmp
 constexpr std::uint8_t GeneratorSwitchHeadWitness[]{
-    0x45, 0x0F, 0xB6, 0x67, 0x56, 0x33, 0xC9, 0x45, 0x0F, 0xB7, 0x7F, 0x54,
-    0x8B, 0xF1, 0xC7, 0x45, 0x90, 0xFF, 0xFF, 0xFF, 0xFF, 0x44, 0x8B, 0xF1,
+    0x45, 0x0F, 0xB6, 0x67, 0x64, 0x33, 0xC9, 0xE9,
+};
+
+// generator type switch compare, 20 bytes at 0x527466, after the jmp rel32
+constexpr std::uint8_t GeneratorSwitchCompareWitness[]{
+    0x90, 0x90, 0xC7, 0x45, 0x90, 0xFF, 0xFF, 0xFF, 0xFF, 0x44, 0x8B, 0xF1,
     0x3C, 0xFF, 0x0F, 0x85, 0x8A, 0x01, 0x00, 0x00,
 };
 
@@ -280,11 +320,11 @@ constexpr std::uint8_t GeneratorNoBuildTargetWitness[]{
 constexpr std::uint8_t BinderLoopWitness[]{
     0x48, 0x8B, 0x7D, 0x48, 0x41, 0xBF, 0x03, 0x00, 0x00, 0x00, 0x48, 0x83,
     0xC7, 0x08, 0x49, 0x8B, 0xCE, 0xE8, 0x41, 0x25, 0xE4, 0xFF, 0x89, 0x47,
-    0x04, 0x41, 0xF6, 0x45, 0x50, 0x01, 0x74, 0x04, 0x4C, 0x89, 0x77, 0xF8,
-    0x41, 0x0F, 0xB6, 0x45, 0x59, 0x3C, 0xFF, 0x75, 0x2E, 0x41, 0xB8, 0x13,
+    0x04, 0x41, 0xF6, 0x45, 0x5E, 0x01, 0x74, 0x04, 0x4C, 0x89, 0x77, 0xF8,
+    0x41, 0x0F, 0xB6, 0x45, 0x67, 0x3C, 0xFF, 0x75, 0x2E, 0x41, 0xB8, 0x13,
     0x02, 0x00, 0x00, 0x4C, 0x89, 0x77, 0xF8, 0x48, 0x8D, 0x15, 0x99, 0x17,
     0x81, 0x01, 0x49, 0x8B, 0xCE, 0xE8, 0x81, 0xF0, 0xE1, 0xFF, 0x89, 0x07,
-    0x41, 0x0F, 0xB7, 0x45, 0x50, 0x84, 0xC0, 0x79, 0x1A, 0x41, 0x8B, 0x9C,
+    0x41, 0x0F, 0xB7, 0x45, 0x5E, 0x84, 0xC0, 0x79, 0x1A, 0x41, 0x8B, 0x9C,
     0x24, 0x88, 0x00, 0x00, 0x00, 0xEB, 0x1F, 0x3C, 0xFE, 0x75, 0x6E, 0x4C,
     0x89, 0x77, 0xF8, 0xC7, 0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xEB, 0xDD,
 };
@@ -299,13 +339,14 @@ struct Witness {
     std::uint32_t       size;
 };
 
-constexpr std::array<Witness, 11> Witnesses{{
+constexpr std::array<Witness, 12> Witnesses{{
     { "parser entry", CubeOutputParserRva, ParserEntryWitness, static_cast<std::uint32_t>(sizeof(ParserEntryWitness)) },
     { "parser useitem branch", ParserUseItemBranchRva, ParserUseItemBranchWitness, static_cast<std::uint32_t>(sizeof(ParserUseItemBranchWitness)) },
     { "item copy", ItemCloneRva, ItemCloneWitness, static_cast<std::uint32_t>(sizeof(ItemCloneWitness)) },
     { "generator frame", GeneratorFrameRva, GeneratorFrameWitness, static_cast<std::uint32_t>(sizeof(GeneratorFrameWitness)) },
     { "generator useitem branch", GeneratorUseItemBranchRva, GeneratorUseItemBranchWitness, static_cast<std::uint32_t>(sizeof(GeneratorUseItemBranchWitness)) },
-    { "generator type switch", GeneratorSwitchHeadRva, GeneratorSwitchHeadWitness, static_cast<std::uint32_t>(sizeof(GeneratorSwitchHeadWitness)) },
+    { "generator type switch head", GeneratorSwitchHeadRva, GeneratorSwitchHeadWitness, static_cast<std::uint32_t>(sizeof(GeneratorSwitchHeadWitness)) },
+    { "generator type switch compare", GeneratorSwitchCompareRva, GeneratorSwitchCompareWitness, static_cast<std::uint32_t>(sizeof(GeneratorSwitchCompareWitness)) },
     { "generator no-build branch", GeneratorNoBuildBranchRva, GeneratorNoBuildBranchWitness, static_cast<std::uint32_t>(sizeof(GeneratorNoBuildBranchWitness)) },
     { "generator default case", GeneratorDefaultCaseRva, GeneratorDefaultCaseWitness, static_cast<std::uint32_t>(sizeof(GeneratorDefaultCaseWitness)) },
     { "generator build and store", GeneratorBuildAndStoreRva, GeneratorBuildAndStoreWitness, static_cast<std::uint32_t>(sizeof(GeneratorBuildAndStoreWitness)) },
@@ -327,7 +368,7 @@ constexpr const std::uint8_t* BinderTypeLoadOriginal =
 // native build applies). rsp and rbp are the generator's own frame.
 constexpr std::uint8_t GeneratorRelay[]{
     0x48, 0x8B, 0x44, 0x24, 0x78,                              // +00 mov rax, qword ptr [rsp + 0x78]
-    0x80, 0x78, 0x59, 0xFB,                                    // +05 cmp byte ptr [rax + 0x59], 0xfb
+    0x80, 0x78, 0x67, 0xFB,                                    // +05 cmp byte ptr [rax + 0x67], 0xfb
     0x75, 0x2F,                                                // +09 jne 0x3a
     0x48, 0x63, 0x4C, 0x24, 0x54,                              // +0B movsxd rcx, dword ptr [rsp + 0x54]
     0x48, 0xC1, 0xE1, 0x04,                                    // +10 shl rcx, 4
@@ -355,7 +396,7 @@ static_assert(sizeof(GeneratorRelay) == 0x5B, "Verified generator relay length c
 // Binder relay, entered from the jmp at 0x52A7BD. Replays the type load and
 // reports cloneitem (FBh) as useitem (FEh) to the compares at 0x52A7C2.
 constexpr std::uint8_t BinderRelay[]{
-    0x41, 0x0F, 0xB6, 0x45, 0x59,                              // +00 movzx eax, byte ptr [r13 + 0x59]
+    0x41, 0x0F, 0xB6, 0x45, 0x67,                              // +00 movzx eax, byte ptr [r13 + 0x67]
     0x3C, 0xFB,                                                // +05 cmp al, 0xfb
     0x75, 0x02,                                                // +07 jne 0xb
     0xB0, 0xFE,                                                // +09 mov al, 0xfe
@@ -835,7 +876,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.cube-cloneitem",
     .name = "Cube Clone Item",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description =
         "Adds the cloneitem cubemain output code: an exact duplicate of the item "

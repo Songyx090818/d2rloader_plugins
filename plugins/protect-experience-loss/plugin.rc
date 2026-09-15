@@ -1,0 +1,27 @@
+#include <D2RLPlugin/resource.h>
+#include <D2RLPlugin/version.h>
+
+D2RL_PLUGIN_MANIFEST_RESOURCE_ID RCDATA { D2RL_PLUGIN_RESOURCE_DWORD(D2RL_PLUGIN_API_VERSION) }
+
+1 VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName", "CelestialRayOne"
+      VALUE "FileDescription", "Skips the experience and gold loss on death in a configurable list of levels."
+      VALUE "FileVersion", "1.0.0"
+      VALUE "InternalName", "celestialrayone.death-penalty-safe-levels"
+      VALUE "OriginalFilename", "d2rl-celestialrayone-death-penalty-safe-levels.dll"
+      VALUE "ProductName", "Death Penalty Safe Levels"
+      VALUE "ProductVersion", "1.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0409, 1200
+  END
+END

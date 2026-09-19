@@ -1,0 +1,1 @@
+The parent folder goes in data/hd/global/ui/panel.

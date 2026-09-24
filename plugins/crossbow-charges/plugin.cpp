@@ -175,11 +175,34 @@
 //   ceil(256 * FPD / (N + 1)), which gives exactly N frames, with
 //   N = default_attack_frames + the attack frames stat. The same function
 //   runs on the server (timing) and on every client (animation), so both agree.
-//   Everything else keeps the game's own speed: sequence skills (mode 18,
-//   Strafe), A2 (only the Assassin has an A2 crossbow animation) and the
-//   special animations S1..S4, which skills such as Assassin traps use.
+//   Everything else keeps the game's own speed: other sequence skills (mode
+//   18), A2 (only the Assassin has an A2 crossbow animation) and the special
+//   animations S1..S4, which skills such as Assassin traps use.
 //   whirlwind-follow-cursor byte-checks 350B40's entry and faster-cast-rate-cap
 //   patches the cast branch at 350C29; neither touches 351482..3515A3.
+//
+//   Mirrored Blades (skills.txt seqnum 25) is a sequence: the player stays in
+//   mode 18 (SQ) and plays steps of another animation from a table compiled
+//   into the exe (resolver 3CB890, table 2386650). Its crossbow slot (6) and
+//   bow slot (5) share 18 steps of the cast animation (mode 10, frames 0..17,
+//   hit event on step 12). Its speed comes through 351597 like A1: mode 18's
+//   rate entry at 1D00518 sends skills with skills.txt UseAttackRate (record
+//   byte +26h, bit 8h, tested at 351142) to the attack path, and a seqtrans
+//   other than SC (record +32h, tested at 350CFB) keeps it off the cast path.
+//     length   the installer 34D900 writes steps << 8 to unit+48h (3CB830) and
+//              the countdown to unit+64h (3CB870 << 8); the mode start 34C880
+//              calls it right before 350B40. Sequence 25's slots have equal
+//              step counts, so both hold 18 << 8 with a crossbow.
+//     advance  3476F1..347766 adds the rate at unit+54h to the position,
+//              subtracts it from the countdown and flags the end (unit+128h
+//              bit 1Bh) once the countdown reaches 0. A sequence therefore
+//              lasts ceil(length / rate) frames, one frame more than a plain
+//              animation with the same numbers.
+//     skill    the used skill is [[unit+100h]+18h] (34BA40 -> 33E090), its id
+//              the record's first word (33E080), as 350B40 reads it.
+//   With that skill id equal to mirrored_blades_skill_id, the sequence
+//   installed (unit+40h) and a crossbow held, the rate becomes
+//   ceil(length / N): exactly N frames for the whole Mirrored Blades attack.
 //
 // ---------------------------------------------------------------------------
 // Nothing calls into the game while the plugin loads
@@ -256,6 +279,13 @@ constexpr std::uint64_t DamageCalcCallRva     = 0x44CF93;
 constexpr std::uint64_t EventFuncSlot20Rva    = 0x238E660;
 constexpr std::uint64_t AttackRateWindowRva   = 0x351482;
 constexpr std::uint64_t AttackRateSiteRva     = 0x351597;
+// Read only: prove the sequence fields the Mirrored Blades part reads
+constexpr std::uint64_t SequenceGateRva        = 0x351102;
+constexpr std::uint64_t SequenceModeEntryRva   = 0x1D00518;
+constexpr std::uint64_t SequenceInstallRva     = 0x34D948;
+constexpr std::uint64_t SequenceAdvanceRva     = 0x3476F1;
+constexpr std::uint64_t UsedSkillRva           = 0x34BA61;
+constexpr std::uint64_t UsedSkillFromListRva   = 0x33E090;
 // Called
 constexpr std::uint64_t ServerGlobalDelayRva  = 0x439470;
 constexpr std::uint64_t ServerLocalDelayRva   = 0x439500;
@@ -292,6 +322,11 @@ constexpr std::size_t UnitCastIdOffset      = 0x12C;
 constexpr std::size_t UnitModeOffset        = 0x0C;
 constexpr std::size_t UnitAnimRecordOffset  = 0x70;
 constexpr std::size_t AnimRecordFramesOffset = 0x08;
+constexpr std::size_t UnitSequenceRowsOffset   = 0x40;
+constexpr std::size_t UnitSequenceLengthOffset = 0x48;
+constexpr std::size_t UnitSkillListOffset      = 0x100;
+constexpr std::size_t SkillListUsedOffset      = 0x18;
+constexpr std::int32_t SequenceMode            = 18;
 constexpr std::size_t SkillGlobalDelayCalc  = 564;
 constexpr std::size_t SkillLocalDelayCalc   = 568;
 constexpr std::int32_t LocalCooldownState   = 185;
@@ -375,6 +410,46 @@ constexpr std::uint8_t AttackRateWindow[]{
 // 351597..3515A3: mov ebx,7FFFh / cmp edi,ebx / jbe store. The first five bytes are replaced.
 constexpr std::uint8_t AttackRateSite[]{
     0xBB,0xFF,0x7F,0x00,0x00,0x3B,0xFB,0x0F,0x86,0xB8,0xF6,0xFF,0xFF };
+
+// 351102..351151: mode 18's rate entry, then the UseAttackRate test on the used
+// skill ([rsi+100h] -> 33E090 -> 33E080 -> skills.txt record, byte +26h & 8)
+// that sends sequences to the attack path.
+constexpr std::uint8_t SequenceGateBytes[]{
+    0x44,0x39,0x70,0x0C,0x0F,0x85,0x33,0x01,0x00,0x00,0x44,0x39,0x70,0x08,0x74,0x47,
+    0x48,0x8B,0x8E,0x00,0x01,0x00,0x00,0xE8,0x72,0xCF,0xFE,0xFF,0x48,0x85,0xC0,0x74,
+    0x2F,0x41,0xB8,0x08,0x0E,0x00,0x00,0x49,0x8B,0xD5,0x48,0x8B,0xC8,0xE8,0x4C,0xCF,
+    0xFE,0xFF,0x0F,0xB6,0x8E,0xBD,0x01,0x00,0x00,0x8B,0xD0,0xE8,0x4E,0x66,0xD4,0xFF,
+    0x0F,0xB6,0x48,0x26,0x23,0x0D,0x90,0x85,0xA4,0x01,0x0F,0x85,0xED,0x00,0x00,0x00 };
+// Rate entry of mode 18 in the player mode table 1D003B0 (20-byte rows): move
+// test on, attack rate when the skill asks for it, no fixed speed.
+constexpr std::uint8_t SequenceModeEntryBytes[]{
+    0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00 };
+// 34D948..34D97E: unit+48h = steps << 8, unit+54h = 256, unit+4Ch = 0,
+// unit+64h = countdown << 8, then the first step.
+constexpr std::uint8_t SequenceInstallBytes[]{
+    0x48,0x83,0x7B,0x40,0x00,0x74,0x3A,0x48,0x8B,0xCB,0xE8,0xD9,0xDE,0x07,0x00,0x89,
+    0x43,0x48,0x48,0x8B,0xCB,0x33,0xC0,0xC7,0x43,0x54,0x00,0x01,0x00,0x00,0x48,0x89,
+    0x43,0x4C,0xE8,0x01,0xDF,0x07,0x00,0xC1,0xE0,0x08,0x33,0xD2,0x48,0x8B,0xCB,0x89,
+    0x43,0x64,0xE8,0xF1,0x3F,0x00,0x00 };
+// 3476F1..347766: position += rate (unit+54h), wrapped by unit+48h; countdown
+// unit+64h -= rate; end flag (unit+128h bit 1Bh) once the countdown is <= 0.
+constexpr std::uint8_t SequenceAdvanceBytes[]{
+    0x48,0x83,0x7B,0x40,0x00,0xC6,0x43,0x6A,0x00,0x74,0x76,0x8B,0x4B,0x4C,0x66,0x0F,
+    0x6E,0x43,0x54,0x81,0xA3,0x24,0x01,0x00,0x00,0xFF,0xBF,0xFF,0xFF,0x44,0x8B,0x4B,
+    0x48,0x0F,0x5B,0xC0,0x89,0x4B,0x50,0xF3,0x0F,0x59,0xC6,0xF3,0x4C,0x0F,0x2C,0xC0,
+    0x41,0x8D,0x04,0x08,0x89,0x43,0x4C,0x41,0x3B,0xC1,0x7C,0x07,0x99,0x41,0xF7,0xF9,
+    0x89,0x53,0x4C,0x44,0x29,0x43,0x64,0x8B,0xD1,0x48,0x8B,0xCB,0xE8,0x2E,0xA2,0x00,
+    0x00,0x85,0xC0,0x74,0x0A,0x81,0x8B,0x24,0x01,0x00,0x00,0x00,0x40,0x00,0x00,0x8B,
+    0x8B,0x28,0x01,0x00,0x00,0x8B,0xC1,0x0F,0xBA,0xF0,0x1B,0x0F,0xBA,0xE9,0x1B,0x83,
+    0x7B,0x64,0x00,0x0F,0x4F,0xC8 };
+// 34BA61..34BA71: mov rcx,[rbx+100h] / add rsp,20h / pop rbx / jmp 33E090.
+constexpr std::uint8_t UsedSkillBytes[]{
+    0x48,0x8B,0x8B,0x00,0x01,0x00,0x00,0x48,0x83,0xC4,0x20,0x5B,0xE9,0x1E,0x26,0xFF,
+    0xFF };
+// 33E090..33E09C: test rcx,rcx / jnz / xor eax,eax / ret / mov rax,[rcx+18h] / ret.
+constexpr std::uint8_t UsedSkillFromListBytes[]{
+    0x48,0x85,0xC9,0x75,0x03,0x33,0xC0,0xC3,0x48,0x8B,0x41,0x18,0xC3 };
 
 struct Witness {
     std::uint64_t       rva;
@@ -484,6 +559,15 @@ const std::array<Witness, 33> Witnesses{
     W(PlayerFromIndexRva, PlayerFromIndexBytes, "player from index"),
 };
 
+const std::array<Witness, 6> SequenceWitnesses{
+    W(SequenceGateRva, SequenceGateBytes, "sequence attack rate gate"),
+    W(SequenceModeEntryRva, SequenceModeEntryBytes, "sequence mode rate entry"),
+    W(SequenceInstallRva, SequenceInstallBytes, "sequence install"),
+    W(SequenceAdvanceRva, SequenceAdvanceBytes, "sequence advance"),
+    W(UsedSkillRva, UsedSkillBytes, "used skill"),
+    W(UsedSkillFromListRva, UsedSkillFromListBytes, "used skill from list"),
+};
+
 const std::array<Witness, 3> UiWitnesses{
     W(ButtonUpdateRva, ButtonUpdateBytes, "skill button update"),
     W(FindChildWidgetRva, FindChildWidgetBytes, "child widget lookup"),
@@ -588,6 +672,7 @@ std::atomic<std::uint64_t> BoltsReloaded{};
 std::atomic<std::uint64_t> CastsTagged{};
 std::atomic<std::uint64_t> ProcsTagged{};
 std::atomic<std::uint64_t> HitsBoosted{};
+std::atomic<std::uint64_t> SequenceRatesSet{};
 
 // ---------------------------------------------------------------------------
 // Config
@@ -630,9 +715,14 @@ constexpr char DefaultConfigToml[] =
     "#   Crossbow attacks (the A1 attack animation) always take exactly\n"
     "#   default_attack_frames plus the attack frames stat, whatever IAS or skill\n"
     "#   attack speed the player has. Negative stat values make attacks faster. A\n"
-    "#   total of 0 or less leaves the game's normal speed. Sequence skills such as\n"
-    "#   Strafe and the special animations (S1 to S4, used by skills such as\n"
-    "#   Assassin traps) keep the game's normal speed.\n"
+    "#   total of 0 or less leaves the game's normal speed.\n"
+    "#   Mirrored Blades with a crossbow takes the same number of frames for the\n"
+    "#   whole attack. It is a sequence: 18 steps of the cast animation, bolt on\n"
+    "#   step 12, so it never plays A1 and needs its own setting below. This only\n"
+    "#   reaches it while its skills.txt row keeps UseAttackRate = 1 and a seqtrans\n"
+    "#   other than SC (it ships with SQ); otherwise it keeps the game's speed.\n"
+    "#   Other sequence skills and the special animations (S1 to S4, used by\n"
+    "#   skills such as Assassin traps) keep the game's normal speed.\n"
     "#\n"
     "# Skill buttons\n"
     "#   Crossbow skills show the bolts left in the button's number box, 0 included.\n"
@@ -659,6 +749,10 @@ constexpr char DefaultConfigToml[] =
     "\n"
     "# Frames every crossbow attack takes. The attack frames stat adds to it.\n"
     "default_attack_frames = 7\n"
+    "\n"
+    "# skills.txt row id of Mirrored Blades. With a crossbow its whole attack takes\n"
+    "# the frames above too. -1 leaves it at the game's speed.\n"
+    "mirrored_blades_skill_id = 692\n"
     "\n"
     "# itemstatcost.txt rows.\n"
     "#   max bolts:     bolts added to default_max_bolts.\n"
@@ -698,6 +792,7 @@ struct Config {
     std::int32_t               damageBase{ 25 };
     std::int32_t               defaultAttackFrames{ 7 };
     std::int32_t               attackFramesStat{ 517 };
+    std::int32_t               mirroredBladesSkill{ 692 };
     std::string                sweepName{ "CrossbowSweep" };
     std::int32_t               sweepFrames{ 64 };
     std::array<std::int32_t, 3> shadowColor{ 128, 128, 128 };
@@ -818,6 +913,8 @@ void ApplyConfigLine(std::string_view section, std::string_view key, std::string
         if (!ParseInt(value, 0, 1000, Settings.defaultAttackFrames)) bad("expected 0 to 1000");
     } else if (key == "attack_frames_stat_id") {
         if (!ParseInt(value, 0, 32767, Settings.attackFramesStat)) bad("expected 0 to 32767");
+    } else if (key == "mirrored_blades_skill_id") {
+        if (!ParseInt(value, -1, 32767, Settings.mirroredBladesSkill)) bad("expected -1 to 32767");
     } else if (key == "damage_base") {
         if (!ParseInt(value, -100, 100000, Settings.damageBase)) bad("expected -100 to 100000");
     } else if (key == "sweep_widget_name") {
@@ -1609,25 +1706,52 @@ std::uint64_t __fastcall HookedButtonUpdate(void* button) {
 // Hook: crossbow attack speed
 // ---------------------------------------------------------------------------
 
+bool SequencePartVerified{};
+
 auto IsCrossbowAttackMode(std::int32_t mode) noexcept -> bool {
     return mode == 7;   // A1 only; S1..S4 carry non-attack skills such as traps
+}
+
+// The skill the unit is using, read the way 350B40 reads it: [[unit+100h]+18h].
+auto UsedSkillId(void* unit) noexcept -> std::int32_t {
+    void* skills = Read<void*>(unit, UnitSkillListOffset);
+    if (skills == nullptr) return -1;
+    void* skill = Read<void*>(skills, SkillListUsedOffset);
+    return skill != nullptr ? SkillIdOf(skill) : -1;
+}
+
+// Mirrored Blades playing its sequence: mode 18 with the sequence installed.
+auto IsMirroredBladesSequence(void* unit, std::int32_t mode) noexcept -> bool {
+    return SequencePartVerified && mode == SequenceMode && Settings.mirroredBladesSkill >= 0
+        && Read<void*>(unit, UnitSequenceRowsOffset) != nullptr
+        && UsedSkillId(unit) == Settings.mirroredBladesSkill;
 }
 
 // Reached from the relay at 351597 with the unit and the rate the game just
 // worked out; returns the rate to store.
 std::int32_t __fastcall HookedAttackRate(void* unit, std::int32_t rate) {
-    if (!Active.load(std::memory_order_relaxed) || !IsPlayer(unit)
-            || !IsCrossbowAttackMode(Read<std::int32_t>(unit, UnitModeOffset)) || !HasCrossbow(unit)) {
-        return rate;
-    }
+    if (!Active.load(std::memory_order_relaxed) || !IsPlayer(unit)) return rate;
+    const std::int32_t mode     = Read<std::int32_t>(unit, UnitModeOffset);
+    const bool         sequence = IsMirroredBladesSequence(unit, mode);
+    if ((!sequence && !IsCrossbowAttackMode(mode)) || !HasCrossbow(unit)) return rate;
     const std::int32_t frames = Settings.defaultAttackFrames + GetStat(unit, Settings.attackFramesStat, 0);
     if (frames <= 0) return rate;
-    void* record = Read<void*>(unit, UnitAnimRecordOffset);
-    if (record == nullptr) return rate;
-    const std::int32_t fpd = Read<std::int32_t>(record, AnimRecordFramesOffset);
-    if (fpd <= 0) return rate;
-    // ceil(256 * FPD / (N + 1)): the smallest rate that finishes in N frames.
-    const std::int64_t wanted = (256LL * fpd + frames) / (static_cast<std::int64_t>(frames) + 1);
+    std::int64_t wanted = 0;
+    if (sequence) {
+        // The whole sequence ends once its countdown (steps << 8) is used up, so
+        // it lasts ceil(length / rate) frames: ceil(length / N) gives exactly N.
+        const std::int32_t length = Read<std::int32_t>(unit, UnitSequenceLengthOffset);
+        if (length <= 0) return rate;
+        wanted = (static_cast<std::int64_t>(length) + frames - 1) / frames;
+        SequenceRatesSet.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        void* record = Read<void*>(unit, UnitAnimRecordOffset);
+        if (record == nullptr) return rate;
+        const std::int32_t fpd = Read<std::int32_t>(record, AnimRecordFramesOffset);
+        if (fpd <= 0) return rate;
+        // ceil(256 * FPD / (N + 1)): the smallest rate that finishes in N frames.
+        wanted = (256LL * fpd + frames) / (static_cast<std::int64_t>(frames) + 1);
+    }
     return static_cast<std::int32_t>(std::clamp<std::int64_t>(wanted, 1, 0x7FFF));
 }
 
@@ -1859,6 +1983,16 @@ auto InstallPatches() -> bool {
     if (!AttackRatePatched) {
         Context->LogWarn("CrossbowCharges: the animation rate code does not match; crossbow attacks keep the game's own "
                          "speed.");
+    } else {
+        // Optional part: a mismatch here only leaves Mirrored Blades at the game's speed.
+        SequencePartVerified = true;
+        for (const Witness& witness : SequenceWitnesses) {
+            if (!Context->CheckExpectedBytes(witness.rva, witness.bytes, witness.size)) {
+                D2RL::LogWarnF(Context, "CrossbowCharges: %s at RVA 0x%llX does not match; Mirrored Blades keeps the "
+                    "game's own speed.", witness.name, static_cast<unsigned long long>(witness.rva));
+                SequencePartVerified = false;
+            }
+        }
     }
     return true;
 }
@@ -1946,6 +2080,12 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
         AttackRatePatched ? "fixed speed on" : "game speed (not installed)", Settings.defaultAttackFrames,
         Settings.attackFramesStat);
     say(line);
+    std::snprintf(line, sizeof(line), "  mirrored blades (skill %d): %s, sequence speed set %llu times.",
+        Settings.mirroredBladesSkill,
+        Settings.mirroredBladesSkill < 0 ? "off in config"
+            : (AttackRatePatched && SequencePartVerified) ? "fixed speed on" : "game speed (not installed)",
+        static_cast<unsigned long long>(SequenceRatesSet.load()));
+    say(line);
     std::snprintf(line, sizeof(line), "  crossbow item types per bank: classic %u, lod %u, rotw %u.",
         CrossbowTypes[1].count.load(), CrossbowTypes[2].count.load(), CrossbowTypes[3].count.load());
     say(line);
@@ -1984,7 +2124,7 @@ constexpr D2RL::PluginInfo PluginInfoData{
     .apiVersion  = D2RL_PLUGIN_API_VERSION,
     .id          = PluginIdText,
     .name        = "Crossbow Charges",
-    .version     = "1.1.1",
+    .version     = "1.2.0",
     .author      = "CelestialRayOne",
     .description = "Crossbow skills fire from a reloading pool of bolts with a skill-button shadow, and crossbow "
                    "hits deal a stat-driven damage bonus.",
@@ -2043,9 +2183,12 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     Active.store(true);
     State = PluginState::Active;
     D2RL::LogInfoF(Context, "CrossbowCharges: active (max bolts stat %d, current bolts stat %d, damage stat %d, "
-        "damage base %d%%, skill buttons %s, attack frames %d + stat %d %s).", Settings.maxBoltsStat,
+        "damage base %d%%, skill buttons %s, attack frames %d + stat %d %s, mirrored blades skill %d %s).",
+        Settings.maxBoltsStat,
         Settings.currentBoltsStat, Settings.damageStat, Settings.damageBase, UiActive ? "on" : "off",
-        Settings.defaultAttackFrames, Settings.attackFramesStat, AttackRatePatched ? "on" : "off");
+        Settings.defaultAttackFrames, Settings.attackFramesStat, AttackRatePatched ? "on" : "off",
+        Settings.mirroredBladesSkill,
+        (Settings.mirroredBladesSkill >= 0 && AttackRatePatched && SequencePartVerified) ? "on" : "off");
     return true;
 }
 

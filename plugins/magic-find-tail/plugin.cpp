@@ -115,6 +115,30 @@ constexpr std::array<std::uint8_t, HookSize> HookExpected{
 constexpr std::size_t MaximumConfigBytes = 32'768;
 constexpr std::size_t RelayBytes         = 4'096;
 
+// In-image trampolines (D2RLoader 1.3.1). The loader now accepts a rel32
+// jump only when its target is inside D2R.exe, and the relay page is not.
+// Each block therefore jumps to a 5-byte "jmp relay stub" written into int3
+// padding, and the relay stub runs exactly as before. A jmp changes no
+// register, flag or stack slot, so the stub sees the block's state untouched.
+//
+//   0x442673  13 x int3 after sub_1404421B0's ret (0x442672), next function
+//             at 0x442680. Unique trampoline at 0x442673, set at 0x442678.
+//   0x441FBB  5 x int3 after the ret at 0x441FBA, next function
+//             sub_140441FC0 at 0x441FC0. Rare trampoline.
+constexpr std::array<std::uintptr_t, QualityCount> TrampolineRva{ 0x442673, 0x442678, 0x441FBB };
+
+struct PaddingRun {
+    std::uintptr_t rva;
+    std::uint32_t  size;
+};
+constexpr std::array<PaddingRun, 2> PaddingRuns{{ { 0x442673, 13 }, { 0x441FBB, 5 } }};
+constexpr std::array<std::uint8_t, 13> Int3Run{
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+};
+static_assert(TrampolineRva[1] == TrampolineRva[0] + HookSize);
+static_assert(TrampolineRva[1] + HookSize <= PaddingRuns[0].rva + PaddingRuns[0].size);
+static_assert(TrampolineRva[2] + HookSize <= PaddingRuns[1].rva + PaddingRuns[1].size);
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -411,6 +435,17 @@ auto BuildTailRelay(std::uint8_t* out, const void* callback,
 // ---------------------------------------------------------------------------
 
 auto VerifyNativeContract() noexcept -> bool {
+    for (const auto& run : PaddingRuns) {
+        if (!Context->CheckExpectedBytes(run.rva, Int3Run.data(), run.size)) {
+            char message[192];
+            std::snprintf(message, sizeof(message),
+                "MagicFindSoftTail: the int3 padding at 0x%llX is not free in this "
+                "build, or another plugin already uses it. Refusing to load.",
+                static_cast<unsigned long long>(run.rva));
+            Context->LogError(message);
+            return false;
+        }
+    }
     for (std::size_t i = 0; i < QualityCount; ++i) {
         if (!Context->CheckExpectedBytes(Sites[i].witnessRva,
                 Witnesses[i].data(), WitnessSize)) {
@@ -458,10 +493,24 @@ auto InstallHooks() noexcept -> bool {
     }
     FlushInstructionCache(GetCurrentProcess(), relay, RelayBytes);
 
+    // One "jmp relay stub" per quality, written through the loader so the
+    // padding is checked first and restored when the plugin unloads.
     for (std::size_t i = 0; i < QualityCount; ++i) {
-        if (!CanEncodeRel32(imageBase + Sites[i].hookRva, relayBase + stub[i])) {
+        const auto from = imageBase + TrampolineRva[i];
+        const auto to   = relayBase + stub[i];
+        if (!CanEncodeRel32(from, to)) {
             Context->LogError(
                 "MagicFindSoftTail: relay displacement validation failed.");
+            return false;
+        }
+        std::array<std::uint8_t, HookSize> jump{ 0xE9 };
+        const auto displacement = static_cast<std::int32_t>(
+            static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from + HookSize));
+        std::memcpy(jump.data() + 1, &displacement, sizeof(displacement));
+        if (!Context->PatchBytes(TrampolineRva[i], Int3Run.data(), HookSize,
+                jump.data(), HookSize)) {
+            Context->LogError(
+                "MagicFindSoftTail: a trampoline in the int3 padding could not be written.");
             return false;
         }
     }
@@ -471,7 +520,7 @@ auto InstallHooks() noexcept -> bool {
                 Sites[i].hookRva,
                 HookExpected.data(),
                 HookSize,
-                relayBase + stub[i] - imageBase,
+                TrampolineRva[i],
                 HookSize)) {
             char message[192];
             std::snprintf(message, sizeof(message),
@@ -511,7 +560,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.magic-find-soft-tail",
     .name = "Magic Find Soft Tail",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description =
         "Adds a configurable unbounded tail to the magic find diminishing "

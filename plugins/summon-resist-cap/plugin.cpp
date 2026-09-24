@@ -35,6 +35,18 @@
 // lookup could not be verified without a live table, so the list is the honest
 // mechanism. The diagnostics below report every monstats row that reaches the
 // gate so the list can be filled in from real gameplay rather than guesswork.
+//
+// D2RLoader 1.3.1: the loader now accepts a rel32 jump only when its target is
+// inside D2R.exe, and the relay page is not. The gate therefore jumps to a
+// 5-byte "jmp relay" trampoline in the int3 padding after the resolver
+// (0x4526B6; the resolver's ret is at 0x4526B5, the next function starts at
+// 0x4526C0), and the trampoline jumps on to the relay. A jmp changes no
+// register, flag or stack slot, so the relay sees exactly what the gate saw.
+// Re-verified against the 1.3.1 image: rsi = ctx (mov rsi,rcx at 0x4523FD)
+// and ebp = 0 (xor ebp,ebp at 0x4523F5) with no later write to either before
+// the gate; the gate, both continuations (0x4524A1 mov edx,[r14+0Ch],
+// 0x4524F8 cmp dword [r14+8],24h, neither reads the flags) and the four game
+// functions the callback calls are unchanged.
 
 #include <D2RLPlugin/api.h>
 
@@ -86,6 +98,14 @@ constexpr std::uint32_t CapGatePatchSize = 5U;
 // cmp dword ptr [rsi+24h], ebp   /   jnz 0x4524F8
 constexpr std::array<std::uint8_t, 5> CapGateExpected{
     0x39, 0x6E, 0x24, 0x75, 0x57,
+};
+// In-image trampoline (D2RLoader 1.3.1), 10 x int3 after the resolver.
+constexpr std::uintptr_t TrampolineRva = 0x4526B6;
+constexpr std::array<std::uint8_t, 10> TrampolineRunExpected{
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+};
+constexpr std::array<std::uint8_t, 5> TrampolineSlotExpected{
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 };
 constexpr std::array<std::uint8_t, 18> GetUnitTypeExpected{
     0x48, 0x83, 0xEC, 0x28, 0x48, 0x85, 0xC9, 0x75, 0x1D,
@@ -165,7 +185,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.summon-resist-cap",
     .name = "Summon Resist Cap",
-    .version = "3.1.1",
+    .version = "3.1.2",
     .author = "CelestialRayOne",
     .description =
         "Caps listed monsters' resistances the way player resistances are capped.",
@@ -571,9 +591,31 @@ auto InstallRelay() noexcept -> bool {
 
     const auto relayAddress = reinterpret_cast<std::uintptr_t>(relay);
     const auto baseAddress = reinterpret_cast<std::uintptr_t>(Base);
-    if (relayAddress < baseAddress || !CanEncodeRel32(gateAddress, relayAddress)) {
+    const auto trampolineAddress = baseAddress + TrampolineRva;
+    const auto trampolineDisplacement = static_cast<std::int64_t>(relayAddress)
+        - static_cast<std::int64_t>(trampolineAddress + CapGatePatchSize);
+    if (relayAddress < baseAddress || !CanEncodeRel32(gateAddress, relayAddress)
+            || trampolineDisplacement < static_cast<std::int64_t>(INT32_MIN)
+            || trampolineDisplacement > static_cast<std::int64_t>(INT32_MAX)) {
         Context->LogError(
             "SummonResistCap: relay displacement validation failed.");
+        return false;
+    }
+
+    // "jmp relay" into the padding first. Nothing reaches it until the gate
+    // below is aimed at it.
+    std::array<std::uint8_t, CapGatePatchSize> trampoline{0xE9};
+    const auto trampolineRel32 = static_cast<std::int32_t>(trampolineDisplacement);
+    std::memcpy(trampoline.data() + 1, &trampolineRel32, sizeof(trampolineRel32));
+    if (!Context->PatchBytes(
+            TrampolineRva,
+            TrampolineSlotExpected.data(),
+            CapGatePatchSize,
+            trampoline.data(),
+            CapGatePatchSize)) {
+        Context->LogError(
+            "SummonResistCap: the trampoline at 0x4526B6 could not be written; "
+            "plugin refused.");
         return false;
     }
 
@@ -581,7 +623,7 @@ auto InstallRelay() noexcept -> bool {
             CapGateRva,
             CapGateExpected.data(),
             CapGatePatchSize,
-            relayAddress - baseAddress,
+            TrampolineRva,
             CapGatePatchSize)) {
         Context->LogError(
             "SummonResistCap: the cap gate at 0x45249C is already owned or does "
@@ -604,8 +646,16 @@ void DescribeGatePatch(char* out, std::size_t size) noexcept {
         std::memcpy(&displacement, gate + 1, sizeof(displacement));
         const auto target =
             reinterpret_cast<std::uintptr_t>(gate + 5) + displacement;
-        state = target == reinterpret_cast<std::uintptr_t>(RelayPage)
-            ? "LIVE" : "FOREIGN (jmp elsewhere)";
+        const auto* trampoline = Base + TrampolineRva;
+        state = "FOREIGN (jmp elsewhere)";
+        if (target == reinterpret_cast<std::uintptr_t>(trampoline)
+                && trampoline[0] == 0xE9) {
+            std::int32_t hop{};
+            std::memcpy(&hop, trampoline + 1, sizeof(hop));
+            const auto relay =
+                reinterpret_cast<std::uintptr_t>(trampoline + 5) + hop;
+            if (relay == reinterpret_cast<std::uintptr_t>(RelayPage)) state = "LIVE";
+        }
     }
     std::snprintf(
         out,
@@ -627,7 +677,7 @@ auto Status(
     std::size_t used = static_cast<std::size_t>(std::snprintf(
         message,
         sizeof(message),
-        "Summon Resist Cap 3.1.1: active=%s; build=%s; gate 0x45249C: %s; "
+        "Summon Resist Cap 3.1.2: active=%s; build=%s; gate 0x45249C: %s; "
         "gate calls=%llu; players=%llu; capped=%llu by Align / %llu by list; "
         "skipped=%llu; Align column=%s; extra rows=%zu:",
         Operational.load(std::memory_order_acquire) ? "true" : "false",
@@ -746,7 +796,12 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
             CapGateRva,
             CapGateExpected.data(),
             CapGateExpected.size(),
-            "the resistance cap gate")) {
+            "the resistance cap gate")
+        || !VerifyBytes(
+            TrampolineRva,
+            TrampolineRunExpected.data(),
+            TrampolineRunExpected.size(),
+            "the int3 padding after the resolver")) {
         return false;
     }
     GetUnitType = At<GetUnitTypeFn>(GetUnitTypeRva);
@@ -766,7 +821,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
     std::snprintf(
         message,
         sizeof(message),
-        "Summon Resist Cap 3.1.1 active for observed D2R %s; Align column=%s, "
+        "Summon Resist Cap 3.1.2 active for observed D2R %s; Align column=%s, "
         "%zu extra rows; cap gate 0x45249C relayed; function entry 0x4523E0 "
         "left untouched; config=%s.",
         RuntimeBuild.c_str(),

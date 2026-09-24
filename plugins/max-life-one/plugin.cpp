@@ -43,18 +43,18 @@
 //   D2RCore features that call the game entry points, other plugins) still
 //   goes through the untouched thunks and reaches the hook.
 //
-//   The hooks go through D2RLoader's own installer (D2RCore 0x482170):
-//   Native Hooks opt-in check, expected-bytes check (0x4837E0), MinHook
-//   create and enable (0x22970 / 0x23470), tracking (0x4845F0). There is no
-//   overlap refusal, and the plugin's hooks are removed on unload (0x472C80).
-//   The installer resolves the target as GetModuleHandleW(NULL) + rva, so the
-//   "rva" passed here is the export address minus the main module base.
-//   D2RCore loads above the main module (0xC0DE5000000 vs 0x140000000); the
-//   plugin checks that before installing and refuses with a clear error
-//   otherwise.
+//   D2RLoader 1.3.1's hook installer only accepts hook sites inside D2R.exe
+//   ("patch range is outside D2R.exe"), so the plugin installs these hooks
+//   itself. For each export it checks the first instructions byte for byte
+//   against D2RCore.dll 1.3.1, copies them into a trampoline that ends with an
+//   absolute jump back past them (rel32 calls and jumps and the RIP-relative
+//   cookie load re-aimed at their original targets), and turns the export
+//   entry into jmp rel32 to a relay that jumps to the hook. Relays and
+//   trampolines share one page allocated within rel32 reach of D2RCore. The
+//   entries are restored on unload and when a later hook fails to install.
 //
-//   Every export's first bytes relocate cleanly under MinHook (checked per
-//   export): sub rsp / call rel32 (ReadWideUnitStat, ReadWideEffectiveStat),
+//   Every export's first bytes relocate cleanly (checked per export against
+//   D2RCore.dll 1.3.1, including that nothing branches back into them): sub rsp / call rel32 (ReadWideUnitStat, ReadWideEffectiveStat),
 //   jmp rel32 (ReadWideItemEventStat, ReadWideMaxLife), sub rsp / mov / xor
 //   (ReadWideUnitStatCallback, ReadWideEffectiveStatZero), sub rsp / mov
 //   rax,[rip+cookie] (OnWideServerStatChanged), push x4 (SetWideUnitStat,
@@ -218,10 +218,6 @@ constexpr std::size_t   IscSaveBitsOffset = 0x15;
 // How long a player's client copy may lag behind the server copy before the
 // missing stat is reported.
 constexpr std::uint64_t ClientCopyGraceMs = 3000;
-
-// Live entry bytes handed to the installer as its expected bytes. MinHook
-// writes a five-byte jmp, so eight bytes cover the whole write.
-constexpr std::uint32_t ExpectedEntryBytes = 8;
 
 constexpr char CoreModuleName[] = "D2RCore.dll";
 
@@ -601,34 +597,73 @@ void __fastcall HookAddUnitStat(void* unit, std::uint32_t stat, std::int32_t del
 // Hook installation
 // ---------------------------------------------------------------------------
 
+// One instruction of an export's entry. dispOffset is 0 for an instruction
+// copied as is, else the offset of its rel32 or RIP disp32, which the
+// trampoline re-aims at the same absolute target.
+struct Instruction {
+    std::uint8_t length;
+    std::uint8_t dispOffset;
+};
+
+constexpr std::size_t MaxPatchSize = 11;
+
 struct HookSpec {
-    const char* exportName;
-    void*       target;
-    void**      original;
-    bool        installed;
+    const char*                             exportName;
+    void*                                   target;
+    void**                                  original;
+    std::uint8_t                            patchSize;
+    std::array<std::uint8_t, MaxPatchSize>  expected;      // D2RCore.dll 1.3.1
+    std::array<Instruction, 2>              instructions;  // together patchSize bytes
+    bool                                    installed;
+    std::uint8_t*                           entry;
+    std::array<std::uint8_t, MaxPatchSize>  written;
 };
 
 // ReadWideUnitStat first: the rule reads the configured stat through it.
 std::array<HookSpec, 9> Hooks{{
-    {"ReadWideUnitStat", reinterpret_cast<void*>(&HookReadUnitStat),
-        &OriginalReadUnitStat, false},
+    {"ReadWideUnitStat", reinterpret_cast<void*>(&HookReadUnitStat), &OriginalReadUnitStat,
+        9, {0x48, 0x83, 0xEC, 0x28, 0xE8, 0xE7, 0x6D, 0xBA, 0xFF},
+        {{{4, 0}, {5, 1}}}, false, nullptr, {}},
     {"ReadWideItemEventStat", reinterpret_cast<void*>(&HookReadItemEventStat),
-        &OriginalReadItemEventStat, false},
-    {"ReadWideMaxLife", reinterpret_cast<void*>(&HookReadMaxLife),
-        &OriginalReadMaxLife, false},
+        &OriginalReadItemEventStat,
+        5, {0xE9, 0xDB, 0x6D, 0xBA, 0xFF},
+        {{{5, 1}, {0, 0}}}, false, nullptr, {}},
+    {"ReadWideMaxLife", reinterpret_cast<void*>(&HookReadMaxLife), &OriginalReadMaxLife,
+        5, {0xE9, 0xAB, 0x67, 0xBA, 0xFF},
+        {{{5, 1}, {0, 0}}}, false, nullptr, {}},
     {"ReadWideUnitStatCallback", reinterpret_cast<void*>(&HookReadUnitStatCallback),
-        &OriginalReadUnitStatCallback, false},
+        &OriginalReadUnitStatCallback,
+        7, {0x48, 0x83, 0xEC, 0x28, 0x48, 0x89, 0xD1},
+        {{{7, 0}, {0, 0}}}, false, nullptr, {}},
     {"ReadWideEffectiveStat", reinterpret_cast<void*>(&HookReadEffectiveStat),
-        &OriginalReadEffectiveStat, false},
+        &OriginalReadEffectiveStat,
+        9, {0x48, 0x83, 0xEC, 0x28, 0xE8, 0x07, 0x5B, 0xBA, 0xFF},
+        {{{4, 0}, {5, 1}}}, false, nullptr, {}},
     {"ReadWideEffectiveStatZero", reinterpret_cast<void*>(&HookReadEffectiveStatZero),
-        &OriginalReadEffectiveStatZero, false},
+        &OriginalReadEffectiveStatZero,
+        7, {0x48, 0x83, 0xEC, 0x28, 0x45, 0x31, 0xC9},
+        {{{7, 0}, {0, 0}}}, false, nullptr, {}},
     {"OnWideServerStatChanged", reinterpret_cast<void*>(&HookServerStatChanged),
-        &OriginalServerStatChanged, false},
-    {"SetWideUnitStat", reinterpret_cast<void*>(&HookSetUnitStat),
-        &OriginalSetUnitStat, false},
-    {"AddWideUnitStat", reinterpret_cast<void*>(&HookAddUnitStat),
-        &OriginalAddUnitStat, false},
+        &OriginalServerStatChanged,
+        11, {0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0x05, 0x55, 0x81, 0xEC, 0xFF},
+        {{{4, 0}, {7, 3}}}, false, nullptr, {}},
+    {"SetWideUnitStat", reinterpret_cast<void*>(&HookSetUnitStat), &OriginalSetUnitStat,
+        5, {0x41, 0x56, 0x56, 0x57, 0x53},
+        {{{5, 0}, {0, 0}}}, false, nullptr, {}},
+    {"AddWideUnitStat", reinterpret_cast<void*>(&HookAddUnitStat), &OriginalAddUnitStat,
+        5, {0x41, 0x56, 0x56, 0x57, 0x53},
+        {{{5, 0}, {0, 0}}}, false, nullptr, {}},
 }};
+
+constexpr std::size_t HookPageBytes    = 4'096;
+constexpr std::size_t RelaySlotBytes   = 16;     // FF 25 00 00 00 00 <abs64>
+constexpr std::size_t TrampolineOffset = 0x200;
+constexpr std::size_t TrampolineBytes  = 32;     // <= 11 copied + 14 jump back
+static_assert(Hooks.size() * RelaySlotBytes <= TrampolineOffset);
+static_assert(TrampolineOffset + Hooks.size() * TrampolineBytes <= HookPageBytes);
+static_assert(MaxPatchSize + 14 <= TrampolineBytes);
+
+std::uint8_t* HookPage{};
 
 auto InstalledHookCount() noexcept -> std::size_t {
     std::size_t count = 0;
@@ -636,41 +671,6 @@ auto InstalledHookCount() noexcept -> std::size_t {
         if (hook.installed) ++count;
     }
     return count;
-}
-
-// Asks D2RLoader's diagnostics service which plugin, if any, already owns a
-// range. Empty when the loader does not track it.
-void DescribeOwner(std::uint64_t rva, const std::uint8_t* expected,
-        std::uint32_t expectedSize, char* out, std::size_t outSize) noexcept {
-    out[0] = '\0';
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics,
-            D2RL::DiagnosticsServiceV1Version, &diagnostics)
-                != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasDiagnosticsServiceV1Field(diagnostics,
-                D2RL::DiagnosticsServiceV1RequiredSize)
-            || diagnostics->queryHookStatus == nullptr) {
-        return;
-    }
-    D2RL::Diagnostics::HookQuery query{};
-    query.structSize   = D2RL::Diagnostics::HookQuerySize;
-    query.rva          = rva;
-    query.expected     = expected;
-    query.expectedSize = expectedSize;
-    D2RL::Diagnostics::HookStatus status{};
-    status.structSize = D2RL::Diagnostics::HookStatusSize;
-    if (diagnostics->queryHookStatus(Context, &query, &status)
-            != D2RL::Diagnostics::Result::Success
-            || status.state != D2RL::Diagnostics::ModificationState::Tracked) {
-        return;
-    }
-    status.ownerPluginId[sizeof(status.ownerPluginId) - 1] = '\0';
-    if (status.ownerPluginId[0] != '\0') {
-        std::snprintf(out, outSize, " It is already hooked by %s.", status.ownerPluginId);
-    } else {
-        std::snprintf(out, outSize, " It is already hooked by %u plugins.",
-            status.ownerCount);
-    }
 }
 
 auto ModuleImageSize(HMODULE module) noexcept -> std::size_t {
@@ -695,54 +695,82 @@ auto IsExecutable(std::uintptr_t address) noexcept -> bool {
     return info.State == MEM_COMMIT && (info.Protect & executable) != 0;
 }
 
-auto InstallHook(HookSpec& hook, HMODULE core, std::size_t coreSize,
-        std::uintptr_t mainBase) noexcept -> bool {
-    const FARPROC address = GetProcAddress(core, hook.exportName);
-    if (address == nullptr) {
-        D2RL::LogErrorF(Context,
-            "MaxLifeOne: D2RCore.dll has no export named %s. This plugin was built "
-            "against D2RLoader 1.3.0.", hook.exportName);
-        return false;
-    }
-    const auto target   = reinterpret_cast<std::uintptr_t>(address);
-    const auto coreBase = reinterpret_cast<std::uintptr_t>(core);
-    if (target < coreBase || target >= coreBase + coreSize
-            || target + ExpectedEntryBytes > coreBase + coreSize || !IsExecutable(target)) {
-        D2RL::LogErrorF(Context,
-            "MaxLifeOne: export %s at 0x%llX is not executable code inside D2RCore.dll.",
-            hook.exportName, static_cast<unsigned long long>(target));
-        return false;
-    }
-    if (target <= mainBase) {
-        D2RL::LogErrorF(Context,
-            "MaxLifeOne: export %s at 0x%llX sits below the main module (0x%llX), so "
-            "D2RLoader's hook installer cannot address it.",
-            hook.exportName, static_cast<unsigned long long>(target),
-            static_cast<unsigned long long>(mainBase));
-        return false;
-    }
+auto FitsRel32(std::int64_t delta) noexcept -> bool {
+    return delta >= INT32_MIN && delta <= INT32_MAX;
+}
 
-    std::array<std::uint8_t, ExpectedEntryBytes> expected{};
-    std::memcpy(expected.data(), reinterpret_cast<const void*>(target), expected.size());
-    const std::uint64_t rva = target - mainBase;
+// A page no further than a rel32 from anywhere in D2RCore.dll.
+auto AllocateNearCore(std::uintptr_t coreBase, std::size_t coreSize) noexcept -> std::uint8_t* {
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const auto granularity = static_cast<std::uintptr_t>(systemInfo.dwAllocationGranularity);
+    auto candidate = (coreBase + coreSize + granularity - 1) & ~(granularity - 1);
+    for (; FitsRel32(static_cast<std::int64_t>(candidate + HookPageBytes)
+                - static_cast<std::int64_t>(coreBase));
+            candidate += granularity) {
+        if (void* page = VirtualAlloc(reinterpret_cast<void*>(candidate), HookPageBytes,
+                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
+            return static_cast<std::uint8_t*>(page);
+        }
+    }
+    return nullptr;
+}
 
-    if (!Context->InstallInlineHook(rva, expected.data(), ExpectedEntryBytes, hook.target,
-            hook.original)) {
-        char owner[112];
-        DescribeOwner(rva, expected.data(), ExpectedEntryBytes, owner, sizeof(owner));
-        D2RL::LogErrorF(Context,
-            "MaxLifeOne: D2RLoader refused the hook on D2RCore!%s (0x%llX).%s",
-            hook.exportName, static_cast<unsigned long long>(target), owner);
-        return false;
+void WriteAbsoluteJump(std::uint8_t* at, std::uintptr_t target) noexcept {
+    static constexpr std::uint8_t JumpQwordRip[]{0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+    std::memcpy(at, JumpQwordRip, sizeof(JumpQwordRip));
+    const std::uint64_t address = target;
+    std::memcpy(at + sizeof(JumpQwordRip), &address, sizeof(address));
+}
+
+// Copies the export's entry instructions to the trampoline and re-aims every
+// rel32 and RIP disp32 at its original target. False if one cannot reach.
+auto BuildTrampoline(const HookSpec& hook, std::uint8_t* trampoline) noexcept -> bool {
+    std::size_t offset = 0;
+    for (const Instruction& instruction : hook.instructions) {
+        if (instruction.length == 0) break;
+        const std::uint8_t* source = hook.entry + offset;
+        std::uint8_t* destination  = trampoline + offset;
+        std::memcpy(destination, source, instruction.length);
+        if (instruction.dispOffset != 0) {
+            std::int32_t displacement = 0;
+            std::memcpy(&displacement, source + instruction.dispOffset, sizeof(displacement));
+            const auto absolute = reinterpret_cast<std::intptr_t>(source) + instruction.length
+                + displacement;
+            const auto moved = static_cast<std::int64_t>(absolute)
+                - (reinterpret_cast<std::intptr_t>(destination) + instruction.length);
+            if (!FitsRel32(moved)) return false;
+            const auto newDisplacement = static_cast<std::int32_t>(moved);
+            std::memcpy(destination + instruction.dispOffset, &newDisplacement,
+                sizeof(newDisplacement));
+        }
+        offset += instruction.length;
     }
-    if (*hook.original == nullptr) {
-        D2RL::LogErrorF(Context,
-            "MaxLifeOne: the hook on D2RCore!%s returned no original function.",
-            hook.exportName);
-        return false;
-    }
-    hook.installed = true;
+    if (offset != hook.patchSize) return false;
+    WriteAbsoluteJump(trampoline + offset,
+        reinterpret_cast<std::uintptr_t>(hook.entry) + hook.patchSize);
     return true;
+}
+
+auto WriteCode(std::uint8_t* at, const std::uint8_t* bytes, std::size_t size) noexcept -> bool {
+    DWORD previous = 0;
+    if (!VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &previous)) return false;
+    std::memcpy(at, bytes, size);
+    DWORD ignored = 0;
+    VirtualProtect(at, size, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, size);
+    return true;
+}
+
+// Puts back every export entry that still holds this plugin's jump.
+void UninstallHooks() noexcept {
+    for (HookSpec& hook : Hooks) {
+        if (!hook.installed || hook.entry == nullptr) continue;
+        if (std::memcmp(hook.entry, hook.written.data(), hook.patchSize) == 0
+                && WriteCode(hook.entry, hook.expected.data(), hook.patchSize)) {
+            hook.installed = false;
+        }
+    }
 }
 
 auto InstallHooks() noexcept -> bool {
@@ -756,17 +784,81 @@ auto InstallHooks() noexcept -> bool {
         D2RL::LogError(Context, "MaxLifeOne: D2RCore.dll has no readable PE header.");
         return false;
     }
-    const auto mainBase = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
-    if (mainBase != Context->exeBase) {
-        D2RL::LogWarnF(Context,
-            "MaxLifeOne: main module base 0x%llX differs from the reported exe base "
-            "0x%llX; using the main module base, as D2RLoader's installer does.",
-            static_cast<unsigned long long>(mainBase),
-            static_cast<unsigned long long>(Context->exeBase));
+    const auto coreBase = reinterpret_cast<std::uintptr_t>(core);
+
+    // Resolve and verify every export before anything is written.
+    for (HookSpec& hook : Hooks) {
+        const FARPROC address = GetProcAddress(core, hook.exportName);
+        if (address == nullptr) {
+            D2RL::LogErrorF(Context,
+                "MaxLifeOne: D2RCore.dll has no export named %s. This plugin was built "
+                "against D2RLoader 1.3.1.", hook.exportName);
+            return false;
+        }
+        const auto target = reinterpret_cast<std::uintptr_t>(address);
+        if (target < coreBase || target + hook.patchSize > coreBase + coreSize
+                || !IsExecutable(target)) {
+            D2RL::LogErrorF(Context,
+                "MaxLifeOne: export %s at 0x%llX is not executable code inside D2RCore.dll.",
+                hook.exportName, static_cast<unsigned long long>(target));
+            return false;
+        }
+        hook.entry = reinterpret_cast<std::uint8_t*>(target);
+        if (std::memcmp(hook.entry, hook.expected.data(), hook.patchSize) != 0) {
+            D2RL::LogErrorF(Context,
+                "MaxLifeOne: D2RCore!%s does not start with the instructions of the "
+                "D2RLoader 1.3.1 build this plugin was verified against, or another "
+                "plugin already hooked it.", hook.exportName);
+            return false;
+        }
     }
 
-    for (HookSpec& hook : Hooks) {
-        if (!InstallHook(hook, core, coreSize, mainBase)) return false;
+    HookPage = AllocateNearCore(coreBase, coreSize);
+    if (HookPage == nullptr) {
+        D2RL::LogError(Context, "MaxLifeOne: no page was free within reach of D2RCore.dll.");
+        return false;
+    }
+    std::memset(HookPage, 0xCC, HookPageBytes);
+    for (std::size_t index = 0; index < Hooks.size(); ++index) {
+        HookSpec& hook = Hooks[index];
+        WriteAbsoluteJump(HookPage + index * RelaySlotBytes,
+            reinterpret_cast<std::uintptr_t>(hook.target));
+        if (!BuildTrampoline(hook, HookPage + TrampolineOffset + index * TrampolineBytes)) {
+            D2RL::LogErrorF(Context,
+                "MaxLifeOne: the entry of D2RCore!%s could not be relocated.", hook.exportName);
+            return false;
+        }
+        *hook.original = HookPage + TrampolineOffset + index * TrampolineBytes;
+    }
+    DWORD previous = 0;
+    if (!VirtualProtect(HookPage, HookPageBytes, PAGE_EXECUTE_READ, &previous)) {
+        D2RL::LogError(Context, "MaxLifeOne: the hook page could not be made executable.");
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), HookPage, HookPageBytes);
+
+    for (std::size_t index = 0; index < Hooks.size(); ++index) {
+        HookSpec& hook = Hooks[index];
+        const auto relay = reinterpret_cast<std::intptr_t>(HookPage + index * RelaySlotBytes);
+        const auto displacement = static_cast<std::int64_t>(relay)
+            - (reinterpret_cast<std::intptr_t>(hook.entry) + 5);
+        if (!FitsRel32(displacement)) {
+            UninstallHooks();
+            D2RL::LogErrorF(Context, "MaxLifeOne: the relay for %s is out of reach.",
+                hook.exportName);
+            return false;
+        }
+        hook.written.fill(0x90);
+        hook.written[0] = 0xE9;
+        const auto rel32 = static_cast<std::int32_t>(displacement);
+        std::memcpy(hook.written.data() + 1, &rel32, sizeof(rel32));
+        if (!WriteCode(hook.entry, hook.written.data(), hook.patchSize)) {
+            UninstallHooks();
+            D2RL::LogErrorF(Context, "MaxLifeOne: D2RCore!%s could not be written.",
+                hook.exportName);
+            return false;
+        }
+        hook.installed = true;
     }
     return true;
 }
@@ -1075,7 +1167,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion  = D2RL_PLUGIN_API_VERSION,
     .id          = "celestialrayone.max-life-one",
     .name        = "Max Life One",
-    .version     = "1.0.1",
+    .version     = "1.0.2",
     .author      = "CelestialRayOne",
     .description = "Adds a configurable stat that sets a unit's maximum life to 1.",
     .flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
@@ -1122,6 +1214,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Armed.store(false, std::memory_order_relaxed);
     HooksReady.store(false, std::memory_order_relaxed);
+    // The page stays allocated: a thread may still be inside a trampoline.
+    UninstallHooks();
 }
 
 }  // namespace CelestialRayOne::MaxLifeOne

@@ -73,9 +73,45 @@
 //   client  sub_140217B90   217BF7  E8 -> 339E60, callback 217FC0 in r9
 //   server  sub_140439500   439565  E8 -> 339E60, callback 43AC00 in r9
 //
-// Only the rel32 of each five-byte call changes, to a near relay that jumps
-// into HookedSetLocalCooldown, which has the setter's own ABI. These two calls
-// are the only references to 0x339E60 in the image besides its .pdata entry.
+// Only the rel32 of each five-byte call changes, to a stub that jumps into
+// HookedSetLocalCooldown, which has the setter's own ABI. These two calls are
+// the only references to 0x339E60 in the image besides its .pdata entry.
+//
+// D2RLOADER 1.3.1  (re-derived against the 1.3.1 D2RLoader.exe dump and D2RCore.dll)
+// ---------------------------------------------------------------------------
+// The defect is unchanged:
+//
+//   - SetWideSkillCooldown now runs D2RCore 0x3CF850. On an existing state-185
+//     list it still only records the minimum, sets state 185 and writes stat
+//     359 at layer skillId. Only the create path allocates with 0x8000 and
+//     stores [list+88h].
+//
+//   - ExpireWideUnitStats now runs D2RCore 0x3DAE20. It still skips a sublist
+//     unless [list+1Ch] & 0x8002, counts down the float at [list+24h] and
+//     calls [list+88h] when it reaches 0.
+//
+// The game image is unchanged too: both call windows below and the setter
+// thunk are byte-identical to 1.3.0.
+//
+// What changed is the patch API. D2RCore's rel32 patch routine (0x47C760) now
+// refuses a call or jump whose TARGET lies outside D2R.exe:
+//
+//     targetRva >= SizeOfImage  ->  "patch range is outside D2R.exe"
+//
+// SDK 0.3.0 documents the same rule: the target is another RVA in D2R.exe.
+// 1.1.0 aimed both calls at a relay page allocated next to the image, so the
+// loader refused the client call at 0x217BF7 and the plugin did not load.
+//
+// 1.2.0 keeps the exact same hook and moves only the relay into the image:
+// 14 of the 15 int3 padding bytes after sub_140217B90's ret, at 0x217C31.
+// Nothing executes or references that padding; its only reference is the
+// .pdata end address of sub_140217B90. The stub is
+//
+//     217C31  FF 25 00 00 00 00   jmp qword ptr [rip+0]
+//     217C37  <8-byte address of HookedSetLocalCooldown>
+//
+// written with the loader's byte patch, and both calls become call 217C31
+// through the loader's rel32 patch, whose target is now inside D2R.exe.
 //
 // THE FIX
 // -------
@@ -93,23 +129,14 @@
 //
 // The server list already has a callback, so the adoption is a no-op there.
 //
-// Verified against the D2RLoader 1.3.0 D2RLoader.exe image and D2RCore.dll.
+// Verified against the D2RLoader 1.3.1 D2RLoader.exe dump and D2RCore.dll.
 // Built against PluginSDK v4 (D2RL_PLUGIN_API_VERSION 4).
 // ---------------------------------------------------------------------------
 
 #include <D2RLPlugin/api.h>
 
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <Windows.h>
-
 #include <array>
 #include <atomic>
-#include <climits>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -188,9 +215,52 @@ constexpr std::array<CallSite, 2> kSites{{
 static_assert(kClientCallRva - kClientWindowRva + kCallSize <= sizeof(kClientWindow));
 static_assert(kServerCallRva - kServerWindowRva + kCallSize <= sizeof(kServerWindow));
 
+// Both windows hold a call to the setter thunk. Proven here from their bytes.
+constexpr auto CallTargetRva(const std::uint8_t* window, std::uint64_t windowRva,
+                             std::uint64_t callRva) -> std::uint64_t {
+    const std::size_t at = static_cast<std::size_t>(callRva - windowRva);
+    const std::uint32_t raw = static_cast<std::uint32_t>(window[at + 1])
+        | (static_cast<std::uint32_t>(window[at + 2]) << 8)
+        | (static_cast<std::uint32_t>(window[at + 3]) << 16)
+        | (static_cast<std::uint32_t>(window[at + 4]) << 24);
+    return callRva + kCallSize + static_cast<std::int64_t>(static_cast<std::int32_t>(raw));
+}
+static_assert(kClientWindow[kClientCallRva - kClientWindowRva] == 0xE8);
+static_assert(kServerWindow[kServerCallRva - kServerWindowRva] == 0xE8);
+static_assert(CallTargetRva(kClientWindow, kClientWindowRva, kClientCallRva) == kRvaSetLocalCooldown);
+static_assert(CallTargetRva(kServerWindow, kServerWindowRva, kServerCallRva) == kRvaSetLocalCooldown);
+
+// The relay stub, inside D2R.exe so the loader accepts it as a rel32 target.
+// sub_140217B90 ends with ret at 217C30; 15 int3 bytes pad it up to the next
+// function at 217C40. The window check covers the ret and all 15 bytes.
+constexpr std::uint64_t kPaddingWindowRva = 0x217C30;
+constexpr std::uint8_t kPaddingWindow[] = {
+    0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+};
+
 // One 14-byte absolute jump: FF 25 00 00 00 00 <abs64>.
-constexpr std::size_t kRelayPageBytes   = 4'096;
-constexpr std::size_t kJumpTargetOffset = 6;
+constexpr std::uint64_t kStubRva          = 0x217C31;
+constexpr std::uint32_t kStubSize         = 14;
+constexpr std::size_t   kStubTargetOffset = 6;
+
+static_assert(kStubRva == kPaddingWindowRva + 1);
+static_assert(kStubRva + kStubSize <= kPaddingWindowRva + sizeof(kPaddingWindow));
+
+constexpr auto CanReachStub(std::uint64_t callRva) -> bool {
+    const std::int64_t delta = static_cast<std::int64_t>(kStubRva)
+        - static_cast<std::int64_t>(callRva + kCallSize);
+    return delta >= INT32_MIN && delta <= INT32_MAX;
+}
+static_assert(CanReachStub(kClientCallRva) && CanReachStub(kServerCallRva));
+
+using StubBytes = std::array<std::uint8_t, kStubSize>;
+
+constexpr StubBytes kPadding = [] {
+    StubBytes padding{};
+    padding.fill(0xCC);
+    return padding;
+}();
 
 // The loader's setter reads skillId as the full 32-bit r8d, so it is passed
 // on as 32 bits, exactly as both native callers load it.
@@ -204,7 +274,8 @@ const D2RL::PluginContext* g_context          = nullptr;
 std::uintptr_t             g_base             = 0;
 SetLocalCooldownFn         g_nativeSetter     = nullptr;
 GetStateStatlistFn         g_getStateStatlist = nullptr;
-void*                      g_relayPage        = nullptr;
+StubBytes                  g_stub             = kPadding;  // what 0x217C31 holds now
+bool                       g_stubWritten      = false;
 std::array<bool, 2>        g_patched{};
 
 std::atomic<std::uint32_t> g_setterCalls{0};
@@ -258,71 +329,47 @@ std::int32_t HookedSetLocalCooldown(void* unit,
 }
 
 // ---------------------------------------------------------------------------
-// Relay page and call-site patching
+// Relay stub and call-site patching
 // ---------------------------------------------------------------------------
 
-auto CanEncodeRel32(std::uintptr_t from, std::uintptr_t to) noexcept -> bool {
-    const std::int64_t delta =
-        static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from) - kCallSize;
-    return delta >= INT32_MIN && delta <= INT32_MAX;
+auto EncodeStub(std::uint64_t target) noexcept -> StubBytes {
+    StubBytes stub{ 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
+    std::memcpy(stub.data() + kStubTargetOffset, &target, sizeof(target));
+    return stub;
 }
 
-auto AllocateNear(std::uintptr_t hint, std::size_t size) noexcept -> void* {
-    SYSTEM_INFO systemInfo{};
-    GetSystemInfo(&systemInfo);
-    const auto granularity = static_cast<std::uintptr_t>(systemInfo.dwAllocationGranularity);
-    const auto aligned = hint & ~(granularity - 1U);
-    for (std::uintptr_t delta = granularity; delta < 0x7000'0000ULL; delta += granularity) {
-        const auto candidate = aligned + delta;
-        if (!CanEncodeRel32(hint, candidate + size)) break;
-        if (auto* memory = VirtualAlloc(reinterpret_cast<void*>(candidate), size,
-                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)) {
-            return memory;
-        }
-    }
-    return nullptr;
-}
-
-void WriteJumpStub(std::uint8_t* stub, std::uint64_t target) noexcept {
-    static constexpr std::uint8_t kJumpQwordRip[]{ 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00 };
-    std::memcpy(stub, kJumpQwordRip, sizeof(kJumpQwordRip));
-    std::memcpy(stub + kJumpTargetOffset, &target, sizeof(target));
-}
-
-auto EncodeCall(std::uintptr_t from, std::uintptr_t to) noexcept
+auto EncodeCall(std::uint64_t fromRva, std::uint64_t toRva) noexcept
         -> std::array<std::uint8_t, kCallSize> {
     std::array<std::uint8_t, kCallSize> bytes{ 0xE8 };
     const auto displacement = static_cast<std::int32_t>(
-        static_cast<std::int64_t>(to) - static_cast<std::int64_t>(from + kCallSize));
+        static_cast<std::int64_t>(toRva) - static_cast<std::int64_t>(fromRva + kCallSize));
     std::memcpy(bytes.data() + 1, &displacement, sizeof(displacement));
     return bytes;
 }
 
-// Points the relay straight at the native setter. A call already on its way
-// through the relay then runs native code only.
-auto RetargetRelayToNative() noexcept -> bool {
-    if (g_relayPage == nullptr) return true;
-    auto* page = static_cast<std::uint8_t*>(g_relayPage);
-    DWORD previous = 0;
-    if (!VirtualProtect(page, kRelayPageBytes, PAGE_EXECUTE_READWRITE, &previous)) {
+// Rewrites the stub through the loader, checked against what it holds now.
+auto WriteStub(const StubBytes& next) noexcept -> bool {
+    if (!g_context->PatchBytes(kStubRva, g_stub.data(), kStubSize, next.data(), kStubSize)) {
         return false;
     }
-    const std::uint64_t native = g_base + kRvaSetLocalCooldown;
-    std::memcpy(page + kJumpTargetOffset, &native, sizeof(native));
-    DWORD ignored = 0;
-    VirtualProtect(page, kRelayPageBytes, previous, &ignored);
-    FlushInstructionCache(GetCurrentProcess(), page, kRelayPageBytes);
+    g_stub = next;
     return true;
+}
+
+// Points the stub straight at the native setter. A call already on its way
+// through the stub then runs native code only.
+auto RetargetStubToNative() noexcept -> bool {
+    if (!g_stubWritten) return true;
+    return WriteStub(EncodeStub(g_base + kRvaSetLocalCooldown));
 }
 
 // Writes the original call back over every patched site.
 auto RestoreSites() noexcept -> bool {
-    const auto relay = reinterpret_cast<std::uintptr_t>(g_relayPage);
     bool restored = true;
     for (std::size_t i = kSites.size(); i-- > 0;) {
         if (!g_patched[i]) continue;
         const CallSite& site = kSites[i];
-        const auto current = EncodeCall(g_base + site.callRva, relay);
+        const auto current = EncodeCall(site.callRva, kStubRva);
         if (g_context->PatchBytes(site.callRva, current.data(), kCallSize,
                 OriginalCallBytes(site), kCallSize)) {
             g_patched[i] = false;
@@ -353,49 +400,28 @@ auto VerifyNativeContract() noexcept -> bool {
             return false;
         }
     }
+    if (!g_context->CheckExpectedBytes(kPaddingWindowRva, kPaddingWindow,
+            static_cast<std::uint32_t>(sizeof(kPaddingWindow)))) {
+        g_context->LogError("local-cooldowns: the padding at RVA 0x217C31 is not free int3 "
+                            "padding in this build, or another plugin already uses it; "
+                            "refusing to load");
+        return false;
+    }
     return true;
 }
 
 // Returns false when nothing in the image reaches this DLL any more.
 auto InstallCallSites() noexcept -> bool {
-    std::uint64_t lowest = UINT64_MAX;
-    for (const auto& site : kSites) {
-        if (site.callRva < lowest) lowest = site.callRva;
-    }
-
-    g_relayPage = AllocateNear(g_base + lowest, kRelayPageBytes);
-    if (g_relayPage == nullptr) {
-        g_context->LogError("local-cooldowns: no relay page within rel32 reach");
+    if (!WriteStub(EncodeStub(reinterpret_cast<std::uint64_t>(&HookedSetLocalCooldown)))) {
+        g_context->LogError("local-cooldowns: the relay stub at RVA 0x217C31 could not be written");
         return false;
     }
-
-    auto* page = static_cast<std::uint8_t*>(g_relayPage);
-    std::memset(page, 0xCC, kRelayPageBytes);
-    WriteJumpStub(page, reinterpret_cast<std::uint64_t>(&HookedSetLocalCooldown));
-
-    DWORD previous = 0;
-    if (!VirtualProtect(page, kRelayPageBytes, PAGE_EXECUTE_READ, &previous)) {
-        g_context->LogError("local-cooldowns: relay page protection could not be finalized");
-        VirtualFree(g_relayPage, 0, MEM_RELEASE);
-        g_relayPage = nullptr;
-        return false;
-    }
-    FlushInstructionCache(GetCurrentProcess(), page, kRelayPageBytes);
-
-    const auto relay = reinterpret_cast<std::uintptr_t>(g_relayPage);
-    for (const auto& site : kSites) {
-        if (!CanEncodeRel32(g_base + site.callRva, relay)) {
-            g_context->LogError("local-cooldowns: relay displacement validation failed");
-            VirtualFree(g_relayPage, 0, MEM_RELEASE);
-            g_relayPage = nullptr;
-            return false;
-        }
-    }
+    g_stubWritten = true;
 
     for (std::size_t i = 0; i < kSites.size(); ++i) {
         const CallSite& site = kSites[i];
         if (g_context->PatchCallRel32(site.callRva, OriginalCallBytes(site), kCallSize,
-                relay - g_base, kCallSize)) {
+                kStubRva, kCallSize)) {
             g_patched[i] = true;
             continue;
         }
@@ -406,19 +432,14 @@ auto InstallCallSites() noexcept -> bool {
             site.name, static_cast<unsigned long long>(site.callRva));
         g_context->LogError(line);
 
-        const bool retargeted = RetargetRelayToNative();
         if (RestoreSites()) {
-            VirtualFree(g_relayPage, 0, MEM_RELEASE);
-            g_relayPage = nullptr;
+            // Nothing calls the stub any more: give the padding back.
+            if (WriteStub(kPadding)) g_stubWritten = false;
             return false;
         }
-        if (retargeted) {
-            g_context->LogError("local-cooldowns: a site could not be restored; it now "
-                                "reaches the native setter without adoption");
-            return false;
-        }
-        g_context->LogError("local-cooldowns: rollback failed, staying loaded so the "
-                            "patched site keeps a valid target");
+        RetargetStubToNative();
+        g_context->LogError("local-cooldowns: rollback failed, staying loaded so every "
+                            "patched call keeps a valid target");
         return true;
     }
     return true;
@@ -437,10 +458,12 @@ auto StatusCommand(D2R::Game::Client* client,
     char line[256];
 
     std::snprintf(line, sizeof(line),
-                  "local-cooldowns: client call %s, server call %s (setter RVA 0x%llX)",
+                  "local-cooldowns: client call %s, server call %s (setter RVA 0x%llX, "
+                  "stub RVA 0x%llX)",
                   g_patched[0] ? "HOOKED" : "not hooked",
                   g_patched[1] ? "HOOKED" : "not hooked",
-                  static_cast<unsigned long long>(kRvaSetLocalCooldown));
+                  static_cast<unsigned long long>(kRvaSetLocalCooldown),
+                  static_cast<unsigned long long>(kStubRva));
     command->plugin->WriteConsoleMessage(line);
 
     std::snprintf(line, sizeof(line),
@@ -464,7 +487,7 @@ constexpr D2RL::PluginInfo kPluginInfo{
     .apiVersion  = D2RL_PLUGIN_API_VERSION,
     .id          = "celestialrayone.local-cooldowns",
     .name        = "True Local Cooldowns",
-    .version     = "1.1.0",
+    .version     = "1.2.0",
     .author      = "CelestialRayOne",
     .description = "Gives the client's local-cooldown statlist the expire "
                    "callback it is missing, so each skill comes off cooldown "
@@ -511,7 +534,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     }
 
     context->LogInfo("local-cooldowns: client and server cooldown calls redirected "
-                     "(RVA 0x217BF7, 0x439565)");
+                     "(RVA 0x217BF7, 0x439565) through the stub at RVA 0x217C31");
 
     if (!context->RegisterConsoleCommand("localcooldowns", StatusCommand,
                                          "Report local-cooldown hook status and "
@@ -523,9 +546,10 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
-    if (g_context == nullptr || g_relayPage == nullptr) return;
-    RetargetRelayToNative();
+    if (g_context == nullptr || !g_stubWritten) return;
+    RetargetStubToNative();
     RestoreSites();
-    // The relay page is deliberately kept: a thread may be inside a jump
-    // through it right now, and a site that could not be restored still needs it.
+    // The stub is deliberately left in place, aimed at the native setter: a
+    // thread may be inside its jump right now, and a site that could not be
+    // restored still needs it.
 }

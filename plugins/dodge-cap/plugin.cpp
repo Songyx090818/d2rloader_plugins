@@ -253,6 +253,24 @@ constexpr std::size_t RelayPageBytes   = 4'096;
 constexpr std::size_t JumpTargetOffset = 6;     // FF 25 00 00 00 00 <abs64>
 constexpr std::array<std::size_t, KindCount> RelayOffset{ 0, 16 };
 
+// In-image trampolines (D2RLoader 1.3.1). The loader now accepts a rel32
+// call only when its target is inside D2R.exe, and the relay page is not.
+// Each site therefore calls a 5-byte "jmp relay stub" written into int3
+// padding, and the relay stub continues to the read hook exactly as before.
+// A jmp changes no register and no stack slot, so the hook still sees the
+// getter's ABI and returns straight to the call site.
+//
+//   0x44CE75  11 x int3 between the ret at 0x44CE74 and the next function at
+//             0x44CE80. Gameplay trampoline at 0x44CE75, display at 0x44CE7A.
+constexpr std::uint64_t TrampolineRunRva = 0x44CE75;
+constexpr std::array<std::uint8_t, 11> TrampolineRunExpected{
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+};
+constexpr std::array<std::uint64_t, KindCount> TrampolineRva{ 0x44CE75, 0x44CE7A };
+constexpr std::array<std::uint8_t, 5> TrampolineSlotExpected{ 0xCC, 0xCC, 0xCC, 0xCC, 0xCC };
+static_assert(TrampolineRva[1] == TrampolineRva[0] + 5);
+static_assert(TrampolineRva[1] + 5 <= TrampolineRunRva + TrampolineRunExpected.size());
+
 constexpr std::size_t MaximumConfigBytes = 32'768;
 
 // ---------------------------------------------------------------------------
@@ -539,6 +557,47 @@ auto EncodeCall(std::uintptr_t from, std::uintptr_t to) noexcept
     return bytes;
 }
 
+auto EncodeJump(std::uintptr_t from, std::uintptr_t to) noexcept
+        -> std::array<std::uint8_t, CallSize> {
+    auto bytes = EncodeCall(from, to);
+    bytes[0] = 0xE9;
+    return bytes;
+}
+
+std::array<bool, KindCount> TrampolineWritten{};
+
+// Writes "jmp relay stub" into one trampoline slot through the loader, which
+// checks the padding first.
+auto WriteTrampoline(SiteKind kind) noexcept -> bool {
+    const auto index = KindIndex(kind);
+    if (TrampolineWritten[index]) return true;
+    const auto imageBase = reinterpret_cast<std::uintptr_t>(Base);
+    const auto from = imageBase + TrampolineRva[index];
+    if (!CanEncodeRel32(from, RelayAddress(kind))) return false;
+    const auto jump = EncodeJump(from, RelayAddress(kind));
+    if (!Context->PatchBytes(TrampolineRva[index], TrampolineSlotExpected.data(),
+            static_cast<std::uint32_t>(TrampolineSlotExpected.size()), jump.data(), CallSize)) {
+        return false;
+    }
+    TrampolineWritten[index] = true;
+    return true;
+}
+
+// Puts the int3 padding back once no site calls a trampoline any more.
+void RestoreTrampolines() noexcept {
+    const auto imageBase = reinterpret_cast<std::uintptr_t>(Base);
+    for (std::size_t index = 0; index < KindCount; ++index) {
+        if (!TrampolineWritten[index]) continue;
+        const auto kind = static_cast<SiteKind>(index);
+        const auto current = EncodeJump(imageBase + TrampolineRva[index], RelayAddress(kind));
+        if (Context->PatchBytes(TrampolineRva[index], current.data(), CallSize,
+                TrampolineSlotExpected.data(),
+                static_cast<std::uint32_t>(TrampolineSlotExpected.size()))) {
+            TrampolineWritten[index] = false;
+        }
+    }
+}
+
 // Points both relays at the vanilla getter. Anything still calling a relay
 // then runs native code only.
 auto RetargetRelaysToVanilla() noexcept -> bool {
@@ -565,7 +624,8 @@ auto RestoreSites() noexcept -> bool {
     for (std::size_t i = SiteCount; i-- > 0;) {
         if (!Patched[i]) continue;
         const Site& site = Sites[i];
-        const auto current = EncodeCall(imageBase + site.callRva, RelayAddress(site.kind));
+        const auto current = EncodeCall(imageBase + site.callRva,
+            imageBase + TrampolineRva[KindIndex(site.kind)]);
         if (Context->PatchBytes(site.callRva, current.data(), CallSize,
                 OriginalCallBytes(site), CallSize)) {
             Patched[i] = false;
@@ -590,7 +650,14 @@ auto VerifyNativeContract() noexcept -> bool {
                 static_cast<std::uint32_t>(GetUnitStatBody.size()))) {
         Context->LogError(
             "DodgeAvoidEvadeCap: STATLIST_GetUnitStat at 0x2F5020 is not the "
-            "D2RLoader 1.3.0 thunk to D2RCore ReadWideUnitStat. Refusing to load.");
+            "D2RLoader thunk to D2RCore ReadWideUnitStat. Refusing to load.");
+        return false;
+    }
+    if (!Context->CheckExpectedBytes(TrampolineRunRva, TrampolineRunExpected.data(),
+            static_cast<std::uint32_t>(TrampolineRunExpected.size()))) {
+        Context->LogError(
+            "DodgeAvoidEvadeCap: the int3 padding at 0x44CE75 is not free in this "
+            "build, or another plugin already uses it. Refusing to load.");
         return false;
     }
     for (const auto& site : Sites) {
@@ -650,10 +717,10 @@ auto InstallHooks() noexcept -> bool {
     FlushInstructionCache(GetCurrentProcess(), page, RelayPageBytes);
 
     for (const auto& site : Sites) {
-        if (SiteEnabled(site)
-                && !CanEncodeRel32(imageBase + site.callRva, RelayAddress(site.kind))) {
+        if (SiteEnabled(site) && !WriteTrampoline(site.kind)) {
             Context->LogError(
-                "DodgeAvoidEvadeCap: relay displacement validation failed.");
+                "DodgeAvoidEvadeCap: the trampolines at 0x44CE75 could not be written.");
+            RestoreTrampolines();
             ReleaseRelayPage();
             return false;
         }
@@ -664,7 +731,7 @@ auto InstallHooks() noexcept -> bool {
         if (!SiteEnabled(site)) continue;
 
         if (Context->PatchCallRel32(site.callRva, OriginalCallBytes(site), CallSize,
-                RelayAddress(site.kind) - imageBase, CallSize)) {
+                TrampolineRva[KindIndex(site.kind)], CallSize)) {
             Patched[i] = true;
             continue;
         }
@@ -678,6 +745,7 @@ auto InstallHooks() noexcept -> bool {
         const bool retargeted = RetargetRelaysToVanilla();
         const bool restored = RestoreSites();
         if (restored) {
+            RestoreTrampolines();
             ReleaseRelayPage();
             return false;
         }
@@ -751,7 +819,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.dodge-avoid-evade-cap",
     .name = "Dodge Avoid Evade Cap",
-    .version = "1.0.1",
+    .version = "1.0.2",
     .author = "CelestialRayOne",
     .description =
         "Caps the chance to dodge, avoid and evade at a configurable percent, "

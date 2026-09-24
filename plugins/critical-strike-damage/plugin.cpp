@@ -153,6 +153,46 @@ constexpr auto DeadlyStrikeReadExpected = std::to_array<std::uint8_t>({
     0xE8, 0xDC, 0x98, 0xEA, 0xFF,
 });
 
+// In-image trampolines (D2RLoader 1.3.1).
+//
+// 1.3.1's rel32 patch accepts a call or jump only when its TARGET lies inside
+// D2R.exe ("patch range is outside D2R.exe" otherwise), and the relay page is
+// outside the image. So every redirected site now lands on a 5-byte
+// "jmp relay+x" trampoline written into int3 padding between two functions,
+// and the trampoline continues to the same relay code as before. Registers,
+// flags and the stack reach the relay untouched, exactly as in 1.0.1.
+//
+//   0x44DB12  14 x int3 after the tail jmp that ends the function before
+//             sub_14044DB20 (0x44DB20). Holds the melee and missile trampolines.
+//   0x465B33  13 x int3 after the ret that ends sub_140465420 (0x465B33).
+//             Holds the two provenance trampolines.
+constexpr std::uint32_t  TrampolineSize          = 5;
+constexpr std::uintptr_t DoubleTrampolineRunRva  = 0x44DB12;
+constexpr std::uintptr_t CriticalTrampolineRva   = 0x44DB12;
+constexpr std::uintptr_t MissileTrampolineRva    = 0x44DB17;
+constexpr std::uintptr_t ProbeTrampolineRunRva   = 0x465B33;
+constexpr std::uintptr_t PassiveTrampolineRva    = 0x465B33;
+constexpr std::uintptr_t DeadlyTrampolineRva     = 0x465B38;
+
+constexpr auto DoubleTrampolineRunExpected = std::to_array<std::uint8_t>({
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+});
+constexpr auto ProbeTrampolineRunExpected = std::to_array<std::uint8_t>({
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+});
+constexpr std::array<std::uint8_t, TrampolineSize> TrampolineSlotExpected{
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+};
+
+static_assert(MissileTrampolineRva == CriticalTrampolineRva + TrampolineSize);
+static_assert(MissileTrampolineRva + TrampolineSize
+    <= DoubleTrampolineRunRva + DoubleTrampolineRunExpected.size());
+static_assert(DeadlyTrampolineRva == PassiveTrampolineRva + TrampolineSize);
+static_assert(DeadlyTrampolineRva + TrampolineSize
+    <= ProbeTrampolineRunRva + ProbeTrampolineRunExpected.size());
+
 // 0x2F5020 entry (unit in rcx, statId in edx, layer in r8d). In D2RLoader
 // 1.3.0 a thunk to D2RCore!ReadWideUnitStat:
 //   2F5020  FF 25 xx xx xx xx   jmp   [rip+disp32]
@@ -557,6 +597,19 @@ auto CanEncodeRel32(std::uintptr_t from, std::uintptr_t to) noexcept -> bool {
     return delta >= INT32_MIN && delta <= INT32_MAX;
 }
 
+// Writes "jmp target" into one int3 trampoline slot, through the loader so the
+// padding is checked first and restored when the plugin unloads.
+auto WriteTrampoline(std::uintptr_t rva, std::uintptr_t target) noexcept -> bool {
+    const auto from = reinterpret_cast<std::uintptr_t>(Base) + rva;
+    if (!CanEncodeRel32(from, target)) return false;
+    std::array<std::uint8_t, TrampolineSize> jump{ 0xE9 };
+    const auto displacement = static_cast<std::int32_t>(
+        static_cast<std::int64_t>(target) - static_cast<std::int64_t>(from + TrampolineSize));
+    std::memcpy(jump.data() + 1, &displacement, sizeof(displacement));
+    return Context->PatchBytes(rva, TrampolineSlotExpected.data(), TrampolineSize,
+        jump.data(), TrampolineSize);
+}
+
 auto AllocateNear(void* hint, std::size_t size) noexcept -> void* {
     SYSTEM_INFO systemInfo{};
     GetSystemInfo(&systemInfo);
@@ -720,7 +773,9 @@ auto Verify(std::uintptr_t rva, const std::array<std::uint8_t, Size>& expected,
 }
 
 auto VerifyNativeContract() noexcept -> bool {
-    if (!Verify(FillDamageValuesRva, FillDamageValuesExpected, "damage builder")
+    if (!Verify(DoubleTrampolineRunRva, DoubleTrampolineRunExpected,
+            "int3 padding at 0x44DB12")
+        || !Verify(FillDamageValuesRva, FillDamageValuesExpected, "damage builder")
         || !Verify(CriticalDoubleRva, CriticalDoubleExpected,
                    "critical doubling block")
         || !Verify(PassiveCriticalReadRva, PassiveCriticalReadExpected,
@@ -804,12 +859,20 @@ auto InstallHooks() noexcept -> bool {
     }
     FlushInstructionCache(GetCurrentProcess(), relay, RelayBytes);
 
-    if (!CanEncodeRel32(imageBase + CriticalDoubleRva, relayBase + scaleStub)
+    if (!WriteTrampoline(CriticalTrampolineRva, relayBase + scaleStub)
         || (Settings.applyToMissiles
-            && !CanEncodeRel32(imageBase + MissileDoubleRva,
-                               relayBase + missileStub))) {
+            && !WriteTrampoline(MissileTrampolineRva, relayBase + missileStub))) {
         Context->LogError(
-            "CriticalStrikeDamage: relay displacement validation failed.");
+            "CriticalStrikeDamage: the doubling trampolines at 0x44DB12 could not be written.");
+        return false;
+    }
+    if (needProvenance
+        && (!Verify(ProbeTrampolineRunRva, ProbeTrampolineRunExpected,
+                    "int3 padding at 0x465B33")
+            || !WriteTrampoline(PassiveTrampolineRva, relayBase + passiveThunk)
+            || !WriteTrampoline(DeadlyTrampolineRva, relayBase + deadlyThunk))) {
+        Context->LogError(
+            "CriticalStrikeDamage: the probe trampolines at 0x465B33 could not be written.");
         return false;
     }
 
@@ -829,12 +892,12 @@ auto InstallHooks() noexcept -> bool {
                 PassiveCriticalReadRva,
                 PassiveCriticalReadExpected.data(),
                 static_cast<std::uint32_t>(PassiveCriticalReadExpected.size()),
-                relayBase + passiveThunk - imageBase)
+                PassiveTrampolineRva)
             || !Context->PatchCallRel32(
                 DeadlyStrikeReadRva,
                 DeadlyStrikeReadExpected.data(),
                 static_cast<std::uint32_t>(DeadlyStrikeReadExpected.size()),
-                relayBase + deadlyThunk - imageBase)) {
+                DeadlyTrampolineRva)) {
             Context->LogError(
                 "CriticalStrikeDamage: a critical-source probe could not be installed.");
             return false;
@@ -846,7 +909,7 @@ auto InstallHooks() noexcept -> bool {
             CriticalDoubleRva,
             CriticalDoubleExpected.data(),
             static_cast<std::uint32_t>(CriticalDoubleExpected.size()),
-            relayBase + scaleStub - imageBase,
+            CriticalTrampolineRva,
             CriticalDoubleSize)) {
         Context->LogError(
             "CriticalStrikeDamage: the critical doubling block could not be redirected.");
@@ -868,7 +931,7 @@ auto InstallHooks() noexcept -> bool {
                 MissileDoubleRva,
                 CriticalDoubleExpected.data(),
                 static_cast<std::uint32_t>(CriticalDoubleExpected.size()),
-                relayBase + missileStub - imageBase,
+                MissileTrampolineRva,
                 CriticalDoubleSize)) {
             Context->LogError(
                 "CriticalStrikeDamage: the missile critical doubling block could "
@@ -914,7 +977,7 @@ constexpr D2RL::PluginInfo Info{
     .apiVersion = D2RL_PLUGIN_API_VERSION,
     .id = "celestialrayone.critical-strike-damage",
     .name = "Critical Strike Damage",
-    .version = "1.0.1",
+    .version = "1.0.2",
     .author = "CelestialRayOne",
     .description =
         "Adds a configurable stat that increases the damage multiplier of "

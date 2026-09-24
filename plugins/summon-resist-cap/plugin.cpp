@@ -182,7 +182,7 @@ std::atomic<std::size_t> ObservedCount{};
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.summon-resist-cap",
     .name = "Summon Resist Cap",
     .version = "3.1.2",
@@ -754,7 +754,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept
 D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(
         const D2RL::PluginContext* context) noexcept -> bool {
     if (!D2RL::HasContext(context)
-            || context->apiVersion != D2RL_PLUGIN_API_VERSION) {
+            || context->abiVersion != D2RL_PLUGIN_ABI_VERSION) {
         return false;
     }
     Context = context;

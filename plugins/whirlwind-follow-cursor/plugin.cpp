@@ -1842,7 +1842,7 @@ auto WhirlwindCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* com
 
 constexpr D2RL::PluginInfo WhirlwindInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.whirlwind",
 	.name        = "Whirlwind",
 	.version     = "0.4.0",

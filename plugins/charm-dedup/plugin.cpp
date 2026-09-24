@@ -5,9 +5,12 @@
 //  active at a time. The other charms of the group stay where they are, give
 //  no bonuses, and are drawn with the red background of an unusable item.
 //
-//  Built for D2R 3.3 under D2RLoader 1.3.0. Every address below was read out
-//  of the dumped D2RLoader 1.3.0 image or D2RCore.dll 1.3.0 and disassembled
-//  before being relied on. Byte witnesses guard all of them, so a different
+//  Built for D2R 3.3 under D2RLoader 1.3.1. Every address below was read out
+//  of the dumped D2RLoader 1.3.1 image or D2RCore.dll 1.3.1 and disassembled
+//  before being relied on. 1.3.1 moved both thunks, their slots and the two
+//  D2RCore exports; the export bodies are the 1.3.0 code, rebuilt (the only
+//  change is where D2RCore keeps its own inactive-charm tint flag, which the
+//  plugin never touches). Byte witnesses guard all of them, so a different
 //  build refuses cleanly and the game runs stock.
 //
 // -----------------------------------------------------------------------------
@@ -15,7 +18,7 @@
 // -----------------------------------------------------------------------------
 //  D2RLoader moved the charm predicate into D2RCore.dll. All 12 game callers
 //  of the stock ITEMS_IsCharmUsable (0x36AE00, now dead) call the import thunk
-//  at 0x3E2B548 (jmp [0x3E2AC10]), which lands on D2RCore!IsCharmUsable:
+//  at 0x3E2B61C (jmp [0x3E2ACA0]), which lands on D2RCore!IsCharmUsable:
 //
 //      IsCharmUsable(item, owner) = item is valid
 //                                && item type 13 (charm)
@@ -53,8 +56,8 @@
 // -----------------------------------------------------------------------------
 //  RED BACKGROUND
 // -----------------------------------------------------------------------------
-//  The inventory item renderer 0x2C3570 calls the thunk at 0x3E2B1CA
-//  (jmp [0x3E2A780]) -> D2RCore!CheckInventoryItemRequirementsForDisplay at
+//  The inventory item renderer 0x2C3570 calls the thunk at 0x3E2B298
+//  (jmp [0x3E2A808]) -> D2RCore!CheckInventoryItemRequirementsForDisplay at
 //  0x2C3774 and takes its red, requirements-not-met path at 0x2C377B when the
 //  result is 0. It is the only caller. The plugin returns 0 there for a
 //  grouped charm that is eligible but switched off by the rule. D2RCore's own
@@ -67,7 +70,7 @@
 //  page the plugin allocates within reach of the image; the stub jumps to the
 //  hook. The hooks call the D2RCore exports resolved by name, after checking
 //  that each thunk slot holds exactly that export and that the export bodies
-//  are the 1.3.0 bodies. Nothing in D2RCore.dll is modified.
+//  are the 1.3.1 bodies. Nothing in D2RCore.dll is modified.
 //
 //  Console command "charmdedup" shows the settings, what is installed and
 //  counters. Settings: d2rloader/config/celestialrayone.charm-dedup.toml
@@ -96,7 +99,7 @@
 namespace CelestialRayOne::CharmDedup {
 namespace {
 
-constexpr char PluginVersion[] = "1.0.0";
+constexpr char PluginVersion[] = "1.0.1";
 
 // ---------------------------------------------------------------------------
 //  Default configuration. EnsureConfig writes this text on first load, and it
@@ -115,7 +118,7 @@ constexpr const char DefaultConfigToml[] = R"TOML(# celestialrayone.charm-dedup
 #   removing rows in the txt files cannot break a group.
 #
 # Changes are read when the plugin loads. Restart the game after editing.
-# Built for D2RLoader 1.3.0 (Diablo II: Resurrected 3.3). On any other build
+# Built for D2RLoader 1.3.1 (Diablo II: Resurrected 3.3). On any other build
 # the byte checks fail and the plugin loads without changing the game.
 
 # Master switch. false loads the plugin without touching the game.
@@ -561,20 +564,20 @@ inline auto EvaluateGroupedCharm(Env& env, void* item, void* owner, std::int32_t
 // LOGIC-END
 
 // ---------------------------------------------------------------------------
-//  Native layout (D2R 3.3, D2RLoader 1.3.0 process image)
+//  Native layout (D2R 3.3, D2RLoader 1.3.1 process image)
 // ---------------------------------------------------------------------------
 constexpr std::int32_t UnitTypeItem          = 4;
 constexpr std::size_t  MaximumInventoryItems = 4096;
 constexpr const char   SourceFile[]          = "charm-dedup";
 
 // Import thunks D2RLoader generated for the D2RCore replacements.
-constexpr std::uint64_t IsCharmUsableThunkRva       = 0x3E2B548;  // FF 25 C2 F6 FF FF
-constexpr std::uint64_t IsCharmUsableSlotRva        = 0x3E2AC10;
-constexpr std::uint64_t DisplayRequirementsThunkRva = 0x3E2B1CA;  // FF 25 B0 F5 FF FF
-constexpr std::uint64_t DisplayRequirementsSlotRva  = 0x3E2A780;
+constexpr std::uint64_t IsCharmUsableThunkRva       = 0x3E2B61C;  // FF 25 7E F6 FF FF (3E2B548 in 1.3.0)
+constexpr std::uint64_t IsCharmUsableSlotRva        = 0x3E2ACA0;  // (3E2AC10 in 1.3.0)
+constexpr std::uint64_t DisplayRequirementsThunkRva = 0x3E2B298;  // FF 25 6A F5 FF FF (3E2B1CA in 1.3.0)
+constexpr std::uint64_t DisplayRequirementsSlotRva  = 0x3E2A808;  // (3E2A780 in 1.3.0)
 
-constexpr auto IsCharmUsableThunk       = std::to_array<std::uint8_t>({0xFF, 0x25, 0xC2, 0xF6, 0xFF, 0xFF});
-constexpr auto DisplayRequirementsThunk = std::to_array<std::uint8_t>({0xFF, 0x25, 0xB0, 0xF5, 0xFF, 0xFF});
+constexpr auto IsCharmUsableThunk       = std::to_array<std::uint8_t>({0xFF, 0x25, 0x7E, 0xF6, 0xFF, 0xFF});
+constexpr auto DisplayRequirementsThunk = std::to_array<std::uint8_t>({0xFF, 0x25, 0x6A, 0xF5, 0xFF, 0xFF});
 
 // Game functions the rule calls.
 constexpr std::uint64_t GetItemCodeRva      = 0x36EF50;  // ITEMS_GetItemCode(item) -> packed code
@@ -622,23 +625,23 @@ constexpr auto GetStatListOwnerEntry = std::to_array<std::uint8_t>({
     0x44, 0x99, 0xFF, 0xFF,
 });
 
-// D2RCore.dll 1.3.0
+// D2RCore.dll 1.3.1
 constexpr wchar_t       CoreModuleName[]                = L"D2RCore.dll";
 constexpr char          CoreIsCharmUsableName[]         = "IsCharmUsable";
 constexpr char          CoreDisplayRequirementsName[]   = "CheckInventoryItemRequirementsForDisplay";
-constexpr std::uint64_t CoreIsCharmUsableRva            = 0x78F7B0;
-constexpr std::uint64_t CoreDisplayRequirementsRva      = 0x78E2A0;
+constexpr std::uint64_t CoreIsCharmUsableRva            = 0x816850;  // 78F7B0 in 1.3.0
+constexpr std::uint64_t CoreDisplayRequirementsRva      = 0x815340;  // 78E2A0 in 1.3.0
 
 // IsCharmUsable(item, owner): only rcx and rdx are read, result in eax.
 constexpr auto CoreIsCharmUsableBody = std::to_array<std::uint8_t>({
     0x55, 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x6C, 0x24,
     0x40, 0x48, 0xC7, 0x45, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xD6,
-    0x48, 0x89, 0xCF, 0xFF, 0x15, 0x97, 0xDC, 0xEE, 0xFF, 0x90, 0x31, 0xDB,
+    0x48, 0x89, 0xCF, 0xFF, 0x15, 0xAF, 0x92, 0xEE, 0xFF, 0x90, 0x31, 0xDB,
     0x84, 0xC0, 0x74, 0x50, 0x48, 0x89, 0xF9, 0xBA, 0x0D, 0x00, 0x00, 0x00,
-    0xFF, 0x15, 0xDA, 0xDB, 0xEE, 0xFF, 0x90, 0x85, 0xC0, 0x74, 0x3D, 0x48,
-    0x89, 0xF9, 0xFF, 0x15, 0x24, 0xD8, 0xEE, 0xFF, 0x90, 0x89, 0xC1, 0xE8,
-    0x84, 0x61, 0xC9, 0xFF, 0x84, 0xC0, 0x74, 0x28, 0x48, 0x8B, 0x05, 0xA1,
-    0xDB, 0xEE, 0xFF, 0x0F, 0x57, 0xC0, 0x0F, 0x11, 0x44, 0x24, 0x20, 0xC7,
+    0xFF, 0x15, 0xF2, 0x91, 0xEE, 0xFF, 0x90, 0x85, 0xC0, 0x74, 0x3D, 0x48,
+    0x89, 0xF9, 0xFF, 0x15, 0x3C, 0x8E, 0xEE, 0xFF, 0x90, 0x89, 0xC1, 0xE8,
+    0x24, 0x85, 0xC0, 0xFF, 0x84, 0xC0, 0x74, 0x28, 0x48, 0x8B, 0x05, 0xB9,
+    0x91, 0xEE, 0xFF, 0x0F, 0x57, 0xC0, 0x0F, 0x11, 0x44, 0x24, 0x20, 0xC7,
     0x44, 0x24, 0x30, 0x00, 0x00, 0x00, 0x00, 0x48, 0x89, 0xF9, 0x48, 0x89,
     0xF2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9, 0xFF, 0xD0, 0x90, 0x89, 0xC3,
     0x89, 0xD8, 0x48, 0x83, 0xC4, 0x48, 0x5B, 0x5F, 0x5E, 0x5D, 0xC3,
@@ -649,17 +652,17 @@ constexpr auto CoreIsCharmUsableBody = std::to_array<std::uint8_t>({
 constexpr auto CoreDisplayRequirementsBody = std::to_array<std::uint8_t>({
     0x55, 0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8D, 0x6C, 0x24,
     0x40, 0x48, 0xC7, 0x45, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x48, 0x89, 0xCF,
-    0x0F, 0x28, 0x45, 0x50, 0x8B, 0x05, 0x4E, 0x36, 0xF0, 0xFF, 0x65, 0x48,
+    0x0F, 0x28, 0x45, 0x50, 0x8B, 0x05, 0xC2, 0x9E, 0xFC, 0xFF, 0x65, 0x48,
     0x8B, 0x0C, 0x25, 0x58, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x1C, 0xC1, 0xC6,
-    0x83, 0x70, 0x04, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05, 0xCB, 0xF0, 0xEE,
+    0x83, 0x20, 0x18, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x05, 0xE3, 0xA6, 0xEE,
     0xFF, 0x0F, 0x11, 0x44, 0x24, 0x20, 0xC7, 0x44, 0x24, 0x30, 0x00, 0x00,
     0x00, 0x00, 0x48, 0x89, 0xF9, 0xFF, 0xD0, 0x90, 0x89, 0xC6, 0x48, 0x85,
     0xFF, 0x74, 0x12, 0x85, 0xF6, 0x74, 0x0E, 0x48, 0x89, 0xF9, 0xFF, 0x15,
-    0x14, 0xED, 0xEE, 0xFF, 0x90, 0x84, 0xC0, 0x74, 0x0B, 0x89, 0xF0, 0x48,
+    0x2C, 0xA3, 0xEE, 0xFF, 0x90, 0x84, 0xC0, 0x74, 0x0B, 0x89, 0xF0, 0x48,
     0x83, 0xC4, 0x48, 0x5B, 0x5F, 0x5E, 0x5D, 0xC3, 0x48, 0x89, 0xF9, 0xBA,
-    0x0D, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x9E, 0xF0, 0xEE, 0xFF, 0x90, 0x85,
-    0xC0, 0x74, 0xE2, 0x31, 0xC9, 0xE8, 0x52, 0x76, 0xC9, 0xFF, 0x84, 0xC0,
-    0x75, 0xD7, 0x48, 0x8D, 0x83, 0x70, 0x04, 0x00, 0x00, 0xC6, 0x00, 0x01,
+    0x0D, 0x00, 0x00, 0x00, 0xFF, 0x15, 0xB6, 0xA6, 0xEE, 0xFF, 0x90, 0x85,
+    0xC0, 0x74, 0xE2, 0x31, 0xC9, 0xE8, 0xF2, 0x99, 0xC0, 0xFF, 0x84, 0xC0,
+    0x75, 0xD7, 0x48, 0x8D, 0x83, 0x20, 0x18, 0x00, 0x00, 0xC6, 0x00, 0x01,
     0x31, 0xF6, 0xEB, 0xC9,
 });
 
@@ -843,7 +846,7 @@ auto CheckExact(std::uint64_t rva, const std::uint8_t* bytes, std::size_t size, 
     if (Context->CheckExpectedBytes(rva, bytes, static_cast<std::uint32_t>(size))) {
         return true;
     }
-    LogError("CharmDedup: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name, static_cast<unsigned long long>(rva));
+    LogError("CharmDedup: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name, static_cast<unsigned long long>(rva));
     return false;
 }
 
@@ -854,10 +857,10 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         return true;
     }
 
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics, D2RL::DiagnosticsServiceV1Version, &diagnostics)
+    const D2RL::DiagnosticsService* diagnostics = nullptr;
+    if (Context->QueryService(&diagnostics)
             == D2RL::ServiceQueryResult::Success
-        && D2RL::HasDiagnosticsServiceV1Field(diagnostics, D2RL::DiagnosticsServiceV1RequiredSize)
+        && D2RL::HasDiagnosticsServiceField(diagnostics, D2RL::DiagnosticsServiceRequiredSize)
         && diagnostics->queryHookStatus != nullptr) {
         D2RL::Diagnostics::HookQuery query{
             .structSize   = D2RL::Diagnostics::HookQuerySize,
@@ -879,7 +882,7 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         }
     }
 
-    LogError("CharmDedup: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name, static_cast<unsigned long long>(rva));
+    LogError("CharmDedup: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name, static_cast<unsigned long long>(rva));
     return false;
 }
 
@@ -905,7 +908,7 @@ void ResolveGameFunctions() noexcept {
 }
 
 // Resolves a D2RCore export by name and proves three things: it sits at the
-// 1.3.0 RVA, its body is the 1.3.0 body, and the game's thunk slot holds it.
+// 1.3.1 RVA, its body is the 1.3.1 body, and the game's thunk slot holds it.
 auto ResolveCoreExport(const char* name, std::uint64_t expectedRva, const std::uint8_t* body, std::size_t bodySize,
                        std::uint64_t slotRva) noexcept -> std::uintptr_t {
     const HMODULE module = GetModuleHandleW(CoreModuleName);
@@ -916,7 +919,7 @@ auto ResolveCoreExport(const char* name, std::uint64_t expectedRva, const std::u
     const auto address = reinterpret_cast<std::uintptr_t>(GetProcAddress(module, name));
     const auto coreBase = reinterpret_cast<std::uintptr_t>(module);
     if (address == 0 || address != coreBase + expectedRva) {
-        LogError("CharmDedup: D2RCore.dll export %s is not where D2RCore 1.3.0 has it.", name);
+        LogError("CharmDedup: D2RCore.dll export %s is not where D2RCore 1.3.1 has it.", name);
         return 0;
     }
     const auto* image = reinterpret_cast<const std::uint8_t*>(module);
@@ -924,7 +927,7 @@ auto ResolveCoreExport(const char* name, std::uint64_t expectedRva, const std::u
     const auto  imageSize = ReadU32(image, ntOffset + 0x50);
     if (expectedRva + bodySize > imageSize
         || std::memcmp(reinterpret_cast<const std::uint8_t*>(address), body, bodySize) != 0) {
-        LogError("CharmDedup: D2RCore.dll %s is not the 1.3.0 body this plugin was verified against.", name);
+        LogError("CharmDedup: D2RCore.dll %s is not the 1.3.1 body this plugin was verified against.", name);
         return 0;
     }
     // The hooks call the export directly, so the slot is only a sanity check.
@@ -1142,7 +1145,7 @@ auto RestoreThunk(ThunkPatch& patch) noexcept -> bool {
 void Install() noexcept {
     if (!CheckExact(IsCharmUsableThunkRva, IsCharmUsableThunk.data(), IsCharmUsableThunk.size(), "IsCharmUsable import thunk")
         || !ValidateGameFunctions()) {
-        SetInactive("the game image does not match D2RLoader 1.3.0");
+        SetInactive("the game image does not match D2RLoader 1.3.1");
         return;
     }
     ResolveGameFunctions();
@@ -1150,7 +1153,7 @@ void Install() noexcept {
     const auto usability = ResolveCoreExport(CoreIsCharmUsableName, CoreIsCharmUsableRva, CoreIsCharmUsableBody.data(),
                                              CoreIsCharmUsableBody.size(), IsCharmUsableSlotRva);
     if (usability == 0) {
-        SetInactive("D2RCore.dll IsCharmUsable does not match 1.3.0");
+        SetInactive("D2RCore.dll IsCharmUsable does not match 1.3.1");
         return;
     }
     OriginalIsCharmUsable = reinterpret_cast<IsCharmUsableFn>(usability);
@@ -1274,7 +1277,7 @@ namespace {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.charm-dedup",
     .name        = "Charm Dedup",
     .version     = "1.0.0",

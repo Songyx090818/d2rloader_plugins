@@ -214,13 +214,29 @@ constexpr auto ExpireBlockTail = std::to_array<std::uint8_t>({
 
 // 56C03B mov rax,[rdi+18h] / cmp [rax],esi / jle 56C15C
 // 56C047 mov rax,[rdi+28h] / cmp [rax],rsi / jz  56C15C
-// 56C054 mov rax,[rdi+38h] / mov [rsp+20h],si / mov byte[rax],1
+// 56C054 mov rax,[rdi+38h] / nop / mov [rsp+20h],esi / mov byte[rax],1
 // Proves both gates land on the hook site and that +0x38 is the survive flag.
+// D2RLoader 1.3.1 widened the store at 56C059 from 16 bits (66 89 74 24 20,
+// mov [rsp+20h],si) to 32 bits (90 89 74 24 20). The relay never replays it.
 constexpr auto GatesAndFlagWrite = std::to_array<std::uint8_t>({
     0x48, 0x8B, 0x47, 0x18, 0x39, 0x30, 0x0F, 0x8E, 0x15, 0x01, 0x00, 0x00,
     0x48, 0x8B, 0x47, 0x28, 0x48, 0x39, 0x30, 0x0F, 0x84, 0x08, 0x01, 0x00,
-    0x00, 0x48, 0x8B, 0x47, 0x38, 0x66, 0x89, 0x74, 0x24, 0x20, 0xC6, 0x00,
+    0x00, 0x48, 0x8B, 0x47, 0x38, 0x90, 0x89, 0x74, 0x24, 0x20, 0xC6, 0x00,
     0x01});
+
+// D2RLoader 1.3.1 accepts a jmp-rel32 patch only when its target is inside
+// D2R.exe, and the relay page is not. The hook at 56C15C therefore jumps to a
+// 5-byte "jmp relay" trampoline in the int3 run after sub_14056BFE0's ret at
+// 56C192 (56C193..56C19F, the next function starts at 56C1A0), and the
+// trampoline jumps on to the relay. A jmp changes no register, flag or stack
+// slot, so the relay sees exactly what the hook site saw.
+constexpr std::uint64_t TrampolineRva = 0x0056C193ULL;
+constexpr std::uint64_t TrampolinePaddingRva = 0x0056C192ULL;
+constexpr auto TrampolinePadding = std::to_array<std::uint8_t>({
+    0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC});
+constexpr auto TrampolineSlotExpected = std::to_array<std::uint8_t>({
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC});
 
 // 56C08D mov rax,[rdi+40h] / mov r8d,1 / mov rcx,[rdi] / movsx edx,word[rax]
 // Proves +0x40 is the state id and +0x00 is the unit slot.
@@ -254,7 +270,7 @@ struct Witness {
     const char* what;
 };
 
-constexpr std::array<Witness, 7> Witnesses{{
+constexpr std::array<Witness, 8> Witnesses{{
     {ChargeHelperRva, ChargeHelperPrologue.data(),
      static_cast<std::uint32_t>(ChargeHelperPrologue.size()),
      "charge helper prologue"},
@@ -276,6 +292,9 @@ constexpr std::array<Witness, 7> Witnesses{{
     {CallerFlagReadRva, CallerFlagRead.data(),
      static_cast<std::uint32_t>(CallerFlagRead.size()),
      "caller survive-flag read-back"},
+    {TrampolinePaddingRva, TrampolinePadding.data(),
+     static_cast<std::uint32_t>(TrampolinePadding.size()),
+     "trampoline padding after the charge helper"},
 }};
 
 // ---------------------------------------------------------------------------
@@ -677,10 +696,31 @@ void Install() noexcept {
         g_state = PluginState::InstallFailed;
         return;
     }
+    // "jmp relay" into the padding first; nothing reaches it until the hook
+    // below is aimed at it.
+    const std::int64_t trampolineNext = static_cast<std::int64_t>(g_base + TrampolineRva + 5);
+    const std::int64_t trampolineDelta = static_cast<std::int64_t>(g_base + RelayCodeRva()) - trampolineNext;
+    if (trampolineDelta < INT32_MIN || trampolineDelta > INT32_MAX) {
+        Log(2, "finisher-state-protection: the relay is out of reach of the trampoline at RVA 0x%llX.",
+            static_cast<unsigned long long>(TrampolineRva));
+        g_state = PluginState::InstallFailed;
+        return;
+    }
+    std::array<std::uint8_t, 5> trampoline{0xE9, 0, 0, 0, 0};
+    const auto trampolineRel32 = static_cast<std::int32_t>(trampolineDelta);
+    std::memcpy(trampoline.data() + 1, &trampolineRel32, sizeof(trampolineRel32));
+    if (!g_ctx->PatchBytes(TrampolineRva, TrampolineSlotExpected.data(),
+            static_cast<std::uint32_t>(TrampolineSlotExpected.size()),
+            trampoline.data(), static_cast<std::uint32_t>(trampoline.size()))) {
+        Log(2, "finisher-state-protection: the trampoline at RVA 0x%llX could not be written.",
+            static_cast<unsigned long long>(TrampolineRva));
+        g_state = PluginState::InstallFailed;
+        return;
+    }
     const bool hooked = g_ctx->PatchJmpRel32(
         ExpireHookRva, ExpireHookExpected.data(),
         static_cast<std::uint32_t>(ExpireHookExpected.size()),
-        RelayCodeRva(), static_cast<std::uint32_t>(ExpireHookExpected.size()));
+        TrampolineRva, static_cast<std::uint32_t>(ExpireHookExpected.size()));
     if (!hooked) {
         Log(2, "finisher-state-protection: the expire hook at RVA 0x%llX could not be written.",
             static_cast<unsigned long long>(ExpireHookRva));
@@ -740,10 +780,10 @@ D2RL::ConsoleCommandResult StatusCommand(D2R::Game::Client*, const D2RL::Console
 
 constexpr D2RL::PluginInfo PluginInfoData{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.finisher-state-protection",
     .name = "Finisher State Protection",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description = "Keeps chosen states alive when a progressive skill spends its last charge. Port of the ESR 2.4 patch pair.",
     .flags = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,

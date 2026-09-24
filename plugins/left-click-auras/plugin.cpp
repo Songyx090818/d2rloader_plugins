@@ -1,7 +1,7 @@
 // =============================================================================
 //  Left Click Auras  -  celestialrayone.left-click-auras
 //
-//  D2R 3.3 under D2RLoader 1.3.0. An aura on the LEFT mouse button runs like an
+//  D2R 3.3 under D2RLoader 1.3.1. An aura on the LEFT mouse button runs like an
 //  aura on the right button, and both run at the same time. Port of ESR's 2.4
 //  left click aura patch set:
 //
@@ -11,7 +11,8 @@
 //    3. MOVE ONLY CLICKS. A left click on a monster with an aura on the left
 //       button moves toward it instead of doing nothing.
 //
-//  Every address below was read out of the dumped D2RLoader 1.3.0 image and
+//  Every address below was read out of the dumped D2RLoader 1.3.0 image, re-checked
+//  against the 1.3.1 image (only the SetUnitCastId thunk calls moved), and
 //  disassembled before being relied on. Byte witnesses guard every function
 //  the plugin changes, so a different build refuses cleanly.
 //
@@ -146,7 +147,7 @@ constexpr const char DefaultConfigToml[] = R"TOML(# celestialrayone.left-click-a
 #   mouse button does, and both can be active at the same time.
 #
 # Changes are read when the plugin loads. Restart the game after editing.
-# Built for D2RLoader 1.3.0 (Diablo II: Resurrected 3.3). On any other build
+# Built for D2RLoader 1.3.1 (Diablo II: Resurrected 3.3). On any other build
 # the byte checks fail and the plugin loads without changing the game.
 #
 # Data requirement
@@ -240,7 +241,7 @@ diagnostics = false
 )TOML";
 
 // ---------------------------------------------------------------------------
-//  Native layout (D2R 3.3, D2RLoader 1.3.0 process image)
+//  Native layout (D2R 3.3, D2RLoader 1.3.1 process image)
 // ---------------------------------------------------------------------------
 constexpr std::size_t   GameDataContextOffset        = 0x106;  // movzx ecx,byte [rbp+106h] at 0x43B8C2
 constexpr std::size_t   UnitIdOffset                 = 0x08;
@@ -359,6 +360,8 @@ constexpr auto AssignSkillBody = std::to_array<std::uint8_t>({
 });
 
 // 0x437460..0x4375AA, the type 8 event: entry, right button read, perform.
+// The call at 0x437545 goes through the loader's SetUnitCastId thunk, 0x3E2B652
+// in 1.3.1 (0x3E2B57E in 1.3.0).
 constexpr auto PeriodicSkillEventWindow = std::to_array<std::uint8_t>({
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x56, 0x57,
     0x41, 0x54, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x50, 0x48, 0x89,
@@ -379,7 +382,7 @@ constexpr auto PeriodicSkillEventWindow = std::to_array<std::uint8_t>({
     0x00, 0x00, 0x00, 0xC6, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x00, 0xE8,
     0xC0, 0xAE, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x48, 0x8B, 0xCF,
     0xE8, 0x83, 0x41, 0xF1, 0xFF, 0x41, 0x8B, 0xD7, 0x48, 0x8B, 0xCF, 0x8B,
-    0xD8, 0xE8, 0x34, 0x40, 0x9F, 0x03, 0xBA, 0x00, 0x00, 0x00, 0x20, 0x41,
+    0xD8, 0xE8, 0x08, 0x41, 0x9F, 0x03, 0xBA, 0x00, 0x00, 0x00, 0x20, 0x41,
     0xB8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCF, 0xE8, 0xE3, 0x6B, 0xF1,
     0xFF, 0x45, 0x33, 0xF6, 0x45, 0x8B, 0xCC, 0x44, 0x89, 0x74, 0x24, 0x30,
     0x44, 0x8B, 0xC5, 0x44, 0x89, 0x74, 0x24, 0x28, 0x48, 0x8B, 0xD7, 0x48,
@@ -391,12 +394,13 @@ constexpr auto PeriodicSkillEventWindow = std::to_array<std::uint8_t>({
 });
 
 // 0x437761..0x437800, skill timer perform (0x4377BC -> 0x43ACB0) and re-arm
-// (0x4377E7 -> 0x43B2B0).
+// (0x4377E7 -> 0x43B2B0). The calls at 0x437783 and 0x4377F1 go through the
+// SetUnitCastId thunk, 0x3E2B652 in 1.3.1 (0x3E2B57E in 1.3.0).
 constexpr auto LeftTimerPerformWindow = std::to_array<std::uint8_t>({
     0xC6, 0x84, 0x24, 0x90, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x92, 0xAF, 0xFF,
     0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x48, 0x8B, 0xCF, 0xE8, 0x45, 0x3F,
-    0xF1, 0xFF, 0x41, 0x8B, 0xD7, 0x48, 0x8B, 0xCF, 0x8B, 0xD8, 0xE8, 0xF6,
-    0x3D, 0x9F, 0x03, 0xBA, 0x00, 0x00, 0x00, 0x20, 0x41, 0xB8, 0x01, 0x00,
+    0xF1, 0xFF, 0x41, 0x8B, 0xD7, 0x48, 0x8B, 0xCF, 0x8B, 0xD8, 0xE8, 0xCA,
+    0x3E, 0x9F, 0x03, 0xBA, 0x00, 0x00, 0x00, 0x20, 0x41, 0xB8, 0x01, 0x00,
     0x00, 0x00, 0x48, 0x8B, 0xCF, 0xE8, 0xA5, 0x69, 0xF1, 0xFF, 0x45, 0x33,
     0xF6, 0x45, 0x8B, 0xCC, 0x44, 0x89, 0x74, 0x24, 0x30, 0x44, 0x8B, 0xC5,
     0x44, 0x89, 0x74, 0x24, 0x28, 0x48, 0x8B, 0xD7, 0x48, 0x8B, 0xCE, 0xC7,
@@ -405,7 +409,7 @@ constexpr auto LeftTimerPerformWindow = std::to_array<std::uint8_t>({
     0x6F, 0x69, 0xF1, 0xFF, 0x44, 0x89, 0x74, 0x24, 0x28, 0x45, 0x8B, 0xCC,
     0x44, 0x89, 0x7C, 0x24, 0x20, 0x44, 0x8B, 0xC5, 0x48, 0x8B, 0xD7, 0x48,
     0x8B, 0xCE, 0xE8, 0xC4, 0x3A, 0x00, 0x00, 0x8B, 0xD3, 0x48, 0x8B, 0xCF,
-    0xE8, 0x88, 0x3D, 0x9F, 0x03, 0xEB, 0x0F, 0x4C, 0x8B, 0xC3, 0x48, 0x8D,
+    0xE8, 0x5C, 0x3E, 0x9F, 0x03, 0xEB, 0x0F, 0x4C, 0x8B, 0xC3, 0x48, 0x8D,
     0x4C, 0x24, 0x40,
 });
 
@@ -861,7 +865,7 @@ auto CheckExact(std::uint64_t rva, const std::uint8_t* bytes, std::size_t size, 
     if (Context->CheckExpectedBytes(rva, bytes, static_cast<std::uint32_t>(size))) {
         return true;
     }
-    LogError("LeftClickAuras: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name,
+    LogError("LeftClickAuras: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name,
              static_cast<unsigned long long>(rva));
     return false;
 }
@@ -873,10 +877,10 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         return true;
     }
 
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics, D2RL::DiagnosticsServiceV1Version, &diagnostics)
+    const D2RL::DiagnosticsService* diagnostics = nullptr;
+    if (Context->QueryService(&diagnostics)
             == D2RL::ServiceQueryResult::Success
-        && D2RL::HasDiagnosticsServiceV1Field(diagnostics, D2RL::DiagnosticsServiceV1RequiredSize)
+        && D2RL::HasDiagnosticsServiceField(diagnostics, D2RL::DiagnosticsServiceRequiredSize)
         && diagnostics->queryHookStatus != nullptr) {
         D2RL::Diagnostics::HookQuery query{
             .structSize   = D2RL::Diagnostics::HookQuerySize,
@@ -898,7 +902,7 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         }
     }
 
-    LogError("LeftClickAuras: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name,
+    LogError("LeftClickAuras: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name,
              static_cast<unsigned long long>(rva));
     return false;
 }
@@ -1624,10 +1628,10 @@ namespace {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.left-click-auras",
     .name        = "Left Click Auras",
-    .version     = "1.0.0",
+    .version     = "1.0.1",
     .author      = "CelestialRayOne",
     .description = "Auras on the left mouse button run alongside the right button's aura.",
     .flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,

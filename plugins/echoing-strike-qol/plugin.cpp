@@ -16,7 +16,9 @@
 //      and the missile expires on the spot.
 //
 // Built against D2R 3.3 (module 140000000.D2RLoader.exe,
-// md5 baf085b077a4f9605bfddd977cfd9207) and PluginSDK v4.
+// md5 baf085b077a4f9605bfddd977cfd9207) and PluginSDK v4. Re-checked against
+// D2RLoader 1.3.1 and PluginSDK 0.3.0: every site is unchanged. 1.0.1 only
+// writes its documented config file when it is missing.
 
 #include <D2RLPlugin/api.h>
 
@@ -197,8 +199,40 @@ auto ReadInt(const char* text, const char* key, std::int32_t fallback) noexcept 
 	return static_cast<std::int32_t>(result);
 }
 
+// Written by EnsureConfig when the file does not exist yet. It is the plugin's
+// documentation as shipped.
+constexpr char DefaultConfigToml[] = R"toml(# celestialrayone.soaring-strike
+#
+# Soaring Strike return trip (missiles.txt pSrvHitFunc 34)
+#
+# Changes are read when the plugin loads. Restart the game after editing.
+# Built for D2RLoader 1.3.1 (Diablo II: Resurrected 3.3).
+
+# Hit again on the way back. pSrvHitFunc 34 starts the return trip without
+# touching the missile's LastCollide slot, which holds only the most recent
+# target, so the last monster struck on the way out stays blocked on the way
+# home. With this on, the slot is re-stamped the moment the missile turns.
+return_trip_rehit = true
+
+# What the slot is re-stamped with when the missile turns.
+#   true   the missile's owner
+#   false  cleared outright (id -1), which nothing matches
+# Either way no monster stays blocked. Only used with return_trip_rehit on.
+reseed_with_owner = true
+
+# Longest return trip. The engine takes min(distance, this), and the stock value
+# is 50. It is shifted left by 16 bits, so 1 to 32767 are valid; anything
+# outside that range leaves the stock 50 in place.
+return_path_cap = 32767
+)toml";
+
 auto LoadSettings(const D2RL::PluginContext* context) noexcept -> Settings {
 	Settings settings {};
+
+	if (!context->EnsureConfig(DefaultConfigToml)) {
+		context->LogWarn("Could not create celestialrayone.soaring-strike.toml; using defaults.");
+		return settings;
+	}
 
 	std::array<char, 8'192> buffer {};
 	if (!context->ReadConfig(buffer.data(), ByteSize(buffer.size()))) {
@@ -309,10 +343,10 @@ auto ApplyReturnPathCap(const D2RL::PluginContext* context, const Settings& sett
 
 constexpr D2RL::PluginInfo SoaringStrikeInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.soaring-strike",
 	.name        = "Soaring Strike Return Trip",
-	.version     = "1.0.0",
+	.version     = "1.0.1",
 	.author      = "CelestialRayOne",
 	.description = "Boomerang missiles (pSrvHitFunc 34) can strike their last outbound target "
 	               "again on the way back, and the return path is no longer clamped to 50.",

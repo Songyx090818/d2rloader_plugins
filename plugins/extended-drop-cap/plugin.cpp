@@ -607,7 +607,7 @@ auto MonsterDropCapCommand(
 
 constexpr D2RL::PluginInfo MonsterDropCapInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.monster-drop-cap",
 	.name        = "Monster Drop Cap",
 	.version     = "0.1.0",

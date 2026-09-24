@@ -1038,10 +1038,10 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         return true;
     }
 
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics, D2RL::DiagnosticsServiceV1Version, &diagnostics)
+    const D2RL::DiagnosticsService* diagnostics = nullptr;
+    if (Context->QueryService(&diagnostics)
             == D2RL::ServiceQueryResult::Success
-        && D2RL::HasDiagnosticsServiceV1Field(diagnostics, D2RL::DiagnosticsServiceV1RequiredSize)
+        && D2RL::HasDiagnosticsServiceField(diagnostics, D2RL::DiagnosticsServiceRequiredSize)
         && diagnostics->queryHookStatus != nullptr) {
         D2RL::Diagnostics::HookQuery query{
             .structSize   = D2RL::Diagnostics::HookQuerySize,
@@ -1620,7 +1620,7 @@ namespace {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.aura-reactivation",
     .name        = "Aura Reactivation",
     .version     = "1.0.4",

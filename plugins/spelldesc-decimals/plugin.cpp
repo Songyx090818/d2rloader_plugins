@@ -15,7 +15,9 @@
 //   Modes 4 and 2 (mode 2 after its stat1 life or mana scaling at 2C1D5F) both
 //   continue at 2C1C93 and print the number through one call:
 //     2C1C93  0F B7 8F B6 00 00 00   movzx ecx, word [rdi+0B6h]  ; spelldescstr
-//     2C1C9A  E8 BD 99 B6 03         call  GetNamespacedStringById
+//     2C1C9A  E8 91 9A B6 03         call  GetNamespacedStringById
+//                                    (loader thunk 3E2B730 in 1.3.1, 3E2B65C
+//                                    in 1.3.0; the only byte change)
 //     2C1C9F  48 8B D0               mov   rdx, rax              ; the string
 //     2C1CA2  48 8D 8C 24 80 00 00 00  lea rcx, [rsp+80h]        ; 512-byte buffer
 //     2C1CAA  44 8B C3               mov   r8d, ebx              ; the number
@@ -72,7 +74,7 @@ constexpr std::size_t   CallOffset    = CallRva - WindowRva;
 // 2C1C93..2C1CBD: spelldescstr lookup, the three arguments and the format call.
 constexpr std::uint8_t Window[]{
     0x0F,0xB7,0x8F,0xB6,0x00,0x00,0x00,
-    0xE8,0xBD,0x99,0xB6,0x03,
+    0xE8,0x91,0x9A,0xB6,0x03,
     0x48,0x8B,0xD0,
     0x48,0x8D,0x8C,0x24,0x80,0x00,0x00,0x00,
     0x44,0x8B,0xC3,
@@ -342,10 +344,10 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
 constexpr D2RL::PluginInfo PluginInfoData{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginIdText,
     .name        = "Spelldesc Decimals",
-    .version     = "1.0.0",
+    .version     = "1.0.1",
     .author      = "CelestialRayOne",
     .description = "Item spelldesc strings can show their number with decimals (%.1f, %.2f, %.3f).",
     .flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,

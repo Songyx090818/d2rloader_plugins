@@ -684,7 +684,7 @@ auto CastRateCapCommand(
 
 constexpr D2RL::PluginInfo CastRateCapInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.cast-rate-cap",
 	.name        = "Cast Rate Cap",
 	.version     = "0.1.0",

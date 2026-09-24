@@ -739,7 +739,7 @@ void LoadSettings(const D2RL::PluginContext* context) noexcept {
 
 constexpr D2RL::PluginInfo kPluginInfo{
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.charge-impact",
 	.name        = "Charge Impact",
 	.version     = "1.0.0",

@@ -9,6 +9,55 @@
 // D2RCore.dll, and every entry, call site and register used here is checked
 // byte for byte at load. Nothing is installed when a check fails.
 //
+// D2RLoader 1.3 runs item event functions inside D2RCore.dll. For event
+// function 20 D2RCore registers its own handler, which casts through the
+// game's 5896E0 -> 589930 but never calls the game's table slot 20, so the
+// slot hook up to 1.2.1 never ran and procs from crossbow hits were never
+// tagged. 1.2.2 puts the same hook into D2RCore's handler table instead (entry
+// 20 of the table RegisterWideSkillEffect hands its registrar, read when an
+// event is registered). D2RCore's handlers take the game's arguments in the
+// game's order; its forwarders pass rcx, rdx, r8 and r9 straight through, so
+// the hook's owner is still r8.
+//
+// D2RLoader 1.3.1: the loader's thunk table moved up by D4h. The proc caster
+// at 589C37 / 589C41 now calls GenerateUnitCastId through 3E2B64C and
+// SetUnitCastId through 3E2B652 (3E2B578 / 3E2B57E in 1.3.0). Every other
+// site checked here is unchanged.
+//
+// 1.3.0: the damage bonus reached only hits whose damage the engine
+// recalculated inside SUNITDMG_ExecuteEvents (the missile flag on). Damage a
+// skill function calculated up front and applied later (the stored melee
+// record, PrepareAndQueueCombatRecord 44B600 -> ConsumeMeleeCombatRecord
+// 44B2B0) and every other hit applied with the flag off never got it, and
+// missile damage applied without the engine's owner stamp (the area callback
+// 464610, the general applier 436E90) was judged by whatever the player cast
+// last. The bonus now sits where every hit passes (section 6), and a hit is
+// judged by the missile the engine is resolving when it is the attacker's own
+// section 5).
+//
+// 1.3.2: the damage bonus never applied to anything, in any version. Every
+// server-side part of it (skill-start tags, the hit bonus, proc tags, missile
+// links) first checked that the unit is a server unit with 34F8D0, which reads
+// bit 21 of unit+124h. That bit marks async client-only units; it is clear on
+// the player on both sides, so every one of those parts skipped the player.
+// Server units are the ones carrying 4000000h in unit+128h, set by the server
+// unit allocator 4905A0 (which also stores the game at unit+D8h) and by
+// nothing on the client. Bolts never depended on the check, so they worked.
+//
+// 1.3.1: aura pulses never get the bonus. The aura events set flag 20000000h
+// in unit+128h for exactly the length of the aura's do-handler call (skill
+// auras 437460, item auras 437230, aura start 43B680), so a hit, a proc or a
+// missile of a player carrying that flag is never a crossbow one, whatever the
+// player cast last. Missiles that a skill fires under a new cast id each
+// (523370, the multi-missile fire used by Mirrored Blades, 52353C) now belong
+// to the cast that fired them; before, they matched no tagged cast and never
+// got the bonus. A crossbow cast is also tagged when its bolt is spent, the
+// moment the game itself applies its globaldelay with a crossbow held. Bolt
+// pools exist only for players holding a crossbow (1.3.0 gave every player
+// type unit the regeneration event reaches a pool, never removed). A debug log
+// (TOML debug, or "crossbowcharges debug on") writes every decision with its
+// reason, and the console command shows counters for each step.
+//
 // ---------------------------------------------------------------------------
 // 1. Which skills are crossbow skills
 // ---------------------------------------------------------------------------
@@ -80,42 +129,91 @@
 //   host the client side reads the server pool directly.
 //
 // ---------------------------------------------------------------------------
-// 5. Which hits get the damage bonus: cast ids
+// 5. Which hits get the damage bonus: cast ids and the missile in progress
 // ---------------------------------------------------------------------------
 //   Every cast has an id, unit+12Ch (34B6C0 reads it). D2RCore's
-//   GenerateUnitCastId is a per-game counter at game+16Ch; SetUnitCastId
-//   writes unit+12Ch. The game uses it to track where things come from:
+//   GenerateUnitCastId is a per-game counter at game+16Ch, so an id names one
+//   cast in the whole game; SetUnitCastId writes unit+12Ch. The game uses it
+//   to track where things come from:
 //     skill start   34F430 (unit, skill, castId) sets the used skill and the id;
 //                   the player mode starts 42D2C0 / 42DE40 pass a fresh id
-//     missiles      5379F5: a new missile takes the id it was given, else its
-//                   creator's current id, so explosions take their parent's
+//                   only when a skill starts, so walking keeps the old one
+//     missiles      537A17 in the creator 5371A0: a new missile takes the id in
+//                   its creation params (+68h), else its owner's current id.
+//                   Hit sub-missiles get their parent's id this way (45DF50
+//                   writes the parent's 34B6C0 into +68h)
 //     missile hit   462E40 stamps the owner with the missile's id around the
 //                   damage and on-hit effects, then restores it
 //     procs         589930 generates a fresh id (call at 589C37) while the
 //                   owner still carries the id of the hit that triggered it
-//     auras         437230 stamps the aura's own id around every pulse
-//   So the plugin tags cast ids:
+//     auras         437460 / 437230 / 43B680 stamp the aura's own id around
+//                   every pulse and set flag 20000000h in unit+128h (34E140)
+//     multi-missile 523370 gives every missile its own new id when the
+//                   skill's record asks for it (52353C)
+//   So the plugin tags cast ids, each with the GUID of the player it belongs
+//   to:
 //     - at skill start (34F430 hook), when the skill is a crossbow skill
+//     - when the cast spends its bolt (the do-handler relay at 43B18D and
+//       436C70), unless an aura pulse is running
 //     - in item event function 20 (chance to cast on attack, on striking and
-//       on kill; table 238E5C0, slot 20 at 238E660 -> 583B30), when the owner
-//       carries a tagged id: the fresh id generated at 589C37 is tagged too
+//       on kill; D2RCore's handler table entry 20), when the hit that
+//       triggers it is a crossbow hit: the fresh id generated at 589C37 is
+//       tagged too
 //   Event function 21 (chance to cast when struck, 5837F0) is left alone, so
 //   those never count, whatever the player cast last.
-//   The bonus applies when the attacker is a player whose current cast id is
-//   tagged at the moment the damage is resolved.
+//
+//   Not every missile hit carries the owner stamp: the area callback 464610
+//   (handed out by the missile function 4576B0) and the general applier 436E90
+//   hand damage to SUNITDMG_ExecuteEvents with the player's current id. So the
+//   plugin also keeps, per server thread, the missiles the engine is
+//   resolving, innermost last:
+//     4639A0  MISSILES_ServerHitResolution (game, missile, target, forced)
+//     466CE0  MISSILES_ServerDoDispatcher  (game, missile)
+//     462E40  missile damage               (game, missile, target, damage)
+//   Each pushes its missile on entry and pops it on return; 490300 (game,
+//   unit) gives a missile's owner (unit+E8h type, +ECh GUID). A hit or a proc
+//   of a player is a crossbow one when no aura pulse is running for the player
+//   (flag above) and:
+//     - the innermost missile in progress belongs to that player and belongs
+//       to a tagged cast, or
+//     - no missile of that player is in progress (skill functions, stored
+//       melee records, procs outside missiles) and the player's current cast
+//       id is tagged for that player.
+//   A missile belongs to the cast its own id names, except (the call at
+//   537A17 goes through a relay that also receives the creation params, r14,
+//   owner at +8h, and links the new missile by GUID):
+//     - created while one of the same owner's missiles is in progress under a
+//       different id (its creator left +68h empty): the parent's cast
+//     - created outside any missile under a newer id than the owner's current
+//       cast (523370): the owner's current cast
+//     - created during an aura pulse: no cast, never a crossbow missile
+//   A link holds only while the missile still carries the id it was created
+//   with. The game's own cast ids are never changed; missiles.txt LastCollide
+//   keys its per-target dedup on them.
 //
 // ---------------------------------------------------------------------------
 // 6. Where the bonus is applied
 // ---------------------------------------------------------------------------
-//   SUNITDMG_ExecuteEvents 44CE80 calls the damage calculation 44DF10 for
-//   missile-style damage:
+//   SUNITDMG_ExecuteEvents 44CE80 (game, attacker, defender, bMissile, damage)
+//   recalculates only when bMissile is set, and every hit meets at 44CF98:
+//     44CF83  85 DB                 test ebx,ebx               ; bMissile
+//     44CF85  74 11                 je   44CF98
 //     44CF87  4C 8B CF 4C 8B C6 49 8B D6 49 8B CF   r9 dmg, r8 def, rdx att, rcx game
-//     44CF93  E8 78 0F 00 00                          call 44DF10
-//   The call is sent through a relay; the hook runs the calculation, then
-//   scales the finished numbers. Inside the calculation the bleed plugin reads
-//   the physical damage at 44ECA5 and the poison immunity plugin builds the
-//   life total at 44EC71, so bleed sees the unboosted hit and the poison rule
-//   is kept (the total is scaled as a whole).
+//     44CF93  E8 78 0F 00 00        call 44DF10                ; CalculateTotalDamage
+//     44CF98  0F B7 47 04           movzx eax, word [rdi+4]    ; every hit
+//     44CF9C  A8 20                 test al,20h
+//   Hits with bMissile clear were calculated before they got here (the
+//   stored melee records calculate at 44B6AC). 44CF98..44CF9D becomes a call
+//   to a relay plus a nop; the relay keeps every volatile register, hands
+//   (r15 game, r14 attacker, rsi defender, rdi damage) to the hook, then
+//   replays the two instructions, so eax and the flags are the game's own
+//   when it returns. Nothing else branches to 44CF9C. After this point come
+//   the damage events, leech, the life commit and the kill events, so the
+//   bonus lands on the final numbers. Inside the calculation the bleed plugin
+//   reads the physical damage at 44ECA5 and the poison immunity plugin builds
+//   the life total at 44EC71, both before this point, so bleed sees the
+//   unboosted hit and the poison rule is kept (the total is scaled as a
+//   whole).
 //   Scaled D2Damage fields: +18h physical, +20h fire, +24h burn, +2Ch
 //   lightning, +30h magic, +34h cold, +38h poison, +134h life total, and the
 //   damage of each per-source poison entry (pointer +40h, count +48h, 12-byte
@@ -223,7 +321,10 @@
 //   No site here is touched by any plugin or static patch in the ESR set:
 //   srcdam-calc-field hooks 43ACB0's entry, cast-on-cast patches 43AF06 to
 //   43AF25, 43B0EC and 589C6F, soft-hits patches event slots 4 and 6, bleed
-//   redirects 44ECA5, poison immunity patches inside 44EC71 to 44ECA4.
+//   redirects 44ECA5, poison immunity patches inside 44EC71 to 44ECA4,
+//   charge-aoe-hits hooks the entries of 5622C0 and 44B600, engine-stability
+//   hooks 537B23 inside the missile creator and works inside the SrvHit
+//   function 45FB50, critical-strike-damage works inside 44C030 and 465420.
 //   whirlwind-follow-cursor calls 34F430 directly and reaches this hook.
 
 #include <D2RLPlugin/api.h>
@@ -239,6 +340,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -262,6 +364,32 @@ std::uintptr_t             Base{};
 // Addresses (RVAs into the D2RLoader 1.3.0 image)
 // ---------------------------------------------------------------------------
 
+// D2RCore.dll as shipped with D2RLoader 1.3.1: where event function 20 really runs.
+constexpr wchar_t     CoreModuleName[]           = L"D2RCore.dll";
+constexpr char        CoreRegisterExport[]       = "RegisterWideSkillEffect";
+constexpr std::size_t CoreRegisterTableLeaOffset = 0x2C;  // lea rdi,[rip+disp32] -> handler table
+constexpr std::size_t CoreEventFunc20Index       = 20;
+// RegisterWideSkillEffect, 84 bytes up to its registrar call.
+constexpr std::uint8_t CoreRegisterStub[]{
+    0x56,0x57,0x48,0x83,0xEC,0x58,0x8B,0x84,0x24,0x90,0x00,0x00,0x00,0x44,0x8B,0x94,
+    0x24,0x98,0x00,0x00,0x00,0x44,0x8B,0x9C,0x24,0xA0,0x00,0x00,0x00,0x8B,0xB4,0x24,
+    0xA8,0x00,0x00,0x00,0x0F,0x28,0x84,0x24,0xB0,0x00,0x00,0x00,0x48,0x8D,0x3D,0xBD,
+    0xCA,0xDF,0xFF,0x48,0x89,0x7C,0x24,0x50,0x0F,0x11,0x44,0x24,0x40,0x89,0x74,0x24,
+    0x38,0x44,0x89,0x5C,0x24,0x30,0x44,0x89,0x54,0x24,0x28,0x89,0x44,0x24,0x20,0xE8,
+    0xBC,0xEB,0xB9,0xFF,
+};
+// D2RCore's event function 20 handler, the whole 96 bytes.
+constexpr std::uint8_t CoreEventFunc20Body[]{
+    0x48,0x83,0xEC,0x48,0x4C,0x89,0xC0,0x49,0x89,0xC8,0x0F,0x28,0x44,0x24,0x70,0x48,
+    0x8B,0x0D,0x0A,0xA1,0x32,0x00,0x48,0x31,0xE1,0x48,0x89,0x4C,0x24,0x40,0x0F,0x11,
+    0x44,0x24,0x28,0x4C,0x89,0x4C,0x24,0x20,0x48,0x8D,0x4C,0x24,0x3F,0xBA,0x01,0x00,
+    0x00,0x00,0x49,0x89,0xC1,0xE8,0x16,0xD5,0x00,0x00,0x48,0x8B,0x4C,0x24,0x40,0x48,
+    0x31,0xE1,0x48,0x8B,0x15,0xD7,0xA0,0x32,0x00,0x48,0x39,0xCA,0x75,0x05,0x48,0x83,
+    0xC4,0x48,0xC3,0x48,0x8B,0x4C,0x24,0x40,0x48,0x31,0xE1,0xE8,0x70,0x60,0x16,0x00,
+};
+static_assert(CoreRegisterStub[CoreRegisterTableLeaOffset] == 0x48 && CoreRegisterStub[CoreRegisterTableLeaOffset + 1] == 0x8D
+    && CoreRegisterStub[CoreRegisterTableLeaOffset + 2] == 0x3D, "The table lea is not lea rdi,[rip+disp32].");
+
 // Hooked
 constexpr std::uint64_t CooldownGateRva       = 0x3404A0;
 constexpr std::uint64_t ClientApplyRva        = 0x215FC0;
@@ -269,13 +397,18 @@ constexpr std::uint64_t ServerApplyRva        = 0x436C70;
 constexpr std::uint64_t PlayerRegenRva        = 0x42E600;
 constexpr std::uint64_t SetUsedSkillRva       = 0x34F430;
 constexpr std::uint64_t ButtonUpdateRva       = 0x2399F0;
+constexpr std::uint64_t MissileHitRva         = 0x4639A0;
+constexpr std::uint64_t MissileDoRva          = 0x466CE0;
+constexpr std::uint64_t MissileDamageRva      = 0x462E40;
 // Redirected calls and table slot
 constexpr std::uint64_t DoHandlerWindowRva    = 0x43B163;
 constexpr std::uint64_t DoHandlerCallRva      = 0x43B18D;
 constexpr std::uint64_t ProcCastIdWindowRva   = 0x589C34;
 constexpr std::uint64_t ProcCastIdCallRva     = 0x589C37;
-constexpr std::uint64_t DamageCalcWindowRva   = 0x44CF87;
-constexpr std::uint64_t DamageCalcCallRva     = 0x44CF93;
+constexpr std::uint64_t HitBonusWindowRva     = 0x44CF78;
+constexpr std::uint64_t HitBonusSiteRva       = 0x44CF98;
+constexpr std::uint64_t MissileCastIdWindowRva = 0x5379F5;
+constexpr std::uint64_t MissileCastIdCallRva  = 0x537A17;
 constexpr std::uint64_t EventFuncSlot20Rva    = 0x238E660;
 constexpr std::uint64_t AttackRateWindowRva   = 0x351482;
 constexpr std::uint64_t AttackRateSiteRva     = 0x351597;
@@ -291,15 +424,15 @@ constexpr std::uint64_t ServerGlobalDelayRva  = 0x439470;
 constexpr std::uint64_t ServerLocalDelayRva   = 0x439500;
 constexpr std::uint64_t ClientGlobalDelayRva  = 0x217B30;
 constexpr std::uint64_t ClientLocalDelayRva   = 0x217B90;
-constexpr std::uint64_t CalculateDamageRva    = 0x44DF10;
+constexpr std::uint64_t MissileOwnerRva       = 0x490300;
+constexpr std::uint64_t SetCastIdRva          = 0x3E2B652;  // loader thunk (3E2B57E in 1.3.0)
 constexpr std::uint64_t EventFunc20Rva        = 0x583B30;
-constexpr std::uint64_t GenerateCastIdRva     = 0x3E2B578;  // loader thunk
+constexpr std::uint64_t GenerateCastIdRva     = 0x3E2B64C;  // loader thunk (3E2B578 in 1.3.0)
 constexpr std::uint64_t SkillsRecordRva       = 0x097790;
 constexpr std::uint64_t EvaluateFormulaRva    = 0x3B5160;
 constexpr std::uint64_t DataContextRva        = 0x34A0E0;
 constexpr std::uint64_t UnitTypeRva           = 0x34B9D0;
 constexpr std::uint64_t UnitIdRva             = 0x34A330;
-constexpr std::uint64_t IsServerUnitRva       = 0x34F8D0;
 constexpr std::uint64_t InventoryRva          = 0x34A360;
 constexpr std::uint64_t LeftHandWeaponRva     = 0x387690;
 constexpr std::uint64_t CheckItemTypeRva      = 0x373890;
@@ -331,6 +464,12 @@ constexpr std::size_t SkillGlobalDelayCalc  = 564;
 constexpr std::size_t SkillLocalDelayCalc   = 568;
 constexpr std::int32_t LocalCooldownState   = 185;
 constexpr std::int32_t LocalCooldownStat    = 359;
+constexpr std::uint32_t MissileUnitType     = 3;
+constexpr std::size_t CreateParamsOwnerOffset = 0x08;  // missile creation params: owner unit
+constexpr std::size_t UnitClassOffset       = 0x04;  // 349860 returns it: missiles.txt / monstats row, player class
+constexpr std::size_t UnitFlagsExOffset     = 0x128; // second flag word, written by 34E140 (unit, flag, set)
+constexpr std::uint32_t AuraPulseFlag       = 0x20000000;  // set by the aura events around every pulse
+constexpr std::uint32_t ServerUnitFlag      = 0x04000000;  // set by the server unit allocator 4905A0 only
 
 // SkillSelectButtonWidget and child widgets
 constexpr std::size_t ButtonSideOffset         = 2952;
@@ -357,6 +496,8 @@ constexpr std::size_t DamagePoisonEntries = 0x40;
 constexpr std::size_t DamagePoisonCount   = 0x48;
 constexpr std::size_t PoisonEntrySize     = 12;
 constexpr std::size_t PoisonEntryDamage   = 4;
+
+constexpr const char*   PluginVersion       = "1.3.2";
 
 constexpr std::uint64_t MsPerFrame          = 40;
 constexpr std::uint64_t PredictionTimeoutMs = 1500;
@@ -392,16 +533,36 @@ constexpr std::uint8_t DoHandlerWindow[]{
 constexpr std::size_t DoHandlerCallOffset = DoHandlerCallRva - DoHandlerWindowRva;
 
 // 589C34..589C45: generate the proc's cast id, then set it on the caster.
+// Both calls go through the loader's thunks at 3E2B64C and 3E2B652.
 constexpr std::uint8_t ProcCastIdWindow[]{
-    0x49,0x8B,0xCF,0xE8,0x3C,0x19,0x8A,0x03,0x8B,0xD0,0x48,0x8B,0xCB,0xE8,0x38,0x19,
+    0x49,0x8B,0xCF,0xE8,0x10,0x1A,0x8A,0x03,0x8B,0xD0,0x48,0x8B,0xCB,0xE8,0x0C,0x1A,
     0x8A,0x03 };
 constexpr std::size_t ProcCastIdCallOffset = ProcCastIdCallRva - ProcCastIdWindowRva;
 
-// 44CF87..44CF9B: the missile-style damage calculation call.
-constexpr std::uint8_t DamageCalcWindow[]{
-    0x4C,0x8B,0xCF,0x4C,0x8B,0xC6,0x49,0x8B,0xD6,0x49,0x8B,0xCF,0xE8,0x78,0x0F,0x00,
-    0x00,0x0F,0xB7,0x47,0x04 };
-constexpr std::size_t DamageCalcCallOffset = DamageCalcCallRva - DamageCalcWindowRva;
+// 44CF78..44CFA3: the pre-hit call (rdx attacker r14, rcx defender rsi), the
+// bMissile test on ebx, the recalculation call with r15/r14/rsi/rdi, then the
+// point every hit reaches: movzx eax,word [rdi+4] / test al,20h, whose six
+// bytes are replaced, and the two branches that read those flags.
+constexpr std::uint8_t HitBonusWindow[]{
+    0x49,0x8B,0xD6,0x48,0x8B,0xCE,0xE8,0xDD,0x0B,0xF0,0xFF,0x85,0xDB,0x74,0x11,0x4C,
+    0x8B,0xCF,0x4C,0x8B,0xC6,0x49,0x8B,0xD6,0x49,0x8B,0xCF,0xE8,0x78,0x0F,0x00,0x00,
+    0x0F,0xB7,0x47,0x04,0xA8,0x20,0x75,0x61,0xA8,0x01,0x74,0x5D };
+constexpr std::size_t HitBonusSiteOffset = HitBonusSiteRva - HitBonusWindowRva;
+constexpr std::size_t HitBonusPatchSize  = 6;
+static_assert(HitBonusSiteOffset == 0x20 && HitBonusWindow[HitBonusSiteOffset] == 0x0F
+    && HitBonusWindow[HitBonusSiteOffset + 4] == 0xA8, "The hit bonus site is not movzx / test.");
+
+// 5379F5..537A22 in the missile creator 5371A0 (r14 = creation params, r15 =
+// the new missile): eax = params+68h, or the owner's (params+8h) current cast
+// id through 34B6C0, or -1; then SetUnitCastId(missile, eax), the call that
+// goes through the relay.
+constexpr std::uint8_t MissileCastIdWindow[]{
+    0x41,0x8B,0x46,0x68,0x85,0xC0,0x75,0x15,0x49,0x8B,0x4E,0x08,0x48,0x85,0xC9,0x74,
+    0x07,0xE8,0xB5,0x3C,0xE1,0xFF,0xEB,0x05,0xB8,0xFF,0xFF,0xFF,0xFF,0x8B,0xD0,0x49,
+    0x8B,0xCF,0xE8,0x36,0x3C,0x8F,0x03,0x41,0x8B,0x56,0x3C,0x49,0x8B,0xCF };
+constexpr std::size_t MissileCastIdCallOffset = MissileCastIdCallRva - MissileCastIdWindowRva;
+static_assert(MissileCastIdCallOffset == 0x22 && MissileCastIdWindow[MissileCastIdCallOffset] == 0xE8,
+    "The missile cast id store is not a call.");
 
 // 351482..35149D: edi = rate% (r15d) * animation speed (r12d) / 100, rsi = unit.
 constexpr std::uint8_t AttackRateWindow[]{
@@ -467,9 +628,39 @@ constexpr std::uint8_t ClientGlobalDelayBytes[]{
     0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x8B,0xFA };
 constexpr std::uint8_t ClientLocalDelayBytes[]{
     0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57 };
-constexpr std::uint8_t CalculateDamageBytes[]{
-    0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0xAC,
-    0x24,0x68,0xFD,0xFF,0xFF,0x48,0x81,0xEC };
+// 34E161..34E173 in the unit flag setter 34E140 (unit, flag, set): the flag
+// word is unit+128h (mov eax,[rcx+128h] / or eax,edx / mov [rcx+128h],eax).
+constexpr std::uint64_t UnitFlagSetterRva = 0x34E161;
+constexpr std::uint8_t UnitFlagSetterBytes[]{
+    0x8B,0x81,0x28,0x01,0x00,0x00,0x45,0x85,0xC0,0x74,0x0D,0x0B,0xC2,0x89,0x81,0x28,
+    0x01,0x00,0x00 };
+// 43754A..437592 in the skill aura event 437460 (game, unit, customId, param,
+// castId): 34E140(unit, 20000000h, 1), the aura's do-handler 43ACB0, then
+// 34E140(unit, 20000000h, 0). The item aura event 437230 and the aura start
+// 43B680 bracket their do-handler calls the same way; the proc caster 589930
+// does not.
+constexpr std::uint64_t AuraPulseWindowRva = 0x43754A;
+constexpr std::uint8_t AuraPulseWindow[]{
+    0xBA,0x00,0x00,0x00,0x20,0x41,0xB8,0x01,0x00,0x00,0x00,0x48,0x8B,0xCF,0xE8,0xE3,
+    0x6B,0xF1,0xFF,0x45,0x33,0xF6,0x45,0x8B,0xCC,0x44,0x89,0x74,0x24,0x30,0x44,0x8B,
+    0xC5,0x44,0x89,0x74,0x24,0x28,0x48,0x8B,0xD7,0x48,0x8B,0xCE,0xC7,0x44,0x24,0x20,
+    0x01,0x00,0x00,0x00,0xE8,0x2D,0x37,0x00,0x00,0x45,0x33,0xC0,0xBA,0x00,0x00,0x00,
+    0x20,0x48,0x8B,0xCF,0xE8,0xAD,0x6B,0xF1,0xFF };
+
+// Hooked missile functions, position independent prologues up to an
+// instruction boundary.
+constexpr std::uint8_t MissileHitBytes[]{
+    0x48,0x89,0x5C,0x24,0x20,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57 };
+constexpr std::uint8_t MissileDoBytes[]{
+    0x40,0x53,0x56,0x41,0x56,0x48,0x83,0xEC,0x20,0x48,0x8B,0xDA,0x48,0x8B,0xF1,0x48,
+    0x8B,0xCB };
+constexpr std::uint8_t MissileDamageBytes[]{
+    0x40,0x53,0x57,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x38,0x49,0x8B,0xD9,0x4D,0x8B,
+    0xF8,0x48,0x8B,0xFA,0x4C,0x8B,0xF1 };
+// 490300 (game, unit): the owner through unit+E8h type / +ECh GUID.
+constexpr std::uint8_t MissileOwnerBytes[]{
+    0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xFA,0x48,0x8B,0xF1,
+    0x48,0x85,0xD2,0x75,0x20 };
 constexpr std::uint8_t EventFunc20Bytes[]{
     0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x48,
     0x89,0x7C,0x24,0x20,0x41,0x54,0x41,0x56 };
@@ -488,10 +679,16 @@ constexpr std::uint8_t UnitTypeBytes[]{
 constexpr std::uint8_t UnitIdBytes[]{
     0x48,0x83,0xEC,0x28,0x48,0x85,0xC9,0x75,0x1D,0x88,0x4C,0x24,0x30,0x48,0x8D,0x4C,
     0x24,0x30 };
-// 34F8F3: mov eax,[rcx+124h] / shr eax,15h / and eax,1
-constexpr std::uint64_t IsServerUnitFlagRva = 0x34F8F3;
-constexpr std::uint8_t IsServerUnitFlagBytes[]{
-    0x8B,0x81,0x24,0x01,0x00,0x00,0xC1,0xE8,0x15,0x83,0xE0,0x01 };
+// 4906A4..4906D4 in the server unit allocator 4905A0 (game, params, ...),
+// right after the common allocation: type, class, the game at unit+D8h, the
+// data context, then 34E140(unit, 4000000h, 1). Only server units carry that
+// flag; the client allocators (98DF0, 98FA0, ...) never set it.
+constexpr std::uint64_t ServerUnitAllocRva = 0x4906A4;
+constexpr std::uint8_t ServerUnitAllocBytes[]{
+    0x44,0x89,0x30,0x48,0x8B,0xCF,0x44,0x89,0x68,0x04,0x4C,0x89,0xB8,0xD8,0x00,0x00,
+    0x00,0x41,0x0F,0xB6,0x97,0x06,0x01,0x00,0x00,0xE8,0x1E,0xDB,0xEB,0xFF,0xBA,0x00,
+    0x00,0x00,0x04,0x41,0xB8,0x01,0x00,0x00,0x00,0x48,0x8B,0xCF,0xE8,0x6B,0xDA,0xEB,
+    0xFF };
 constexpr std::uint8_t InventoryBytes[]{
     0x48,0x89,0x5C,0x24,0x18,0x56,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF1,0x48,0x85,0xC9 };
 constexpr std::uint8_t LeftHandWeaponBytes[]{
@@ -523,7 +720,7 @@ constexpr auto W(std::uint64_t rva, const std::uint8_t (&bytes)[N], const char* 
     return { rva, bytes, static_cast<std::uint32_t>(N), name };
 }
 
-const std::array<Witness, 33> Witnesses{
+const std::array<Witness, 40> Witnesses{
     W(CooldownGateRva, CooldownGateBytes, "cooldown gate"),
     W(ClientApplyRva, ClientApplyBytes, "client cooldown step"),
     W(ServerApplyRva, ServerApplyBytes, "server cooldown step"),
@@ -531,12 +728,19 @@ const std::array<Witness, 33> Witnesses{
     W(SetUsedSkillRva, SetUsedSkillBytes, "skill start"),
     W(DoHandlerWindowRva, DoHandlerWindow, "skill do-handler shared cooldown call"),
     W(ProcCastIdWindowRva, ProcCastIdWindow, "proc caster cast id"),
-    W(DamageCalcWindowRva, DamageCalcWindow, "damage calculation call"),
+    W(HitBonusWindowRva, HitBonusWindow, "hit bonus site"),
+    W(MissileCastIdWindowRva, MissileCastIdWindow, "missile cast id store"),
+    W(MissileHitRva, MissileHitBytes, "missile hit resolution"),
+    W(MissileDoRva, MissileDoBytes, "missile do dispatcher"),
+    W(MissileDamageRva, MissileDamageBytes, "missile damage"),
     W(ServerGlobalDelayRva, ServerGlobalDelayBytes, "server shared cooldown"),
     W(ServerLocalDelayRva, ServerLocalDelayBytes, "server skill cooldown"),
     W(ClientGlobalDelayRva, ClientGlobalDelayBytes, "client shared cooldown"),
     W(ClientLocalDelayRva, ClientLocalDelayBytes, "client skill cooldown"),
-    W(CalculateDamageRva, CalculateDamageBytes, "damage calculation"),
+    W(MissileOwnerRva, MissileOwnerBytes, "missile owner"),
+    W(SetCastIdRva, LoaderThunkBytes, "cast id setter"),
+    W(UnitFlagSetterRva, UnitFlagSetterBytes, "unit flag setter"),
+    W(AuraPulseWindowRva, AuraPulseWindow, "aura pulse flag"),
     W(EventFunc20Rva, EventFunc20Bytes, "item event function 20"),
     W(GenerateCastIdRva, LoaderThunkBytes, "cast id generator"),
     W(SkillsRecordRva, SkillsRecordBytes, "skills.txt record"),
@@ -544,7 +748,7 @@ const std::array<Witness, 33> Witnesses{
     W(DataContextRva, DataContextBytes, "data context"),
     W(UnitTypeRva, UnitTypeBytes, "unit type"),
     W(UnitIdRva, UnitIdBytes, "unit id"),
-    W(IsServerUnitFlagRva, IsServerUnitFlagBytes, "server unit flag"),
+    W(ServerUnitAllocRva, ServerUnitAllocBytes, "server unit flag"),
     W(InventoryRva, InventoryBytes, "inventory"),
     W(LeftHandWeaponRva, LeftHandWeaponBytes, "attack weapon"),
     W(CheckItemTypeRva, CheckItemTypeBytes, "item type check"),
@@ -588,7 +792,11 @@ using ServerGlobalFn   = std::uint64_t(__fastcall*)(void* game, void* unit, std:
 using ServerLocalFn    = std::uint64_t(__fastcall*)(void* game, void* unit, std::int32_t frames, std::int32_t skillId);
 using ClientGlobalFn   = std::uint64_t(__fastcall*)(void* unit, std::int32_t frames);
 using ClientLocalFn    = std::uint64_t(__fastcall*)(void* unit, std::int32_t frames, std::int32_t skillId);
-using CalculateFn      = void(__fastcall*)(void* game, void* attacker, void* defender, void* damage);
+using MissileHitFn     = std::uint64_t(__fastcall*)(void* game, void* missile, void* target, std::int32_t forced);
+using MissileDoFn      = std::uint64_t(__fastcall*)(void* game, void* missile);
+using MissileDamageFn  = std::uint64_t(__fastcall*)(void* game, void* missile, void* target, void* damage);
+using MissileOwnerFn   = void*(__fastcall*)(void* game, void* unit);
+using SetCastIdFn      = void(__fastcall*)(void* unit, std::uint32_t castId);
 using EventFunc20Fn    = std::uint64_t(__fastcall*)(void* game, std::uint64_t event, void* owner, void* target,
                              void* damage, std::uint64_t packedStat, std::uint64_t a7, std::uint64_t a8, std::uint64_t a9);
 using GenerateCastIdFn = std::uint32_t(__fastcall*)(void* game);
@@ -598,7 +806,6 @@ using EvaluateFn       = std::int32_t(__fastcall*)(std::uint8_t context, void* u
 using DataContextFn    = std::uint8_t(__fastcall*)(void* unit);
 using UnitTypeFn       = std::uint32_t(__fastcall*)(void* unit);
 using UnitIdFn         = std::uint32_t(__fastcall*)(void* unit, const char* file, std::int32_t line);
-using IsServerUnitFn   = std::uint32_t(__fastcall*)(void* unit);
 using InventoryFn      = void*(__fastcall*)(void* unit, const char* file, std::int32_t line);
 using WeaponFn         = void*(__fastcall*)(void* inventory);
 using CheckItemTypeFn  = std::int32_t(__fastcall*)(void* item, std::int32_t itemType);
@@ -622,12 +829,16 @@ ServerApplyFn   OriginalServerApply{};
 PlayerRegenFn   OriginalPlayerRegen{};
 SetUsedSkillFn  OriginalSetUsedSkill{};
 ButtonUpdateFn  OriginalButtonUpdate{};
+MissileHitFn    OriginalMissileHit{};
+MissileDoFn     OriginalMissileDo{};
+MissileDamageFn OriginalMissileDamage{};
 
 ServerGlobalFn   ServerGlobalDelay{};
 ServerLocalFn    ServerLocalDelay{};
 ClientGlobalFn   ClientGlobalDelay{};
 ClientLocalFn    ClientLocalDelay{};
-CalculateFn      CalculateDamage{};
+MissileOwnerFn   MissileOwner{};
+SetCastIdFn      SetUnitCastId{};
 EventFunc20Fn    NativeEventFunc20{};
 GenerateCastIdFn GenerateCastId{};
 SkillsRecordFn   SkillsRecord{};
@@ -635,7 +846,6 @@ EvaluateFn       Evaluate{};
 DataContextFn    DataContext{};
 UnitTypeFn       UnitType{};
 UnitIdFn         UnitId{};
-IsServerUnitFn   IsServerUnit{};
 InventoryFn      Inventory{};
 WeaponFn         LeftHandWeapon{};
 CheckItemTypeFn  CheckItemType{};
@@ -665,14 +875,36 @@ PluginState State{ PluginState::NotLoaded };
 std::atomic<bool> Active{};
 bool UiActive{};
 
+// Counters, shown by the console command and zeroed by "crossbowcharges reset".
 std::atomic<std::uint64_t> BoltsSpent{};
 std::atomic<std::uint64_t> BoltsRefused{};
 std::atomic<std::uint64_t> RepeatStepsIgnored{};
 std::atomic<std::uint64_t> BoltsReloaded{};
-std::atomic<std::uint64_t> CastsTagged{};
+std::atomic<std::uint64_t> SkillStarts{};         // player skill starts on the server
+std::atomic<std::uint64_t> CastsTagged{};         // ... that were crossbow skills
+std::atomic<std::uint64_t> CastsTaggedAtSpend{};  // casts first tagged when their bolt was spent
+std::atomic<std::uint64_t> ProcsSeen{};
 std::atomic<std::uint64_t> ProcsTagged{};
-std::atomic<std::uint64_t> HitsBoosted{};
+std::atomic<std::uint64_t> PlayerMissiles{};
+std::atomic<std::uint64_t> CrossbowMissiles{};
+std::atomic<std::uint64_t> LinkedMissiles{};      // following a parent missile or their cast
+std::atomic<std::uint64_t> PlayerHits{};
+std::atomic<std::uint64_t> MissileHitsBoosted{};
+std::atomic<std::uint64_t> OtherHitsBoosted{};
+std::atomic<std::uint64_t> HitsSkippedAura{};
+std::atomic<std::uint64_t> HitsSkippedMissile{};
+std::atomic<std::uint64_t> HitsSkippedCast{};
+std::atomic<std::uint64_t> MissileDepthLeaks{};
 std::atomic<std::uint64_t> SequenceRatesSet{};
+
+void ResetCounters() {
+    for (std::atomic<std::uint64_t>* counter : { &BoltsSpent, &BoltsRefused, &RepeatStepsIgnored, &BoltsReloaded,
+            &SkillStarts, &CastsTagged, &CastsTaggedAtSpend, &ProcsSeen, &ProcsTagged, &PlayerMissiles,
+            &CrossbowMissiles, &LinkedMissiles, &PlayerHits, &MissileHitsBoosted, &OtherHitsBoosted,
+            &HitsSkippedAura, &HitsSkippedMissile, &HitsSkippedCast, &MissileDepthLeaks, &SequenceRatesSet }) {
+        counter->store(0, std::memory_order_relaxed);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -707,9 +939,11 @@ constexpr char DefaultConfigToml[] =
     "#   Hits from crossbow skills, and from everything those hits trigger (chance\n"
     "#   to cast on attack, on striking and on kill, and what those trigger in\n"
     "#   turn), deal (100 + damage_base + damage stat) percent of their final\n"
-    "#   damage, after resistances and absorbs. Physical, fire, burn, lightning,\n"
-    "#   cold, magic and poison scale. Crushing blow, open wounds and bleed do not.\n"
-    "#   Chance to cast when struck is never counted as a crossbow hit.\n"
+    "#   damage, after resistances and absorbs. That includes the explosions and\n"
+    "#   other missiles a crossbow missile spawns. Physical, fire, burn,\n"
+    "#   lightning, cold, magic and poison scale. Crushing blow, open wounds and\n"
+    "#   bleed do not. Chance to cast when struck and aura pulses never count,\n"
+    "#   whatever the player cast last.\n"
     "#\n"
     "# Attack speed\n"
     "#   Crossbow attacks (the A1 attack animation) always take exactly\n"
@@ -734,12 +968,22 @@ constexpr char DefaultConfigToml[] =
     "#   hudpanelhd.json and controller/hudpanelhd.json. A button without that\n"
     "#   child still shows the number.\n"
     "#\n"
-    "# Console command: crossbowcharges (status and counters)\n"
+    "# Console command\n"
+    "#   crossbowcharges            status, bolt pools and counters\n"
+    "#   crossbowcharges debug on   start the debug log (see debug below); off stops it\n"
+    "#   crossbowcharges reset      zero the counters, for a clean test\n"
     "\n"
     "[crossbow_charges]\n"
     "\n"
     "# Master switch.\n"
     "enabled = true\n"
+    "\n"
+    "# Debug log. Writes one line per player skill start, bolt spent, missile\n"
+    "# created, hit and proc to d2rloader/logs/celestialrayone.crossbow-charges.log:\n"
+    "# which cast it belongs to, whether that is a crossbow cast and why, and for\n"
+    "# hits the damage before and after the bonus. At most 60 lines per second;\n"
+    "# the rest are counted and reported. Also switchable in game (see above).\n"
+    "debug = false\n"
     "\n"
     "# itemtypes.txt codes that count as crossbows. Child types count too.\n"
     "crossbow_item_types = [\"xbow\"]\n"
@@ -797,6 +1041,7 @@ struct Config {
     std::int32_t               sweepFrames{ 64 };
     std::array<std::int32_t, 3> shadowColor{ 128, 128, 128 };
     std::int32_t               shadowOpacity{ 50 };
+    bool                       debug{ false };
 };
 
 Config      Settings;
@@ -930,6 +1175,8 @@ void ApplyConfigLine(std::string_view section, std::string_view key, std::string
         for (std::size_t i = 0; ok && i < 3; ++i) ok = ParseInt(items[i], 0, 255, color[i]);
         if (ok) Settings.shadowColor = color;
         else bad("expected [red, green, blue], each 0 to 255");
+    } else if (key == "debug") {
+        if (!ParseBool(value, Settings.debug)) bad("expected true or false");
     } else if (key == "shadow_opacity") {
         if (!ParseInt(value, 0, 100, Settings.shadowOpacity)) bad("expected 0 to 100");
     }
@@ -1018,7 +1265,7 @@ auto LocalPlayer() noexcept -> void* {
 // Crossbows
 // ---------------------------------------------------------------------------
 
-const D2RL::DataTableServiceV1* DataTables{};
+const D2RL::DataTableService* DataTables{};
 
 // Index 1..3 = DataTables bank = the unit's data context byte.
 struct BankTypes {
@@ -1091,21 +1338,110 @@ auto HasCrossbow(void* unit) noexcept -> bool {
     return false;
 }
 
-// globaldelay above 0 while a crossbow is held.
-auto IsCrossbowSkill(void* unit, void* skill) noexcept -> bool {
-    if (skill == nullptr || !HasCrossbow(unit)) return false;
+// globaldelay above 0 while a crossbow is held, with what decided it.
+struct CrossbowSkillCheck {
+    bool         held{};         // a crossbow is equipped
+    bool         record{};       // the skills.txt row was found
+    std::int32_t globaldelay{};  // evaluated globaldelay, frames
+};
+
+auto CheckCrossbowSkill(void* unit, void* skill) noexcept -> CrossbowSkillCheck {
+    CrossbowSkillCheck check{};
+    if (skill == nullptr) return check;
+    check.held = HasCrossbow(unit);
+    if (!check.held) return check;
     const std::int32_t skillId = SkillIdOf(skill);
-    if (skillId < 0) return false;
+    if (skillId < 0) return check;
     const std::uint8_t context = DataContext(unit);
     void* record = SkillsRecord(context, skillId);
-    if (record == nullptr) return false;
+    if (record == nullptr) return check;
+    check.record = true;
     const std::int32_t level = SkillLevel(unit, skill, 1, 0);
-    return Evaluate(context, unit, Read<std::uint32_t>(record, SkillGlobalDelayCalc), skillId, level) > 0;
+    check.globaldelay = Evaluate(context, unit, Read<std::uint32_t>(record, SkillGlobalDelayCalc), skillId, level);
+    return check;
+}
+
+auto IsCrossbowSkill(void* unit, void* skill) noexcept -> bool {
+    const CrossbowSkillCheck check = CheckCrossbowSkill(unit, skill);
+    return check.held && check.record && check.globaldelay > 0;
 }
 
 // default_max_bolts plus the max bolts stat, at least 1.
 auto MaxBolts(void* unit) noexcept -> std::int32_t {
     return std::max(1, Settings.defaultMaxBolts + GetStat(unit, Settings.maxBoltsStat, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Debug log
+// ---------------------------------------------------------------------------
+// One line per event while on (TOML debug, or "crossbowcharges debug on"),
+// written to the plugin log. At most DebugLinesPerSecond; the rest are
+// counted and reported at the front of the next line that gets through.
+
+std::atomic<bool>       DebugOn{};
+constexpr std::uint32_t DebugLinesPerSecond = 60;
+std::mutex              DebugMutex;
+std::uint64_t           DebugWindowStart{};
+std::uint32_t           DebugWindowLines{};
+std::uint64_t           DebugDropped{};
+
+void DebugLog(const char* format, ...) {
+    if (!DebugOn.load(std::memory_order_relaxed) || Context == nullptr) return;
+    std::uint64_t dropped = 0;
+    {
+        std::lock_guard lock(DebugMutex);
+        const std::uint64_t now = GetTickCount64();
+        if (now - DebugWindowStart >= 1000) {
+            DebugWindowStart = now;
+            DebugWindowLines = 0;
+        }
+        if (DebugWindowLines >= DebugLinesPerSecond) {
+            ++DebugDropped;
+            return;
+        }
+        ++DebugWindowLines;
+        dropped      = DebugDropped;
+        DebugDropped = 0;
+    }
+    char line[640];
+    int  used = 0;
+    if (dropped != 0) {
+        used = std::snprintf(line, sizeof(line), "(%llu lines dropped) ", static_cast<unsigned long long>(dropped));
+        if (used < 0 || used >= static_cast<int>(sizeof(line))) used = 0;
+    }
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line + used, sizeof(line) - static_cast<std::size_t>(used), format, args);
+    va_end(args);
+    Context->LogInfo(line);
+}
+
+auto UnitKind(std::uint32_t type) noexcept -> const char* {
+    switch (type) {
+    case 0:  return "player";
+    case 1:  return "monster";
+    case 2:  return "object";
+    case 3:  return "missile";
+    case 4:  return "item";
+    default: return "unit";
+    }
+}
+
+auto ClassOf(void* unit) noexcept -> std::uint32_t {
+    return Read<std::uint32_t>(unit, UnitClassOffset);
+}
+
+// Server units only: the server allocator sets the flag, nothing clears it.
+// (34F8D0, bit 21 of unit+124h, marks async client-only units instead and is
+// clear on players on both sides.)
+auto IsServerUnit(void* unit) noexcept -> bool {
+    return unit != nullptr && (Read<std::uint32_t>(unit, UnitFlagsExOffset) & ServerUnitFlag) != 0;
+}
+
+// Set by the aura events (skill auras 437460, item auras 437230, aura start
+// 43B680) for exactly the length of the aura's do-handler call.
+auto InAuraPulse(void* unit) noexcept -> bool {
+    return unit != nullptr && (Read<std::uint32_t>(unit, UnitFlagsExOffset) & AuraPulseFlag) != 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,23 +1462,54 @@ struct Pool {
     std::deque<std::int32_t> reloads;   // frames, front = reloading now
 };
 
-constexpr std::size_t TagRingSize = 512;
-struct TagRing {
-    std::array<std::uint32_t, TagRingSize> ids{};
-    std::size_t                            next{};
+// Crossbow cast ids, each with the GUID of the player it belongs to. Ids are
+// unique per game, so the id alone is the key. Bounded: a tag goes once
+// CastTagCapacity newer ones exist, long after anything it fired is gone.
+constexpr std::size_t CastTagCapacity = 8192;
+struct CastTag {
+    std::uint32_t owner;
+    std::uint32_t slot;
 };
 
-std::mutex                                  ServerMutex;
-void*                                       ServerGame{};
-std::unordered_map<std::uint32_t, Pool>     Pools;
-std::unordered_map<std::uint32_t, TagRing>  Tags;
-std::atomic<bool>                           ResetRequested{};
+// Player missiles that belong to another cast than their own cast id, keyed by
+// missile GUID and valid only while the missile still carries the cast id it
+// was created with (a GUID the game hands out again starts clean):
+//   follows the parent  created while one of its owner's missiles was being
+//                       resolved, under a different cast id
+//   follows the cast    created outside any missile under a newer id than its
+//                       owner's current cast (523370 gives every missile its
+//                       own new id, 52353C), so it belongs to that cast
+//   follows nothing     created during an aura pulse: never a crossbow missile
+constexpr std::size_t LinkCapacity = 8192;
+struct MissileLink {
+    std::uint32_t castId;   // the missile's own cast id when the link was made
+    std::uint32_t follows;  // the cast it belongs to, 0 for none
+    std::uint32_t slot;
+};
+
+std::mutex                                     ServerMutex;
+void*                                          ServerGame{};
+std::unordered_map<std::uint32_t, Pool>        Pools;
+std::int32_t                                   LastPruneFrame{};
+std::unordered_map<std::uint32_t, CastTag>     CastTags;
+std::array<std::uint32_t, CastTagCapacity>     CastTagOrder{};
+std::size_t                                    CastTagCount{};
+std::uint32_t                                  LastCrossbowCast{};
+std::unordered_map<std::uint32_t, MissileLink> MissileLinks;
+std::array<std::uint32_t, LinkCapacity>        LinkOrder{};
+std::size_t                                    LinkCount{};
+std::atomic<bool>                              ResetRequested{};
 
 void ResetServerIfNeeded(void* game) {
     const bool requested = ResetRequested.exchange(false);
     if (requested || (game != nullptr && game != ServerGame)) {
         Pools.clear();
-        Tags.clear();
+        LastPruneFrame = 0;
+        CastTags.clear();
+        CastTagCount     = 0;
+        LastCrossbowCast = 0;
+        MissileLinks.clear();
+        LinkCount = 0;
         if (game != nullptr) ServerGame = game;
     }
 }
@@ -1203,14 +1570,37 @@ void WriteBolts(void* unit, std::int32_t value) {
     if (value >= 0) SetStat(unit, Settings.currentBoltsStat, value, 0);
 }
 
+// A pool whose unit the regeneration event has not ticked for this long is
+// gone (a unit that left the game, or one that never held a crossbow).
+constexpr std::int32_t PoolIdleFrames = 250;
+
+void PrunePools(std::int32_t frame) {
+    if (frame >= LastPruneFrame && frame - LastPruneFrame < PoolIdleFrames) return;
+    LastPruneFrame = frame;
+    for (auto it = Pools.begin(); it != Pools.end();) {
+        const std::int32_t idle = frame - it->second.tickFrame;
+        if (idle > PoolIdleFrames || idle < 0) {
+            it = Pools.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 void TickServer(void* game, void* unit) {
     const std::uint32_t guid  = GuidOf(unit);
     std::int32_t        write = -1;
     {
         std::lock_guard lock(ServerMutex);
         ResetServerIfNeeded(game);
-        Pool& pool = Pools[guid];
         const std::int32_t frame = FrameOf(game);
+        PrunePools(frame);
+        auto it = Pools.find(guid);
+        if (it == Pools.end()) {
+            if (!HasCrossbow(unit)) return;   // only crossbow users get a pool
+            it = Pools.try_emplace(guid).first;
+        }
+        Pool& pool = it->second;
         RefreshCapacity(pool, unit, frame);
         if (!pool.initialized) return;
         Advance(pool, frame);
@@ -1221,67 +1611,206 @@ void TickServer(void* game, void* unit) {
     WriteBolts(unit, write);
 }
 
-void SpendBolt(void* game, void* unit, std::int32_t frames) {
+// The functions up to CastOfMissile expect ServerMutex to be held.
+void TagCast(std::uint32_t castId, std::uint32_t owner) {
+    if (!ValidCastId(castId)) return;
+    LastCrossbowCast = castId;
+    const auto it = CastTags.find(castId);
+    if (it != CastTags.end()) {
+        it->second.owner = owner;
+        return;
+    }
+    const auto slot = static_cast<std::uint32_t>(CastTagCount % CastTagCapacity);
+    if (CastTagCount >= CastTagCapacity) {
+        const auto old = CastTags.find(CastTagOrder[slot]);
+        if (old != CastTags.end() && old->second.slot == slot) CastTags.erase(old);
+    }
+    CastTagOrder[slot] = castId;
+    CastTags.emplace(castId, CastTag{ owner, slot });
+    ++CastTagCount;
+}
+
+auto IsCrossbowCast(std::uint32_t castId, std::uint32_t owner) -> bool {
+    if (!ValidCastId(castId)) return false;
+    const auto it = CastTags.find(castId);
+    return it != CastTags.end() && it->second.owner == owner;
+}
+
+void RecordLink(std::uint32_t missileGuid, std::uint32_t castId, std::uint32_t follows) {
+    const auto it = MissileLinks.find(missileGuid);
+    if (it != MissileLinks.end()) {
+        it->second.castId  = castId;
+        it->second.follows = follows;
+        return;
+    }
+    const auto slot = static_cast<std::uint32_t>(LinkCount % LinkCapacity);
+    if (LinkCount >= LinkCapacity) {
+        const auto old = MissileLinks.find(LinkOrder[slot]);
+        if (old != MissileLinks.end() && old->second.slot == slot) MissileLinks.erase(old);
+    }
+    LinkOrder[slot] = missileGuid;
+    MissileLinks.emplace(missileGuid, MissileLink{ castId, follows, slot });
+    ++LinkCount;
+}
+
+// The cast a missile belongs to: its link while the link is valid, else its
+// own cast id.
+auto CastOfMissile(std::uint32_t missileGuid, std::uint32_t castId, bool* linked) -> std::uint32_t {
+    const auto it    = MissileLinks.find(missileGuid);
+    const bool valid = it != MissileLinks.end() && it->second.castId == castId;
+    if (linked != nullptr) *linked = valid;
+    return valid ? it->second.follows : castId;
+}
+
+// Called for crossbow skills only, by the do-handler relay and 436C70, right
+// after the game evaluated the skill's globaldelay above 0 with a crossbow
+// held. The unit's current cast id is that crossbow cast, so it is tagged here
+// too; a cast the skill start already tagged is left alone.
+void SpendBolt(void* game, void* unit, std::int32_t frames, std::int32_t skillId) {
     const std::uint32_t guid   = GuidOf(unit);
     const std::uint32_t castId = CastIdOf(unit);
+    const bool          aura   = InAuraPulse(unit);
     std::int32_t        write  = -1;
+    const char*         outcome = "no pool";
+    bool                tagged  = false;
+    std::int32_t        left    = 0;
+    std::int32_t        max     = 0;
     {
         std::lock_guard lock(ServerMutex);
         ResetServerIfNeeded(game);
+        if (!aura && ValidCastId(castId) && !IsCrossbowCast(castId, guid)) {
+            TagCast(castId, guid);
+            tagged = true;
+        }
         Pool& pool = Pools[guid];
         const std::int32_t frame = FrameOf(game);
         RefreshCapacity(pool, unit, frame);
-        if (!pool.initialized) return;
-        Advance(pool, frame);
-        // A later do-event of a cast that already spent (Strafe's next arrow).
-        if (ValidCastId(castId) && castId == pool.lastCastId) {
-            RepeatStepsIgnored.fetch_add(1, std::memory_order_relaxed);
-            return;
+        if (pool.initialized) {
+            Advance(pool, frame);
+            if (ValidCastId(castId) && castId == pool.lastCastId) {
+                // A later do-event of a cast that already spent (Strafe's next arrow).
+                outcome = "repeat step, already spent";
+                RepeatStepsIgnored.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                pool.lastCastId = castId;
+                if (pool.current <= 0) {
+                    outcome = "refused, no bolts";
+                    BoltsRefused.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    --pool.current;
+                    const std::int32_t duration = std::max(1, frames);
+                    if (pool.reloads.empty()) pool.headStart = frame;
+                    pool.reloads.push_back(duration);
+                    pool.everSpent    = true;
+                    pool.lastDuration = duration;
+                    pool.tickFrame    = frame;
+                    pool.tickMs       = GetTickCount64();
+                    write   = Commit(pool);
+                    outcome = "bolt spent";
+                    BoltsSpent.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            left = pool.current;
+            max  = pool.lastMax;
         }
-        pool.lastCastId = castId;
-        if (pool.current <= 0) {
-            BoltsRefused.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
-        --pool.current;
-        const std::int32_t duration = std::max(1, frames);
-        if (pool.reloads.empty()) pool.headStart = frame;
-        pool.reloads.push_back(duration);
-        pool.everSpent    = true;
-        pool.lastDuration = duration;
-        pool.tickFrame    = frame;
-        pool.tickMs       = GetTickCount64();
-        write = Commit(pool);
     }
     WriteBolts(unit, write);
-    BoltsSpent.fetch_add(1, std::memory_order_relaxed);
+    if (tagged) CastsTaggedAtSpend.fetch_add(1, std::memory_order_relaxed);
+    DebugLog("[spend] player %u skill %d cast %u: %s, reload %d frames, %d of %d bolts left%s%s", guid, skillId, castId,
+        outcome, frames, left, max, tagged ? "; cast tagged here, the skill start did not tag it" : "",
+        aura ? "; aura pulse, not tagged" : "");
 }
 
+// A pool not started yet would be full.
 auto ServerBolts(void* unit) -> std::int32_t {
     const std::uint32_t guid = GuidOf(unit);
     std::lock_guard lock(ServerMutex);
     ResetServerIfNeeded(nullptr);
-    Pool& pool = Pools[guid];
-    if (!pool.initialized) {
-        pool.initialized = true;
-        pool.lastMax     = MaxBolts(unit);
-        pool.current     = pool.lastMax;
+    const auto it = Pools.find(guid);
+    if (it == Pools.end() || !it->second.initialized) return MaxBolts(unit);
+    return it->second.current;
+}
+
+// The missiles the engine is resolving on this thread (4639A0, 466CE0,
+// 462E40), innermost last. Past MaxMissileFrames nothing is recorded and no
+// missile counts as in progress.
+struct MissileFrame {
+    void* game;
+    void* missile;
+};
+constexpr std::size_t MaxMissileFrames = 32;
+thread_local std::array<MissileFrame, MaxMissileFrames> MissileFrames{};
+thread_local std::size_t                                MissileDepth{};
+
+class MissileScope {
+public:
+    MissileScope(void* game, void* missile) noexcept {
+        if (MissileDepth < MaxMissileFrames) MissileFrames[MissileDepth] = { game, missile };
+        ++MissileDepth;
     }
-    return pool.current;
+    ~MissileScope() { --MissileDepth; }
+    MissileScope(const MissileScope&)            = delete;
+    MissileScope& operator=(const MissileScope&) = delete;
+};
+
+// The innermost missile in progress when it belongs to unit, else null.
+auto OwnMissileInProgress(void* unit) noexcept -> void* {
+    if (unit == nullptr || MissileDepth == 0 || MissileDepth > MaxMissileFrames) return nullptr;
+    const MissileFrame& frame = MissileFrames[MissileDepth - 1];
+    if (frame.game == nullptr || frame.missile == nullptr || UnitType(frame.missile) != MissileUnitType) {
+        return nullptr;
+    }
+    return MissileOwner(frame.game, frame.missile) == unit ? frame.missile : nullptr;
 }
 
-void Tag(std::uint32_t guid, std::uint32_t castId) {
-    if (!ValidCastId(castId)) return;
-    TagRing& ring = Tags[guid];
-    ring.ids[ring.next % TagRingSize] = castId;
-    ++ring.next;
+// Which cast a hit or proc of a player (a server unit) belongs to, and whether
+// that is a crossbow cast. Aura pulses never are. Otherwise the player's own
+// missile being resolved decides, else the player's current cast.
+struct SourceDecision {
+    bool          crossbow{};
+    bool          aura{};
+    bool          viaMissile{};
+    bool          linked{};          // the missile belongs to another cast than its own id
+    std::uint32_t missileGuid{};
+    std::uint32_t missileRow{};
+    std::uint32_t missileCast{};
+    std::uint32_t cast{};            // the cast that decides
+    std::uint32_t unitCast{};        // the player's current cast id
+    std::uint32_t lastCrossbowCast{};
+};
+
+auto DecideSource(void* unit) -> SourceDecision {
+    SourceDecision d{};
+    d.unitCast = CastIdOf(unit);
+    const std::uint32_t owner = GuidOf(unit);
+    if (InAuraPulse(unit)) {
+        d.aura = true;
+    } else if (void* missile = OwnMissileInProgress(unit); missile != nullptr) {
+        d.viaMissile  = true;
+        d.missileGuid = GuidOf(missile);
+        d.missileRow  = ClassOf(missile);
+        d.missileCast = CastIdOf(missile);
+    }
+    std::lock_guard lock(ServerMutex);
+    ResetServerIfNeeded(nullptr);
+    d.lastCrossbowCast = LastCrossbowCast;
+    if (d.aura) return d;
+    d.cast     = d.viaMissile ? CastOfMissile(d.missileGuid, d.missileCast, &d.linked) : d.unitCast;
+    d.crossbow = IsCrossbowCast(d.cast, owner);
+    return d;
 }
 
-auto IsTagged(std::uint32_t guid, std::uint32_t castId) -> bool {
-    if (!ValidCastId(castId)) return false;
-    const auto it = Tags.find(guid);
-    if (it == Tags.end()) return false;
-    return std::find(it->second.ids.begin(), it->second.ids.end(), castId) != it->second.ids.end();
+void DescribeSource(const SourceDecision& d, char* out, std::size_t size) {
+    if (d.aura) {
+        std::snprintf(out, size, "aura pulse (cast %u)", d.unitCast);
+    } else if (d.viaMissile && d.linked) {
+        std::snprintf(out, size, "missile %u (row %u, cast %u, belongs to cast %u)", d.missileGuid, d.missileRow,
+            d.missileCast, d.cast);
+    } else if (d.viaMissile) {
+        std::snprintf(out, size, "missile %u (row %u, cast %u)", d.missileGuid, d.missileRow, d.missileCast);
+    } else {
+        std::snprintf(out, size, "cast %u", d.unitCast);
+    }
 }
 
 // Set while item event function 20 runs for an owner carrying a tagged id.
@@ -1451,7 +1980,7 @@ std::int32_t __fastcall HookedGate(void* unit, void* skill) {
         if (list != nullptr && ReadListStat(DataContext(unit), list, LocalCooldownStat, skillId) > 0) return 0;
     }
     std::int32_t bolts = 0;
-    if (IsServerUnit(unit) != 0) {
+    if (IsServerUnit(unit)) {
         bolts = ServerBolts(unit);
     } else if (unit == LocalPlayer()) {
         bolts = LocalView(unit, GetTickCount64()).bolts;
@@ -1507,23 +2036,30 @@ void __fastcall HookedServerApply(void* game, void* unit, std::int32_t skillId, 
         OriginalServerApply(game, unit, skillId, level);
         return;
     }
-    SpendBolt(game, unit, global);
+    SpendBolt(game, unit, global, skillId);
     const std::int32_t local = Evaluate(context, unit, Read<std::uint32_t>(record, SkillLocalDelayCalc), skillId, level);
     if (local > 0) ServerLocalDelay(game, unit, local, skillId);
 }
 
 // Reached from the relay in place of the call at 43B18D; r13d is the skill id.
 void __fastcall HookedDoHandlerGlobal(void* game, void* unit, std::int32_t frames, std::int32_t skillId) {
-    (void)skillId;
     if (Active.load(std::memory_order_relaxed) && IsPlayer(unit) && HasCrossbow(unit)) {
-        SpendBolt(game, unit, frames);
+        SpendBolt(game, unit, frames, skillId);
         return;
     }
     ServerGlobalDelay(game, unit, frames);
 }
 
 std::uint64_t __fastcall HookedPlayerRegen(void* game, void* unit, std::int32_t a3, std::int32_t a4) {
-    if (Active.load(std::memory_order_relaxed) && game != nullptr && IsPlayer(unit)) TickServer(game, unit);
+    if (Active.load(std::memory_order_relaxed) && game != nullptr && IsPlayer(unit)) {
+        // The per-frame player event never runs inside a missile's processing.
+        // A missile still recorded here means the tracking lost a pop.
+        if (MissileDepth != 0 && MissileDepthLeaks.fetch_add(1, std::memory_order_relaxed) % 1000 == 0) {
+            D2RL::LogWarnF(Context, "CrossbowCharges: missile tracking out of balance (depth %zu at the player "
+                "tick); crossbow missile hits may be judged wrong.", MissileDepth);
+        }
+        TickServer(game, unit);
+    }
     return OriginalPlayerRegen(game, unit, a3, a4);
 }
 
@@ -1534,14 +2070,31 @@ std::uint64_t __fastcall HookedPlayerRegen(void* game, void* unit, std::int32_t 
 std::uint64_t __fastcall HookedSetUsedSkill(void* unit, void* skill, std::uint32_t castId) {
     const std::uint64_t result = OriginalSetUsedSkill(unit, skill, castId);
     if (!Active.load(std::memory_order_relaxed) || skill == nullptr || !ValidCastId(castId)
-            || !IsPlayer(unit) || IsServerUnit(unit) == 0 || !IsCrossbowSkill(unit, skill)) {
+            || !IsPlayer(unit) || !IsServerUnit(unit)) {
         return result;
     }
-    const std::uint32_t guid = GuidOf(unit);
-    std::lock_guard lock(ServerMutex);
-    ResetServerIfNeeded(nullptr);
-    Tag(guid, castId);
+    SkillStarts.fetch_add(1, std::memory_order_relaxed);
+    const std::uint32_t      guid    = GuidOf(unit);
+    const std::int32_t       skillId = SkillIdOf(skill);
+    const CrossbowSkillCheck check   = CheckCrossbowSkill(unit, skill);
+    if (!check.held || !check.record || check.globaldelay <= 0) {
+        if (!check.held || !check.record) {
+            DebugLog("[start] player %u skill %d cast %u: not a crossbow skill (%s)", guid, skillId, castId,
+                !check.held ? "no crossbow held" : "no skills.txt row");
+        } else {
+            DebugLog("[start] player %u skill %d cast %u: not a crossbow skill (globaldelay %d)", guid, skillId,
+                castId, check.globaldelay);
+        }
+        return result;
+    }
+    {
+        std::lock_guard lock(ServerMutex);
+        ResetServerIfNeeded(nullptr);
+        TagCast(castId, guid);
+    }
     CastsTagged.fetch_add(1, std::memory_order_relaxed);
+    DebugLog("[start] player %u skill %d cast %u: crossbow skill (globaldelay %d frames), cast tagged", guid, skillId,
+        castId, check.globaldelay);
     return result;
 }
 
@@ -1551,10 +2104,17 @@ std::uint64_t __fastcall HookedEventFunc20(void* game, std::uint64_t event, void
     const std::uint32_t previousOwner  = ProcOwner;
     bool          tagged = false;
     std::uint32_t guid   = 0;
-    if (Active.load(std::memory_order_relaxed) && IsPlayer(owner) && IsServerUnit(owner) != 0) {
+    if (Active.load(std::memory_order_relaxed) && IsPlayer(owner) && IsServerUnit(owner)) {
         guid = GuidOf(owner);
-        std::lock_guard lock(ServerMutex);
-        tagged = IsTagged(guid, CastIdOf(owner));
+        const SourceDecision d = DecideSource(owner);
+        tagged = d.crossbow;
+        ProcsSeen.fetch_add(1, std::memory_order_relaxed);
+        if (DebugOn.load(std::memory_order_relaxed)) {
+            char source[160];
+            DescribeSource(d, source, sizeof(source));
+            DebugLog("[proc] player %u event %llu via %s: %s", guid, static_cast<unsigned long long>(event), source,
+                tagged ? "crossbow source, a proc cast here gets tagged" : "not a crossbow source");
+        }
     }
     ProcFromCrossbow = tagged;
     ProcOwner        = guid;
@@ -1568,9 +2128,12 @@ std::uint64_t __fastcall HookedEventFunc20(void* game, std::uint64_t event, void
 std::uint32_t __fastcall HookedProcCastId(void* game) {
     const std::uint32_t castId = GenerateCastId(game);
     if (ProcFromCrossbow && ValidCastId(castId)) {
-        std::lock_guard lock(ServerMutex);
-        Tag(ProcOwner, castId);
+        {
+            std::lock_guard lock(ServerMutex);
+            TagCast(castId, ProcOwner);
+        }
         ProcsTagged.fetch_add(1, std::memory_order_relaxed);
+        DebugLog("[proc] player %u: proc cast %u tagged", ProcOwner, castId);
     }
     return castId;
 }
@@ -1596,20 +2159,148 @@ void BoostDamage(void* damage, std::int32_t percent) {
     }
 }
 
-// Reached from the relay in place of the call at 44CF93.
-void __fastcall HookedDamageCalc(void* game, void* attacker, void* defender, void* damage) {
-    CalculateDamage(game, attacker, defender, damage);
+// The damage values of one hit, in 256ths of a life point.
+struct DamageSnapshot {
+    std::array<std::int32_t, std::size(DamageFields)> fields{};
+};
+
+auto TakeSnapshot(void* damage) -> DamageSnapshot {
+    DamageSnapshot snapshot{};
+    for (std::size_t i = 0; i < std::size(DamageFields); ++i) snapshot.fields[i] = Read<std::int32_t>(damage, DamageFields[i]);
+    return snapshot;
+}
+
+// "life 12.00 -> 30.00 (phys 10.00 -> 25.00, fire 2.00 -> 5.00)"
+void DescribeDamage(const DamageSnapshot& before, const DamageSnapshot& after, char* out, std::size_t size) {
+    // DamageFields order: physical, fire, burn, lightning, magic, cold, poison, then the life total.
+    static constexpr const char* Names[]{ "phys", "fire", "burn", "light", "magic", "cold", "poison" };
+    constexpr std::size_t Life = std::size(DamageFields) - 1;
+    static_assert(std::size(Names) == Life);
+    int used = std::snprintf(out, size, "life %.2f -> %.2f", before.fields[Life] / 256.0, after.fields[Life] / 256.0);
+    bool open = false;
+    for (std::size_t i = 0; i < Life && used > 0 && static_cast<std::size_t>(used) < size; ++i) {
+        if (before.fields[i] == 0 && after.fields[i] == 0) continue;
+        used += std::snprintf(out + used, size - static_cast<std::size_t>(used), "%s%s %.2f -> %.2f",
+            open ? ", " : " (", Names[i], before.fields[i] / 256.0, after.fields[i] / 256.0);
+        open = true;
+    }
+    if (open && used > 0 && static_cast<std::size_t>(used) + 1 < size) std::snprintf(out + used, size - static_cast<std::size_t>(used), ")");
+}
+
+// Reached from the relay at 44CF98, which every hit passes after the optional
+// recalculation and before the damage events, leech and the life commit.
+void __fastcall HookedHitBonus(void* game, void* attacker, void* defender, void* damage) {
+    (void)game;
     if (!Active.load(std::memory_order_relaxed) || damage == nullptr || !IsPlayer(attacker)
-            || IsServerUnit(attacker) == 0) {
+            || !IsServerUnit(attacker)) {
         return;
     }
-    const std::uint32_t guid = GuidOf(attacker);
+    PlayerHits.fetch_add(1, std::memory_order_relaxed);
+    const SourceDecision d     = DecideSource(attacker);
+    const bool           debug = DebugOn.load(std::memory_order_relaxed);
+    char source[160]{};
+    if (debug) DescribeSource(d, source, sizeof(source));
+    const std::uint32_t guid         = GuidOf(attacker);
+    const std::uint32_t defenderType = defender != nullptr ? UnitType(defender) : 0xFFFFFFFFu;
+    const std::uint32_t defenderGuid = defender != nullptr ? GuidOf(defender) : 0;
+    if (!d.crossbow) {
+        if (d.aura) {
+            HitsSkippedAura.fetch_add(1, std::memory_order_relaxed);
+            DebugLog("[hit] player %u -> %s %u via %s: no bonus, aura pulses never count", guid, UnitKind(defenderType),
+                defenderGuid, source);
+        } else {
+            (d.viaMissile ? HitsSkippedMissile : HitsSkippedCast).fetch_add(1, std::memory_order_relaxed);
+            DebugLog("[hit] player %u -> %s %u via %s: no bonus, cast %u is not a crossbow cast (last crossbow cast %u)",
+                guid, UnitKind(defenderType), defenderGuid, source, d.cast, d.lastCrossbowCast);
+        }
+        return;
+    }
+    const std::int32_t   stat    = GetStat(attacker, Settings.damageStat, 0);
+    const std::int32_t   percent = Settings.damageBase + stat;
+    const DamageSnapshot before  = debug ? TakeSnapshot(damage) : DamageSnapshot{};
+    BoostDamage(damage, percent);
+    (d.viaMissile ? MissileHitsBoosted : OtherHitsBoosted).fetch_add(1, std::memory_order_relaxed);
+    if (debug) {
+        char values[320];
+        DescribeDamage(before, TakeSnapshot(damage), values, sizeof(values));
+        DebugLog("[hit] player %u -> %s %u via %s: +%d%% (base %d, stat %d), %s", guid, UnitKind(defenderType),
+            defenderGuid, source, percent, Settings.damageBase, stat, values);
+    }
+}
+
+// Reached from the relay in place of the call at 537A17 in the missile creator
+// 5371A0, with the creation params (r14) as the third argument. Every missile
+// is created there; for a player's missile this decides which cast it belongs
+// to (see MissileLink).
+void __fastcall HookedMissileCastId(void* missile, std::uint32_t castId, void* params) {
+    SetUnitCastId(missile, castId);
+    if (!Active.load(std::memory_order_relaxed) || missile == nullptr || params == nullptr) return;
+    void* owner = Read<void*>(params, CreateParamsOwnerOffset);
+    if (!IsPlayer(owner) || !IsServerUnit(owner)) return;
+    const bool          aura        = InAuraPulse(owner);
+    void*               parent      = aura ? nullptr : OwnMissileInProgress(owner);
+    if (parent == missile) parent = nullptr;
+    const std::uint32_t ownerGuid   = GuidOf(owner);
+    const std::uint32_t ownerCast   = CastIdOf(owner);
+    const std::uint32_t missileGuid = GuidOf(missile);
+    const std::uint32_t parentGuid  = parent != nullptr ? GuidOf(parent) : 0;
+    const std::uint32_t parentCast  = parent != nullptr ? CastIdOf(parent) : 0;
+    const char*         how         = "its own cast";
+    std::uint32_t       follows     = castId;
+    bool                crossbow    = false;
     {
         std::lock_guard lock(ServerMutex);
-        if (!IsTagged(guid, CastIdOf(attacker))) return;
+        ResetServerIfNeeded(nullptr);
+        if (aura) {
+            how     = "aura pulse";
+            follows = 0;
+            RecordLink(missileGuid, castId, 0);
+        } else if (parent != nullptr) {
+            how     = "spawned by its missile";
+            follows = CastOfMissile(parentGuid, parentCast, nullptr);
+            if (follows != castId) {
+                RecordLink(missileGuid, castId, follows);
+            } else {
+                MissileLinks.erase(missileGuid);
+            }
+        } else if (ValidCastId(castId) && ValidCastId(ownerCast) && castId > ownerCast) {
+            how     = "new id for one missile of the current cast";
+            follows = ownerCast;
+            RecordLink(missileGuid, castId, ownerCast);
+        } else {
+            MissileLinks.erase(missileGuid);
+        }
+        crossbow = IsCrossbowCast(follows, ownerGuid);
     }
-    BoostDamage(damage, Settings.damageBase + GetStat(attacker, Settings.damageStat, 0));
-    HitsBoosted.fetch_add(1, std::memory_order_relaxed);
+    PlayerMissiles.fetch_add(1, std::memory_order_relaxed);
+    if (crossbow) CrossbowMissiles.fetch_add(1, std::memory_order_relaxed);
+    if (follows != castId) LinkedMissiles.fetch_add(1, std::memory_order_relaxed);
+    if (parent != nullptr) {
+        DebugLog("[missile] player %u missile %u (row %u) cast %u: %s %u (cast %u), belongs to cast %u, %s", ownerGuid,
+            missileGuid, ClassOf(missile), castId, how, parentGuid, parentCast, follows,
+            crossbow ? "crossbow" : "not crossbow");
+    } else {
+        DebugLog("[missile] player %u missile %u (row %u) cast %u: %s, belongs to cast %u (player cast %u), %s",
+            ownerGuid, missileGuid, ClassOf(missile), castId, how, follows, ownerCast,
+            crossbow ? "crossbow" : "not crossbow");
+    }
+}
+
+// The missile in progress for everything these three reach: hits, do
+// functions (areas, trails, expiry) and the stamped damage step.
+std::uint64_t __fastcall HookedMissileHit(void* game, void* missile, void* target, std::int32_t forced) {
+    MissileScope scope(game, missile);
+    return OriginalMissileHit(game, missile, target, forced);
+}
+
+std::uint64_t __fastcall HookedMissileDo(void* game, void* missile) {
+    MissileScope scope(game, missile);
+    return OriginalMissileDo(game, missile);
+}
+
+std::uint64_t __fastcall HookedMissileDamage(void* game, void* missile, void* target, void* damage) {
+    MissileScope scope(game, missile);
+    return OriginalMissileDamage(game, missile, target, damage);
 }
 
 // ---------------------------------------------------------------------------
@@ -1760,15 +2451,17 @@ std::int32_t __fastcall HookedAttackRate(void* unit, std::int32_t rate) {
 // ---------------------------------------------------------------------------
 
 constexpr std::size_t RelayPageBytes   = 4'096;
-constexpr std::size_t DoHandlerStub    = 0x00;  // 45 8B CD / FF 25 00000000 / dq
-constexpr std::size_t ProcCastIdStub   = 0x20;  // FF 25 00000000 / dq
-constexpr std::size_t DamageCalcStub   = 0x40;  // FF 25 00000000 / dq
-constexpr std::size_t AttackRateStub   = 0x60;  // save, call HookedAttackRate(rsi, edi), mov ebx,7FFFh, ret
+constexpr std::size_t DoHandlerStub     = 0x00;  // 45 8B CD / FF 25 00000000 / dq
+constexpr std::size_t ProcCastIdStub    = 0x20;  // FF 25 00000000 / dq
+constexpr std::size_t MissileCastIdStub = 0x40;  // 4D 8B C6 / FF 25 00000000 / dq
+constexpr std::size_t AttackRateStub    = 0x60;  // save, call HookedAttackRate(rsi, edi), mov ebx,7FFFh, ret
+constexpr std::size_t HitBonusStub      = 0xA0;  // save, call HookedHitBonus(r15, r14, rsi, rdi), replay, ret
 
 void* RelayPage{};
 bool  DoHandlerPatched{};
 bool  ProcCastIdPatched{};
-bool  DamageCalcPatched{};
+bool  MissileCastIdPatched{};
+bool  HitBonusPatched{};
 bool  AttackRatePatched{};
 bool  EventSlotPatched{};
 
@@ -1815,7 +2508,8 @@ auto BuildRelayPage() -> bool {
     const std::uint8_t moveSkillId[]{ 0x45, 0x8B, 0xCD };  // mov r9d, r13d
     put(DoHandlerStub, moveSkillId, sizeof(moveSkillId), reinterpret_cast<const void*>(&HookedDoHandlerGlobal));
     put(ProcCastIdStub, nullptr, 0, reinterpret_cast<const void*>(&HookedProcCastId));
-    put(DamageCalcStub, nullptr, 0, reinterpret_cast<const void*>(&HookedDamageCalc));
+    const std::uint8_t moveParams[]{ 0x4D, 0x8B, 0xC6 };  // mov r8, r14
+    put(MissileCastIdStub, moveParams, sizeof(moveParams), reinterpret_cast<const void*>(&HookedMissileCastId));
     // Entered by the call at 351597, so [rsp] returns to 35159C. Seven pushes
     // plus the return address keep rsp 16-byte aligned for the inner call.
     const std::uint8_t attackRate[]{
@@ -1846,6 +2540,40 @@ auto BuildRelayPage() -> bool {
     std::memcpy(page + AttackRateStub, attackRate, sizeof(attackRate));
     const auto attackRateTarget = reinterpret_cast<std::uint64_t>(&HookedAttackRate);
     std::memcpy(page + AttackRateStub + 0x38, &attackRateTarget, sizeof(attackRateTarget));
+    // Entered by the call at 44CF98, so [rsp] returns to the nop at 44CF9D.
+    // Same frame shape as above. The site held no call, so every volatile
+    // register is kept, and the stub ends by replaying the two instructions
+    // the call replaced: eax and the flags leave exactly as the game made them.
+    const std::uint8_t hitBonus[]{
+        0x50,                                // push rax
+        0x51,                                // push rcx
+        0x52,                                // push rdx
+        0x41, 0x50,                          // push r8
+        0x41, 0x51,                          // push r9
+        0x41, 0x52,                          // push r10
+        0x41, 0x53,                          // push r11
+        0x48, 0x83, 0xEC, 0x20,              // sub  rsp, 20h
+        0x4C, 0x89, 0xF9,                    // mov  rcx, r15        ; game
+        0x4C, 0x89, 0xF2,                    // mov  rdx, r14        ; attacker
+        0x49, 0x89, 0xF0,                    // mov  r8, rsi         ; defender
+        0x49, 0x89, 0xF9,                    // mov  r9, rdi         ; damage
+        0xFF, 0x15, 0x17, 0x00, 0x00, 0x00,  // call [rip+17h]       ; slot at +38h
+        0x48, 0x83, 0xC4, 0x20,              // add  rsp, 20h
+        0x41, 0x5B,                          // pop  r11
+        0x41, 0x5A,                          // pop  r10
+        0x41, 0x59,                          // pop  r9
+        0x41, 0x58,                          // pop  r8
+        0x5A,                                // pop  rdx
+        0x59,                                // pop  rcx
+        0x58,                                // pop  rax
+        0x0F, 0xB7, 0x47, 0x04,              // movzx eax, word [rdi+4]   ; replayed
+        0xA8, 0x20,                          // test al, 20h              ; replayed
+        0xC3,                                // ret
+    };
+    static_assert(sizeof(hitBonus) == 0x37);
+    std::memcpy(page + HitBonusStub, hitBonus, sizeof(hitBonus));
+    const auto hitBonusTarget = reinterpret_cast<std::uint64_t>(&HookedHitBonus);
+    std::memcpy(page + HitBonusStub + 0x38, &hitBonusTarget, sizeof(hitBonusTarget));
     DWORD previous = 0;
     const bool sealed = VirtualProtect(page, RelayPageBytes, PAGE_EXECUTE_READ, &previous) != FALSE;
     FlushInstructionCache(GetCurrentProcess(), page, RelayPageBytes);
@@ -1868,23 +2596,100 @@ void RestoreCall(std::uint64_t callRva, const std::uint8_t* original, std::size_
     if (Context->PatchBytes(callRva, current, CallSize, original, CallSize)) patched = false;
 }
 
-auto PatchEventSlot() -> bool {
-    const std::uint64_t native = Base + EventFunc20Rva;
-    const std::uint64_t hooked = reinterpret_cast<std::uint64_t>(&HookedEventFunc20);
-    return Context->PatchBytes(EventFuncSlot20Rva, &native, sizeof(native), &hooked, sizeof(hooked));
+// 44CF98: movzx eax,word [rdi+4] / test al,20h -> call HitBonusStub / nop.
+void EncodeHitBonusSite(std::uint8_t (&out)[HitBonusPatchSize]) noexcept {
+    EncodeCall(Base + HitBonusSiteRva, reinterpret_cast<std::uintptr_t>(RelayPage) + HitBonusStub, out);
+    out[CallSize] = 0x90;
 }
 
+auto PatchHitBonusSite() -> bool {
+    if (!CanEncodeRel32(Base + HitBonusSiteRva, reinterpret_cast<std::uintptr_t>(RelayPage) + HitBonusStub)) return false;
+    std::uint8_t patch[HitBonusPatchSize]{};
+    EncodeHitBonusSite(patch);
+    return Context->PatchBytes(HitBonusSiteRva, HitBonusWindow + HitBonusSiteOffset, HitBonusPatchSize,
+        patch, HitBonusPatchSize);
+}
+
+void RestoreHitBonusSite() {
+    if (!HitBonusPatched) return;
+    std::uint8_t current[HitBonusPatchSize]{};
+    EncodeHitBonusSite(current);
+    if (Context->PatchBytes(HitBonusSiteRva, current, HitBonusPatchSize, HitBonusWindow + HitBonusSiteOffset,
+            HitBonusPatchSize)) {
+        HitBonusPatched = false;
+    }
+}
+
+std::uint64_t* CoreEventSlot20{};  // D2RCore's handler table entry 20 while it holds the hook
+
+auto IsReadable(const void* address, std::size_t size) -> bool {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT
+            || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) return false;
+    return reinterpret_cast<std::uintptr_t>(address) + size
+        <= reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+}
+
+auto WriteCoreSlot(std::uint64_t* slot, std::uint64_t value) -> bool {
+    DWORD previous = 0;
+    if (!VirtualProtect(slot, sizeof(*slot), PAGE_READWRITE, &previous)) return false;
+    InterlockedExchange64(reinterpret_cast<volatile LONG64*>(slot), static_cast<LONG64>(value));
+    DWORD ignored = 0;
+    VirtualProtect(slot, sizeof(*slot), previous, &ignored);
+    return *slot == value;
+}
+
+// Finds D2RCore's handler for event function 20 through RegisterWideSkillEffect,
+// checks the export and the handler byte for byte, and binds the handler as the
+// function the hook calls through.
+auto LocateCoreEventFunc20() -> bool {
+    const HMODULE core = GetModuleHandleW(CoreModuleName);
+    if (core == nullptr) {
+        Context->LogError("CrossbowCharges: D2RCore.dll is not loaded.");
+        return false;
+    }
+    const auto* stub = reinterpret_cast<const std::uint8_t*>(GetProcAddress(core, CoreRegisterExport));
+    if (stub == nullptr || !IsReadable(stub, sizeof(CoreRegisterStub))
+            || std::memcmp(stub, CoreRegisterStub, sizeof(CoreRegisterStub)) != 0) {
+        Context->LogError("CrossbowCharges: D2RCore's RegisterWideSkillEffect is not the verified D2RLoader 1.3.1 code.");
+        return false;
+    }
+    std::int32_t disp = 0;
+    std::memcpy(&disp, stub + CoreRegisterTableLeaOffset + 3, sizeof(disp));
+    auto* table = reinterpret_cast<std::uint64_t*>(const_cast<std::uint8_t*>(stub + CoreRegisterTableLeaOffset + 7 + disp));
+    if (!IsReadable(table, (CoreEventFunc20Index + 1) * sizeof(std::uint64_t))) {
+        Context->LogError("CrossbowCharges: D2RCore's event handler table is not readable.");
+        return false;
+    }
+    const auto* handler = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(table[CoreEventFunc20Index]));
+    if (handler == nullptr || !IsReadable(handler, sizeof(CoreEventFunc20Body))
+            || std::memcmp(handler, CoreEventFunc20Body, sizeof(CoreEventFunc20Body)) != 0) {
+        Context->LogError("CrossbowCharges: D2RCore's event function 20 handler is not the verified D2RLoader 1.3.1 code.");
+        return false;
+    }
+    NativeEventFunc20 = reinterpret_cast<EventFunc20Fn>(const_cast<std::uint8_t*>(handler));
+    CoreEventSlot20   = &table[CoreEventFunc20Index];
+    return true;
+}
+
+auto PatchEventSlot() -> bool {
+    if (CoreEventSlot20 == nullptr || NativeEventFunc20 == nullptr) return false;
+    return WriteCoreSlot(CoreEventSlot20, reinterpret_cast<std::uint64_t>(&HookedEventFunc20));
+}
+
+// Events registered while the hook was in keep calling it; the DLL is expected
+// to stay resident, as with every other hook here.
 void RestoreEventSlot() {
-    if (!EventSlotPatched) return;
-    const std::uint64_t native = Base + EventFunc20Rva;
-    const std::uint64_t hooked = reinterpret_cast<std::uint64_t>(&HookedEventFunc20);
-    if (Context->PatchBytes(EventFuncSlot20Rva, &hooked, sizeof(hooked), &native, sizeof(native))) EventSlotPatched = false;
+    if (!EventSlotPatched || CoreEventSlot20 == nullptr) return;
+    if (WriteCoreSlot(CoreEventSlot20, reinterpret_cast<std::uint64_t>(NativeEventFunc20))) EventSlotPatched = false;
 }
 
 void RemovePatches() {
     RestoreCall(AttackRateSiteRva, AttackRateSite, AttackRateStub, AttackRatePatched);
+    RestoreHitBonusSite();
     RestoreEventSlot();
-    RestoreCall(DamageCalcCallRva, DamageCalcWindow + DamageCalcCallOffset, DamageCalcStub, DamageCalcPatched);
+    RestoreCall(MissileCastIdCallRva, MissileCastIdWindow + MissileCastIdCallOffset, MissileCastIdStub,
+        MissileCastIdPatched);
     RestoreCall(ProcCastIdCallRva, ProcCastIdWindow + ProcCastIdCallOffset, ProcCastIdStub, ProcCastIdPatched);
     RestoreCall(DoHandlerCallRva, DoHandlerWindow + DoHandlerCallOffset, DoHandlerStub, DoHandlerPatched);
     // The relay page is kept: a thread may be inside it right now.
@@ -1903,12 +2708,7 @@ auto VerifyAll() -> bool {
             ok = false;
         }
     }
-    const std::uint64_t slot = Base + EventFunc20Rva;
-    if (!Context->CheckExpectedBytes(EventFuncSlot20Rva, &slot, sizeof(slot))) {
-        D2RL::LogErrorF(Context, "CrossbowCharges: item event slot 20 at RVA 0x%llX does not point at 0x%llX.",
-            static_cast<unsigned long long>(EventFuncSlot20Rva), static_cast<unsigned long long>(EventFunc20Rva));
-        ok = false;
-    }
+    if (!LocateCoreEventFunc20()) ok = false;
     return ok;
 }
 
@@ -1929,15 +2729,14 @@ void BindNatives() {
     ServerLocalDelay  = At<ServerLocalFn>(ServerLocalDelayRva);
     ClientGlobalDelay = At<ClientGlobalFn>(ClientGlobalDelayRva);
     ClientLocalDelay  = At<ClientLocalFn>(ClientLocalDelayRva);
-    CalculateDamage   = At<CalculateFn>(CalculateDamageRva);
-    NativeEventFunc20 = At<EventFunc20Fn>(EventFunc20Rva);
+    MissileOwner      = At<MissileOwnerFn>(MissileOwnerRva);
+    SetUnitCastId     = At<SetCastIdFn>(SetCastIdRva);
     GenerateCastId    = At<GenerateCastIdFn>(GenerateCastIdRva);
     SkillsRecord      = At<SkillsRecordFn>(SkillsRecordRva);
     Evaluate          = At<EvaluateFn>(EvaluateFormulaRva);
     DataContext       = At<DataContextFn>(DataContextRva);
     UnitType          = At<UnitTypeFn>(UnitTypeRva);
     UnitId            = At<UnitIdFn>(UnitIdRva);
-    IsServerUnit      = At<IsServerUnitFn>(IsServerUnitRva);
     Inventory         = At<InventoryFn>(InventoryRva);
     LeftHandWeapon    = At<WeaponFn>(LeftHandWeaponRva);
     CheckItemType     = At<CheckItemTypeFn>(CheckItemTypeRva);
@@ -1959,7 +2758,10 @@ auto InstallHooks() -> bool {
         && Context->InstallInlineHook(ClientApplyRva, ClientApplyBytes, sizeof(ClientApplyBytes), &HookedClientApply, &OriginalClientApply)
         && Context->InstallInlineHook(ServerApplyRva, ServerApplyBytes, sizeof(ServerApplyBytes), &HookedServerApply, &OriginalServerApply)
         && Context->InstallInlineHook(PlayerRegenRva, PlayerRegenBytes, sizeof(PlayerRegenBytes), &HookedPlayerRegen, &OriginalPlayerRegen)
-        && Context->InstallInlineHook(SetUsedSkillRva, SetUsedSkillBytes, sizeof(SetUsedSkillBytes), &HookedSetUsedSkill, &OriginalSetUsedSkill);
+        && Context->InstallInlineHook(SetUsedSkillRva, SetUsedSkillBytes, sizeof(SetUsedSkillBytes), &HookedSetUsedSkill, &OriginalSetUsedSkill)
+        && Context->InstallInlineHook(MissileHitRva, MissileHitBytes, sizeof(MissileHitBytes), &HookedMissileHit, &OriginalMissileHit)
+        && Context->InstallInlineHook(MissileDoRva, MissileDoBytes, sizeof(MissileDoBytes), &HookedMissileDo, &OriginalMissileDo)
+        && Context->InstallInlineHook(MissileDamageRva, MissileDamageBytes, sizeof(MissileDamageBytes), &HookedMissileDamage, &OriginalMissileDamage);
 }
 
 auto InstallPatches() -> bool {
@@ -1971,10 +2773,14 @@ auto InstallPatches() -> bool {
     if (!DoHandlerPatched) return false;
     ProcCastIdPatched = RedirectCall(ProcCastIdCallRva, ProcCastIdWindow + ProcCastIdCallOffset, ProcCastIdStub);
     if (!ProcCastIdPatched) return false;
-    DamageCalcPatched = RedirectCall(DamageCalcCallRva, DamageCalcWindow + DamageCalcCallOffset, DamageCalcStub);
-    if (!DamageCalcPatched) return false;
+    MissileCastIdPatched = RedirectCall(MissileCastIdCallRva, MissileCastIdWindow + MissileCastIdCallOffset,
+        MissileCastIdStub);
+    if (!MissileCastIdPatched) return false;
     EventSlotPatched = PatchEventSlot();
     if (!EventSlotPatched) return false;
+    // Last, so the bonus only goes live once everything that judges a hit is in.
+    HitBonusPatched = PatchHitBonusSite();
+    if (!HitBonusPatched) return false;
     // Optional part: a mismatch here only turns the fixed attack speed off.
     if (Context->CheckExpectedBytes(AttackRateWindowRva, AttackRateWindow, sizeof(AttackRateWindow))
             && Context->CheckExpectedBytes(AttackRateSiteRva, AttackRateSite, sizeof(AttackRateSite))) {
@@ -2023,17 +2829,17 @@ void __cdecl OnGameChanged(const D2RL::PluginContext*, const D2RL::Lifecycle::Ga
 }
 
 auto RegisterLifecycle() -> bool {
-    if (Context->QueryService(D2RL::ServiceId::DataTable, D2RL::DataTableServiceV1Version, &DataTables)
+    if (Context->QueryService(&DataTables)
             != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasDataTableServiceV1Field(DataTables, D2RL::DataTableServiceV1RequiredSize)) {
+            || !D2RL::HasDataTableServiceField(DataTables, D2RL::DataTableServiceRequiredSize)) {
         DataTables = nullptr;
         Context->LogError("CrossbowCharges: the data table service is unavailable.");
         return false;
     }
-    const D2RL::LifecycleServiceV1* lifecycle = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Lifecycle, D2RL::LifecycleServiceV1Version, &lifecycle)
+    const D2RL::LifecycleService* lifecycle = nullptr;
+    if (Context->QueryService(&lifecycle)
             != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasLifecycleServiceV1Field(lifecycle, D2RL::LifecycleServiceV1RequiredSize)) {
+            || !D2RL::HasLifecycleServiceField(lifecycle, D2RL::LifecycleServiceRequiredSize)) {
         Context->LogError("CrossbowCharges: the lifecycle service is unavailable.");
         return false;
     }
@@ -2065,48 +2871,106 @@ auto RegisterLifecycle() -> bool {
 // Console
 // ---------------------------------------------------------------------------
 
+auto CommandArgs(const D2RL::ConsoleCommandContext* command) -> std::string_view {
+    if (command == nullptr || command->args == nullptr || command->argsLength == 0) return {};
+    return Trim(std::string_view(command->args, command->argsLength));
+}
+
+auto Count(const std::atomic<std::uint64_t>& counter) -> unsigned long long {
+    return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed));
+}
+
+//   crossbowcharges              state, bolt pools, counters
+//   crossbowcharges debug on|off the debug log (no argument toggles it)
+//   crossbowcharges reset        zero the counters
 auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept
         -> D2RL::ConsoleCommandResult {
-    char line[256];
+    char line[320];
     const auto say = [&](const char* text) { command->plugin->WriteConsoleMessage(text); };
-    std::snprintf(line, sizeof(line), "Crossbow Charges: %s%s.", StateName(State),
-        State == PluginState::Active && !UiActive ? " (skill button visuals off)" : "");
+    const std::string_view args = CommandArgs(command);
+    if (args.substr(0, 5) == "debug") {
+        const std::string_view value = Trim(args.substr(5));
+        bool on = !DebugOn.load();
+        if (value == "on") {
+            on = true;
+        } else if (value == "off") {
+            on = false;
+        } else if (!value.empty()) {
+            say("Usage: crossbowcharges debug [on|off]");
+            return D2RL::ConsoleCommandResult::Handled;
+        }
+        DebugOn.store(on);
+        if (on) {
+            D2RL::LogInfoF(Context, "CrossbowCharges debug: on (damage base %d%%, damage stat %d). Lines: [start] skill "
+                "starts, [spend] bolts, [missile] player missiles, [hit] player hits, [proc] procs.",
+                Settings.damageBase, Settings.damageStat);
+        } else {
+            Context->LogInfo("CrossbowCharges debug: off.");
+        }
+        say(on ? "Crossbow Charges: debug log on, see d2rloader/logs/celestialrayone.crossbow-charges.log."
+               : "Crossbow Charges: debug log off.");
+        return D2RL::ConsoleCommandResult::Handled;
+    }
+    if (args == "reset") {
+        ResetCounters();
+        say("Crossbow Charges: counters reset.");
+        return D2RL::ConsoleCommandResult::Handled;
+    }
+    if (!args.empty()) {
+        say("Usage: crossbowcharges [debug [on|off] | reset]");
+        return D2RL::ConsoleCommandResult::Handled;
+    }
+
+    std::snprintf(line, sizeof(line), "Crossbow Charges %s: %s%s. Damage bonus %d%% + stat %d. Debug log %s.",
+        PluginVersion, StateName(State),
+        State == PluginState::Active && !UiActive ? " (skill button visuals off)" : "", Settings.damageBase,
+        Settings.damageStat, DebugOn.load() ? "on" : "off");
     say(line);
-    std::snprintf(line, sizeof(line), "  stats: max %d, current %d, damage %d; damage base %d; shadow '%s', %d frames.",
-        Settings.maxBoltsStat, Settings.currentBoltsStat, Settings.damageStat, Settings.damageBase,
-        Settings.sweepName.c_str(), Settings.sweepFrames);
-    say(line);
-    std::snprintf(line, sizeof(line), "  crossbow attacks: %s, %d frames + stat %d.",
-        AttackRatePatched ? "fixed speed on" : "game speed (not installed)", Settings.defaultAttackFrames,
-        Settings.attackFramesStat);
-    say(line);
-    std::snprintf(line, sizeof(line), "  mirrored blades (skill %d): %s, sequence speed set %llu times.",
-        Settings.mirroredBladesSkill,
+    std::snprintf(line, sizeof(line), "  attack speed: %s, %d frames + stat %d; mirrored blades (skill %d) %s.",
+        AttackRatePatched ? "fixed" : "game speed (not installed)", Settings.defaultAttackFrames,
+        Settings.attackFramesStat, Settings.mirroredBladesSkill,
         Settings.mirroredBladesSkill < 0 ? "off in config"
-            : (AttackRatePatched && SequencePartVerified) ? "fixed speed on" : "game speed (not installed)",
-        static_cast<unsigned long long>(SequenceRatesSet.load()));
-    say(line);
-    std::snprintf(line, sizeof(line), "  crossbow item types per bank: classic %u, lod %u, rotw %u.",
-        CrossbowTypes[1].count.load(), CrossbowTypes[2].count.load(), CrossbowTypes[3].count.load());
-    say(line);
-    std::snprintf(line, sizeof(line),
-        "  bolts spent %llu, refused %llu, repeat steps ignored %llu, reloaded %llu; casts tagged %llu, procs tagged %llu, "
-        "hits boosted %llu.",
-        static_cast<unsigned long long>(BoltsSpent.load()), static_cast<unsigned long long>(BoltsRefused.load()),
-        static_cast<unsigned long long>(RepeatStepsIgnored.load()),
-        static_cast<unsigned long long>(BoltsReloaded.load()), static_cast<unsigned long long>(CastsTagged.load()),
-        static_cast<unsigned long long>(ProcsTagged.load()), static_cast<unsigned long long>(HitsBoosted.load()));
+            : (AttackRatePatched && SequencePartVerified) ? "fixed" : "game speed (not installed)");
     say(line);
     {
         std::lock_guard lock(ServerMutex);
+        std::size_t shown = 0;
         for (const auto& [guid, pool] : Pools) {
-            const std::int32_t left = pool.reloads.empty() ? 0
+            if (!pool.initialized) continue;
+            if (++shown > 4) break;
+            const std::int32_t next = pool.reloads.empty() ? 0
                 : std::max(0, pool.reloads.front() - (pool.tickFrame - pool.headStart));
-            std::snprintf(line, sizeof(line), "  server player %u: %d of %d bolts, %zu reloading, next bolt in %d frames%s.",
-                guid, pool.current, pool.lastMax, pool.reloads.size(), left,
-                pool.initialized ? "" : " (not started)");
+            std::snprintf(line, sizeof(line), "  player %u: %d of %d bolts, %zu reloading%s", guid, pool.current,
+                pool.lastMax, pool.reloads.size(), pool.reloads.empty() ? "." : ", next in ");
+            if (!pool.reloads.empty()) {
+                const std::size_t used = std::strlen(line);
+                std::snprintf(line + used, sizeof(line) - used, "%d frames.", next);
+            }
             say(line);
         }
+        if (shown == 0) say("  no player holds a crossbow in this game yet.");
+    }
+    std::snprintf(line, sizeof(line), "  casts: %llu player skill starts, %llu crossbow (tagged at start); %llu tagged "
+        "only when their bolt was spent; procs %llu seen, %llu tagged.", Count(SkillStarts), Count(CastsTagged),
+        Count(CastsTaggedAtSpend), Count(ProcsSeen), Count(ProcsTagged));
+    say(line);
+    std::snprintf(line, sizeof(line), "  missiles: %llu by players, %llu of crossbow casts, %llu following a parent "
+        "missile or their cast.", Count(PlayerMissiles), Count(CrossbowMissiles), Count(LinkedMissiles));
+    say(line);
+    std::snprintf(line, sizeof(line), "  hits: %llu by players, %llu boosted (%llu by missiles, %llu other); no bonus: "
+        "%llu aura pulses, %llu missiles and %llu casts that are not crossbow.", Count(PlayerHits),
+        Count(MissileHitsBoosted) + Count(OtherHitsBoosted), Count(MissileHitsBoosted), Count(OtherHitsBoosted),
+        Count(HitsSkippedAura), Count(HitsSkippedMissile), Count(HitsSkippedCast));
+    say(line);
+    std::snprintf(line, sizeof(line), "  bolts: %llu spent, %llu refused, %llu repeat steps, %llu reloaded; item types "
+        "per bank %u / %u / %u.", Count(BoltsSpent), Count(BoltsRefused), Count(RepeatStepsIgnored),
+        Count(BoltsReloaded), CrossbowTypes[1].count.load(), CrossbowTypes[2].count.load(),
+        CrossbowTypes[3].count.load());
+    say(line);
+    if (Count(MissileDepthLeaks) != 0) {
+        std::snprintf(line, sizeof(line), "  warning: missile tracking out of balance %llu times (see the log).",
+            Count(MissileDepthLeaks));
+        say(line);
     }
     {
         std::lock_guard lock(ClientMutex);
@@ -2121,10 +2985,10 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
 constexpr D2RL::PluginInfo PluginInfoData{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = PluginIdText,
     .name        = "Crossbow Charges",
-    .version     = "1.2.0",
+    .version     = PluginVersion,
     .author      = "CelestialRayOne",
     .description = "Crossbow skills fire from a reloading pool of bolts with a skill-button shadow, and crossbow "
                    "hits deal a stat-driven damage bonus.",
@@ -2143,7 +3007,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     Base = Context->exeBase;
 
     if (!Context->RegisterConsoleCommand("crossbowcharges", &StatusCommand,
-            "Show Crossbow Charges install state, bolt pools and counters.")) {
+            "Crossbow Charges status and counters. \"crossbowcharges debug on|off\" writes the debug log, "
+            "\"crossbowcharges reset\" zeroes the counters.")) {
         Context->LogWarn("CrossbowCharges: the console command could not be registered.");
     }
 
@@ -2180,15 +3045,17 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         UiActive = false;
         Context->LogWarn("CrossbowCharges: the skill button hook could not be installed; the buttons show nothing extra.");
     }
+    DebugOn.store(Settings.debug);
     Active.store(true);
     State = PluginState::Active;
     D2RL::LogInfoF(Context, "CrossbowCharges: active (max bolts stat %d, current bolts stat %d, damage stat %d, "
-        "damage base %d%%, skill buttons %s, attack frames %d + stat %d %s, mirrored blades skill %d %s).",
+        "damage base %d%%, skill buttons %s, attack frames %d + stat %d %s, mirrored blades skill %d %s, debug log %s).",
         Settings.maxBoltsStat,
         Settings.currentBoltsStat, Settings.damageStat, Settings.damageBase, UiActive ? "on" : "off",
         Settings.defaultAttackFrames, Settings.attackFramesStat, AttackRatePatched ? "on" : "off",
         Settings.mirroredBladesSkill,
-        (Settings.mirroredBladesSkill >= 0 && AttackRatePatched && SequencePartVerified) ? "on" : "off");
+        (Settings.mirroredBladesSkill >= 0 && AttackRatePatched && SequencePartVerified) ? "on" : "off",
+        Settings.debug ? "on" : "off");
     return true;
 }
 

@@ -130,7 +130,7 @@
 // The server list already has a callback, so the adoption is a no-op there.
 //
 // Verified against the D2RLoader 1.3.1 D2RLoader.exe dump and D2RCore.dll.
-// Built against PluginSDK v4 (D2RL_PLUGIN_API_VERSION 4).
+// Built against PluginSDK v4 (D2RL_PLUGIN_ABI_VERSION 4).
 // ---------------------------------------------------------------------------
 
 #include <D2RLPlugin/api.h>
@@ -484,7 +484,7 @@ auto StatusCommand(D2R::Game::Client* client,
 
 constexpr D2RL::PluginInfo kPluginInfo{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.local-cooldowns",
     .name        = "True Local Cooldowns",
     .version     = "1.2.0",

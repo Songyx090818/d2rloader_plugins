@@ -4,12 +4,12 @@
 
 static constexpr D2RL::PluginInfo WidgetLocalizationPluginInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "widget-localization-sample",
 	.name        = "Widget and Localization Sample Plugin",
 	.version     = "0.1.0",
 	.author      = "D2RLoader",
-	.description = "Resolves localized text and inspects a namespaced widget.",
+	.description = "Reads input text, resolves localized text, and inspects a namespaced widget.",
 	.flags       = D2RL::PluginFlags::Client,
 };
 
@@ -39,20 +39,39 @@ static constexpr char PanelLayout[] = R"json({
 					"type": "TextBoxWidget", "name": "Help",
 					"fields": {
 						"rect": { "x": 150, "y": 150, "width": 956, "height": 130 },
-						"text": "The command finds the named button below, reads its rectangle, and resolves its label through D2R's localization table.",
+						"text": "Type below, then run widget-localization-sample again. The command reads the input text, button rectangle, and localized label.",
 						"style": "$StyleModalDialogDescription"
+					}
+				},
+				{
+					"type": "InputTextBoxWidget", "name": "SampleInput",
+					"fields": {
+						"rect": { "x": 150, "y": 275, "width": 956, "height": 50 },
+						"maxStringLength": 127,
+						"canInsertNewlines": false,
+						"backgroundColor": "$FontColorTransparent",
+						"fontType": "12ptF",
+						"fontStyle": {
+							"fontFace": "BlizzardGlobal",
+							"fontColor": "$FontColorWhite",
+							"pointSize": "$SmallFontSize"
+						},
+						"hint": {
+							"text": "Type text here",
+							"style": "$StyleModalDialogDescription"
+						}
 					}
 				},
 				{
 					"type": "ButtonWidget", "name": "LocalizedCancel",
 					"fields": {
-						"rect": { "x": 477, "y": 330 },
+						"rect": { "x": 477, "y": 380 },
 						"filename": "Panel\\Modals\\ModalButton",
 						"focusIndicatorFilename": "Controller/HoverImages/ModalButton_Hover",
 						"pressedFrame": 1,
 						"disabledFrame": 2,
 						"hoveredFrame": 3,
-						"textString": "@strCancel",
+						"textString": "@d2r:strCancel",
 						"pointSize": "$MediumFontSize",
 						"onClickMessage": "PanelManager:ClosePanel:widget-localization-sample/SamplePanel",
 						"textColor": "$FontColorWhite"
@@ -63,10 +82,10 @@ static constexpr char PanelLayout[] = R"json({
 	]
 })json";
 
-static const D2RL::LocalizationServiceV1* localization;
-static const D2RL::PanelServiceV1*        panels;
-static const D2RL::WidgetServiceV1*       widgets;
-static D2RL::Panels::RegistrationHandle   panel = D2RL::Panels::InvalidHandle;
+static const D2RL::LocalizationService* localization;
+static const D2RL::PanelService*        panels;
+static const D2RL::WidgetService*       widgets;
+static D2RL::Panels::RegistrationHandle panel = D2RL::Panels::InvalidHandle;
 
 static auto WidgetLocalizationCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept -> D2RL::ConsoleCommandResult {
 	if (command == nullptr || command->plugin == nullptr) {
@@ -78,7 +97,7 @@ static auto WidgetLocalizationCommand(D2R::Game::Client*, const D2RL::ConsoleCom
 	}
 
 	uint32_t required = 0;
-	if (localization->getStringByKey(command->plugin, "strCancel", nullptr, 0, &required) != D2RL::Localization::Result::BufferTooSmall) {
+	if (localization->getStringByKey(command->plugin, "d2r:strCancel", nullptr, 0, &required) != D2RL::Localization::Result::BufferTooSmall) {
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 	std::array<char, 128> text {};
@@ -86,18 +105,23 @@ static auto WidgetLocalizationCommand(D2R::Game::Client*, const D2RL::ConsoleCom
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 
-	if (localization->getStringByKey(command->plugin, "strCancel", text.data(), static_cast<uint32_t>(text.size()), &required) != D2RL::Localization::Result::Success) {
+	if (localization->getStringByKey(command->plugin, "d2r:strCancel", text.data(), static_cast<uint32_t>(text.size()), &required) != D2RL::Localization::Result::Success) {
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 
 	D2RL::Widgets::WidgetHandle panelWidget  = D2RL::Widgets::InvalidHandle;
 	D2RL::Widgets::WidgetHandle cancelWidget = D2RL::Widgets::InvalidHandle;
+	D2RL::Widgets::WidgetHandle inputWidget  = D2RL::Widgets::InvalidHandle;
 	D2RL::Widgets::Rect         rect {};
 	if (widgets->findPanel(command->plugin, "widget-localization-sample/SamplePanel", &panelWidget) != D2RL::Widgets::Result::Success) {
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 
 	if (widgets->findWidget(command->plugin, panelWidget, "LocalizedCancel", &cancelWidget) != D2RL::Widgets::Result::Success) {
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+
+	if (widgets->findWidget(command->plugin, panelWidget, "SampleInput", &inputWidget) != D2RL::Widgets::Result::Success) {
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 
@@ -113,8 +137,21 @@ static auto WidgetLocalizationCommand(D2R::Game::Client*, const D2RL::ConsoleCom
 		return D2RL::ConsoleCommandResult::Failed;
 	}
 
-	char message[224] {};
-	std::snprintf(message, sizeof(message), "Localized strCancel=\"%s\"; LocalizedCancel rect is %d,%d %dx%d.", text.data(), rect.x, rect.y, rect.width, rect.height);
+	uint32_t inputRequired = 0;
+	if (widgets->getInputText(command->plugin, inputWidget, nullptr, 0, &inputRequired) != D2RL::Widgets::Result::BufferTooSmall) {
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+	std::array<char, 128> inputText {};
+	if (inputRequired == 0 || inputRequired > inputText.size()) {
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+
+	if (widgets->getInputText(command->plugin, inputWidget, inputText.data(), static_cast<uint32_t>(inputText.size()), &inputRequired) != D2RL::Widgets::Result::Success) {
+		return D2RL::ConsoleCommandResult::Failed;
+	}
+
+	char message[384] {};
+	std::snprintf(message, sizeof(message), "Input=\"%s\"; localized strCancel=\"%s\"; LocalizedCancel rect is %d,%d %dx%d.", inputText.data(), text.data(), rect.x, rect.y, rect.width, rect.height);
 	command->plugin->WriteConsoleMessage(message);
 	command->plugin->LogInfo(message);
 	return D2RL::ConsoleCommandResult::Handled;
@@ -125,40 +162,40 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept -> const D2RL::PluginI
 }
 
 D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) noexcept -> bool {
-	const D2RL::ResourceServiceV1* resources = nullptr;
+	const D2RL::ResourceService* resources = nullptr;
 	if (context == nullptr) {
 		return false;
 	}
 
-	if (context->QueryService(D2RL::ServiceId::Resource, D2RL::ResourceServiceV1Version, &resources) != D2RL::ServiceQueryResult::Success) {
+	if (context->QueryService(&resources) != D2RL::ServiceQueryResult::Success) {
 		return false;
 	}
 
-	if (!D2RL::HasResourceServiceV1Field(resources, D2RL::ResourceServiceV1RequiredSize)) {
+	if (!D2RL::HasResourceServiceField(resources, D2RL::ResourceServiceRequiredSize)) {
 		return false;
 	}
 
-	if (context->QueryService(D2RL::ServiceId::Panel, D2RL::PanelServiceV1Version, &panels) != D2RL::ServiceQueryResult::Success) {
+	if (context->QueryService(&panels) != D2RL::ServiceQueryResult::Success) {
 		return false;
 	}
 
-	if (!D2RL::HasPanelServiceV1Field(panels, D2RL::PanelServiceV1RequiredSize)) {
+	if (!D2RL::HasPanelServiceField(panels, D2RL::PanelServiceRequiredSize)) {
 		return false;
 	}
 
-	if (context->QueryService(D2RL::ServiceId::Widget, D2RL::WidgetServiceV1Version, &widgets) != D2RL::ServiceQueryResult::Success) {
+	if (context->QueryService(&widgets) != D2RL::ServiceQueryResult::Success) {
 		return false;
 	}
 
-	if (!D2RL::HasWidgetServiceV1Field(widgets, D2RL::WidgetServiceV1RequiredSize)) {
+	if (!D2RL::HasWidgetServiceField(widgets, D2RL::WidgetServiceRequiredSize)) {
 		return false;
 	}
 
-	if (context->QueryService(D2RL::ServiceId::Localization, D2RL::LocalizationServiceV1Version, &localization) != D2RL::ServiceQueryResult::Success) {
+	if (context->QueryService(&localization) != D2RL::ServiceQueryResult::Success) {
 		return false;
 	}
 
-	if (!D2RL::HasLocalizationServiceV1Field(localization, D2RL::LocalizationServiceV1RequiredSize)) {
+	if (!D2RL::HasLocalizationServiceField(localization, D2RL::LocalizationServiceRequiredSize)) {
 		return false;
 	}
 
@@ -180,7 +217,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 	if (panels->registerPanel(context, &registration, &panel) != D2RL::Panels::Result::Success) {
 		return false;
 	}
-	return context->RegisterConsoleCommand("widget-localization-sample", WidgetLocalizationCommand, "Open a panel and report localized text and widget geometry.");
+	return context->RegisterConsoleCommand("widget-localization-sample", WidgetLocalizationCommand, "Open a panel and report its input text, localized text, and widget geometry.");
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {}

@@ -219,6 +219,28 @@ constexpr std::uint64_t ClientMissileCreateRva = 0x1B7760;
 constexpr auto ClientRewindHookExpected = std::to_array<std::uint8_t>({
     0xE8,0x33,0x38,0xFA,0xFF});
 
+// D2RLoader 1.3.1 accepts a jmp-rel32 patch only when its target is inside
+// D2R.exe, and the relay page is not. Each hook site therefore jumps to a
+// 5-byte "jmp relay" trampoline in int3 padding between two game functions,
+// and the trampoline jumps on to the relay block. A jmp changes no register,
+// flag or stack slot, so every relay sees exactly what its hook site saw. Each
+// window is the ret that ends the function before the padding plus the whole
+// int3 run, so the padding is proved unused before a byte is written.
+//   server         43ACA1  int3 run 43ACA1..43ACAF, after the ret at 43ACA0
+//   client target  231363  int3 run 231363..23136F, after the ret at 231362
+//   client rewind  21401B  int3 run 21401B..21401F, after the ret at 21401A
+// All three sit above LowestHookRva, so the relay page is in reach of them.
+constexpr std::uint64_t ServerTrampolineRva = 0x43ACA1;
+constexpr std::uint64_t ClientTargetTrampolineRva = 0x231363;
+constexpr std::uint64_t ClientRewindTrampolineRva = 0x21401B;
+constexpr auto ServerPaddingWindow = std::to_array<std::uint8_t>({
+    0xC3,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC});
+constexpr auto ClientTargetPaddingWindow = std::to_array<std::uint8_t>({
+    0xC3,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC,0xCC});
+constexpr auto ClientRewindPaddingWindow = std::to_array<std::uint8_t>({
+    0xC3,0xCC,0xCC,0xCC,0xCC,0xCC});
+constexpr auto TrampolineSlotExpected = std::to_array<std::uint8_t>({0xCC,0xCC,0xCC,0xCC,0xCC});
+
 // Path accessors proving the layout above.
 constexpr auto PathGetXBytes = std::to_array<std::uint8_t>({0x0F,0xB7,0x41,0x02,0xC3});
 constexpr auto PathGetYBytes = std::to_array<std::uint8_t>({0x0F,0xB7,0x41,0x06,0xC3});
@@ -228,7 +250,7 @@ constexpr auto PathSetTargetPointBytes = std::to_array<std::uint8_t>({
     0x48,0x85,0xC9,0x74,0x11,0x66,0x89,0x51,0x10,0x66,0x44,0x89,0x41,0x12,0x48,0xC7,
     0x41,0x70,0x00,0x00,0x00,0x00,0xC3});
 
-constexpr std::array<Witness, 16> Witnesses{{
+constexpr std::array<Witness, 19> Witnesses{{
     {DoHandlerRva, DoHandlerPrologue.data(), static_cast<std::uint32_t>(DoHandlerPrologue.size()), "skill do-handler prologue"},
     {DoHandlerConsumeTestRva, DoHandlerConsumeTest.data(), static_cast<std::uint32_t>(DoHandlerConsumeTest.size()), "skill do-handler consume-resources test"},
     {DoHandlerCallRva, DoHandlerCall.data(), static_cast<std::uint32_t>(DoHandlerCall.size()), "skill do-handler srvdofunc call"},
@@ -245,6 +267,9 @@ constexpr std::array<Witness, 16> Witnesses{{
     {0x342A50, PathSetTargetPointBytes.data(), static_cast<std::uint32_t>(PathSetTargetPointBytes.size()), "PATH_SetTargetPoint"},
     {ServerHookRva, ServerHookExpected.data(), static_cast<std::uint32_t>(ServerHookExpected.size()), "server hook site"},
     {ClientRewindHookRva, ClientRewindHookExpected.data(), static_cast<std::uint32_t>(ClientRewindHookExpected.size()), "client rewind hook site"},
+    {ServerTrampolineRva - 1, ServerPaddingWindow.data(), static_cast<std::uint32_t>(ServerPaddingWindow.size()), "server trampoline padding"},
+    {ClientTargetTrampolineRva - 1, ClientTargetPaddingWindow.data(), static_cast<std::uint32_t>(ClientTargetPaddingWindow.size()), "client target trampoline padding"},
+    {ClientRewindTrampolineRva - 1, ClientRewindPaddingWindow.data(), static_cast<std::uint32_t>(ClientRewindPaddingWindow.size()), "client rewind trampoline padding"},
 }};
 
 // ---------------------------------------------------------------------------
@@ -280,6 +305,8 @@ constexpr std::size_t ServerBlock = 0;
 constexpr std::size_t ClientTargetBlock = 1;
 constexpr std::size_t ClientRewindBlock = 2;
 constexpr std::uint64_t LowestHookRva = 0x213F28;
+static_assert(ServerTrampolineRva > LowestHookRva && ClientTargetTrampolineRva > LowestHookRva && ClientRewindTrampolineRva > LowestHookRva,
+    "Every trampoline must lie above LowestHookRva so the relay page allocated from it is in reach.");
 
 // ---------------------------------------------------------------------------
 // State
@@ -559,6 +586,24 @@ bool BuildRelays(bool server, bool clientTarget, bool clientRewind) noexcept {
     return true;
 }
 
+// Writes "jmp relay block" into the padding at trampolineRva. The loader checks
+// that the five bytes are still int3 before it writes them.
+bool WriteTrampoline(std::uint64_t trampolineRva, std::size_t block) noexcept {
+    const std::int64_t next = static_cast<std::int64_t>(g_base + trampolineRva + 5);
+    const std::int64_t target = static_cast<std::int64_t>(g_base + RelayRva(block));
+    const std::int64_t displacement = target - next;
+    if (displacement < INT32_MIN || displacement > INT32_MAX) {
+        Log(2, "cast-on-cast: relay block %zu is out of reach of the trampoline at RVA 0x%llX.", block,
+            static_cast<unsigned long long>(trampolineRva));
+        return false;
+    }
+    std::array<std::uint8_t, 5> jump{0xE9, 0, 0, 0, 0};
+    const auto rel32 = static_cast<std::int32_t>(displacement);
+    std::memcpy(jump.data() + 1, &rel32, sizeof(rel32));
+    return g_ctx->PatchBytes(trampolineRva, TrampolineSlotExpected.data(), static_cast<std::uint32_t>(TrampolineSlotExpected.size()),
+        jump.data(), static_cast<std::uint32_t>(jump.size()));
+}
+
 // ---------------------------------------------------------------------------
 // Install
 // ---------------------------------------------------------------------------
@@ -588,27 +633,41 @@ void InstallParts() noexcept {
             ItemEffectAimBytes.data(), static_cast<std::uint32_t>(ItemEffectAimBytes.size())), "server_proc_aim");
     }
     if (g_config.clientProcAim) {
-        const bool installed = relaysReady
-            && g_ctx->PatchBytes(ClientProcBlockRva,
+        bool installed = relaysReady && WriteTrampoline(ClientTargetTrampolineRva, ClientTargetBlock);
+        bool blockPatched = false;
+        if (installed) {
+            blockPatched = g_ctx->PatchBytes(ClientProcBlockRva,
                 ClientProcBlockExpected.data(), static_cast<std::uint32_t>(ClientProcBlockExpected.size()),
-                ClientProcBlockBytes.data(), static_cast<std::uint32_t>(ClientProcBlockBytes.size()))
-            && g_ctx->PatchJmpRel32(ClientTargetHookRva,
-                ClientTargetHookExpected.data(), static_cast<std::uint32_t>(ClientTargetHookExpected.size()),
-                RelayRva(ClientTargetBlock), static_cast<std::uint32_t>(ClientTargetHookExpected.size()));
+                ClientProcBlockBytes.data(), static_cast<std::uint32_t>(ClientProcBlockBytes.size()));
+            installed = blockPatched
+                && g_ctx->PatchJmpRel32(ClientTargetHookRva,
+                    ClientTargetHookExpected.data(), static_cast<std::uint32_t>(ClientTargetHookExpected.size()),
+                    ClientTargetTrampolineRva, static_cast<std::uint32_t>(ClientTargetHookExpected.size()));
+        }
+        // The je -> jmp on its own would drop the offset block without the
+        // target restore that replaces it, so it never stays in alone.
+        if (!installed && blockPatched
+            && !g_ctx->PatchBytes(ClientProcBlockRva,
+                ClientProcBlockBytes.data(), static_cast<std::uint32_t>(ClientProcBlockBytes.size()),
+                ClientProcBlockExpected.data(), static_cast<std::uint32_t>(ClientProcBlockExpected.size()))) {
+            Log(2, "cast-on-cast: the client item-proc block at RVA 0x216DBB could not be put back.");
+        }
         g_clientProcAim = Result(installed, "client_proc_aim");
     }
     if (g_config.clientMissileRewind) {
         const bool installed = relaysReady
+            && WriteTrampoline(ClientRewindTrampolineRva, ClientRewindBlock)
             && g_ctx->PatchJmpRel32(ClientRewindHookRva,
                 ClientRewindHookExpected.data(), static_cast<std::uint32_t>(ClientRewindHookExpected.size()),
-                RelayRva(ClientRewindBlock), static_cast<std::uint32_t>(ClientRewindHookExpected.size()));
+                ClientRewindTrampolineRva, static_cast<std::uint32_t>(ClientRewindHookExpected.size()));
         g_clientMissileRewind = Result(installed, "client_missile_rewind");
     }
     if (g_config.castTrigger) {
         const bool installed = relaysReady
+            && WriteTrampoline(ServerTrampolineRva, ServerBlock)
             && g_ctx->PatchJmpRel32(ServerHookRva,
                 ServerHookExpected.data(), static_cast<std::uint32_t>(ServerHookExpected.size()),
-                RelayRva(ServerBlock), static_cast<std::uint32_t>(ServerHookExpected.size()));
+                ServerTrampolineRva, static_cast<std::uint32_t>(ServerHookExpected.size()));
         g_castTrigger = Result(installed, "cast_trigger");
     }
 
@@ -668,10 +727,10 @@ D2RL::ConsoleCommandResult StatusCommand(D2R::Game::Client*, const D2RL::Console
 
 constexpr D2RL::PluginInfo PluginInfoData{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.cast-on-cast",
     .name = "Cast on Cast",
-    .version = "1.0.0",
+    .version = "1.0.1",
     .author = "CelestialRayOne",
     .description = "Fires doactive when a skill is cast, so items can cast skills on cast. Port of the ESR 2.4 patch set.",
     .flags = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,

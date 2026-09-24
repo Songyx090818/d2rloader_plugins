@@ -20,6 +20,7 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(AddPlugin)
 
 # --- SDK, vendored once, shared by every plugin ----------------------------
+set(BUILD_TESTING OFF)  # PluginSDK 0.3.0 builds its own tests by default
 add_subdirectory(third_party/PluginSDK)
 
 # --- Code shared between plugins -------------------------------------------
@@ -27,7 +28,6 @@ add_subdirectory(common)
 
 # --- Plugins. One line each. -----------------------------------------------
 d2rl_add_plugin(engine-stability)
-d2rl_add_plugin(extended-states)
 d2rl_add_plugin(miasma-chains-cap)
 d2rl_add_plugin(cooldown-fix)
 d2rl_add_plugin(playermode-exposing)

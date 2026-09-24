@@ -69,11 +69,35 @@
 // unit's hit-reaction handling and gates no event. The 2.4 patch wrote 0x0001,
 // so this port writes the same.
 //
-// No hooks, no caves, no allocations: same-length byte swaps only. Each one is
+// Sites 1, 2, 3 and 5 are same-length byte swaps in the game image. Each one is
 // checked against a witness window first, read back after writing, and put
 // back on unload.
+//
+// Site 4 lives in D2RCore.dll since D2RLoader 1.3 (checked on 1.3.1). D2RCore
+// registers its own handler for event function 6, and that handler never calls
+// the game's sub_140582B20, so a change at 582BC6 would never run. D2RCore's
+// handler (entry 6 of the table RegisterWideSkillEffect hands its registrar)
+// reads the stat and calls D2RCore's reflect helper, which writes the packet's
+// result flags itself:
+//     helper+67h  66 C7 45 B4 21 40   mov word [rbp-4Ch], 4021h
+// Event functions 10 and 11 (element 2 and 1) and one more D2RCore reflect path
+// use the same helper, so the store becomes a jump to a small stub that writes
+// 0001h only when the helper was called by the event 6 handler, and 4021h in
+// every other case, exactly as before. The helper's return address sits at
+// [rbp+168h] (six pushes, sub rsp,1B8h, lea rbp,[rsp+80h]). Everything is
+// found through the RegisterWideSkillEffect export and checked byte for byte:
+// the export stub, the event 6 handler up to its helper call, and the helper
+// through the store. The six bytes are put back on unload.
 
 #include <D2RLPlugin/api.h>
+
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <Windows.h>
 
 #include <array>
 #include <cstddef>
@@ -182,6 +206,94 @@ constexpr std::uint8_t MovEaxOneReplacement[] { 0xB8, 0x01, 0x00, 0x00, 0x00 }; 
 // ---------------------------------------------------------------------------
 
 constexpr std::size_t MaxWindowBytes = 96;
+// ---------------------------------------------------------------------------
+// D2RCore anchors for site 4 (D2RCore.dll as shipped with D2RLoader 1.3.1)
+// ---------------------------------------------------------------------------
+
+constexpr wchar_t     CoreModuleName[]           = L"D2RCore.dll";
+constexpr char        CoreRegisterExport[]       = "RegisterWideSkillEffect";
+constexpr std::size_t CoreRegisterTableLeaOffset = 0x2C;  // lea rdi, [rip+disp32] -> handler table
+constexpr std::size_t CoreAttackerHandlerIndex   = 6;
+constexpr std::size_t CoreHandlerCallOffset      = 0x7D;  // call reflect helper
+constexpr std::size_t CoreHandlerReturnOffset    = 0x82;  // that call's return address
+constexpr std::size_t CoreHelperFlagOffset       = 0x67;  // mov word [rbp-4Ch], 4021h
+constexpr std::size_t CoreHelperResumeOffset     = 0x6D;  // cmp r14d, 3
+
+// RegisterWideSkillEffect, 84 bytes up to its registrar call.
+constexpr std::uint8_t CoreRegisterStub[] {
+    0x56, 0x57, 0x48, 0x83, 0xEC, 0x58, 0x8B, 0x84, 0x24, 0x90, 0x00, 0x00,
+    0x00, 0x44, 0x8B, 0x94, 0x24, 0x98, 0x00, 0x00, 0x00, 0x44, 0x8B, 0x9C,
+    0x24, 0xA0, 0x00, 0x00, 0x00, 0x8B, 0xB4, 0x24, 0xA8, 0x00, 0x00, 0x00,
+    0x0F, 0x28, 0x84, 0x24, 0xB0, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x3D, 0xBD,
+    0xCA, 0xDF, 0xFF, 0x48, 0x89, 0x7C, 0x24, 0x50, 0x0F, 0x11, 0x44, 0x24,
+    0x40, 0x89, 0x74, 0x24, 0x38, 0x44, 0x89, 0x5C, 0x24, 0x30, 0x44, 0x89,
+    0x54, 0x24, 0x28, 0x89, 0x44, 0x24, 0x20, 0xE8, 0xBC, 0xEB, 0xB9, 0xFF,
+};
+
+// Event function 6 handler, 130 bytes through `call helper`.
+constexpr std::uint8_t CoreAttackerHandler[] {
+    0x56, 0x57, 0x48, 0x83, 0xEC, 0x48, 0x48, 0x8B, 0x05, 0x63, 0xA8, 0x32,
+    0x00, 0x48, 0x31, 0xE0, 0x48, 0x89, 0x44, 0x24, 0x40, 0x48, 0x85, 0xC9,
+    0x74, 0x6F, 0x48, 0x89, 0x4C, 0x24, 0x38, 0x31, 0xC0, 0x4D, 0x85, 0xC0,
+    0x74, 0x65, 0x4D, 0x85, 0xC9, 0x74, 0x60, 0x41, 0xF6, 0x81, 0x24, 0x01,
+    0x00, 0x00, 0x04, 0x74, 0x56, 0x4C, 0x89, 0xCE, 0x48, 0x8B, 0x84, 0x24,
+    0x88, 0x00, 0x00, 0x00, 0x48, 0x89, 0xC1, 0x48, 0xC1, 0xE9, 0x20, 0x0F,
+    0xB7, 0xD1, 0x4C, 0x89, 0xC7, 0x4C, 0x89, 0xC1, 0x41, 0x89, 0xC0, 0xE8,
+    0x68, 0x7E, 0x00, 0x00, 0x89, 0xC1, 0x31, 0xC0, 0x85, 0xC9, 0x7E, 0x2B,
+    0xC1, 0xE1, 0x08, 0x89, 0x4C, 0x24, 0x20, 0xC7, 0x44, 0x24, 0x28, 0x00,
+    0x00, 0x00, 0x00, 0x48, 0x8D, 0x4C, 0x24, 0x38, 0x48, 0x89, 0xFA, 0x49,
+    0x89, 0xF0, 0x45, 0x31, 0xC9, 0xE8, 0x7E, 0xE4, 0xFF, 0xFF,
+};
+
+// Reflect helper, 115 bytes: prologue, packet setup, the flag store, cmp r14d,3.
+constexpr std::uint8_t CoreReflectHelper[] {
+    0x55, 0x41, 0x57, 0x41, 0x56, 0x56, 0x57, 0x53, 0x48, 0x81, 0xEC, 0xB8,
+    0x01, 0x00, 0x00, 0x48, 0x8D, 0xAC, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48,
+    0xC7, 0x85, 0x30, 0x01, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, 0x45, 0x89,
+    0xCE, 0x4C, 0x89, 0xC7, 0x48, 0x89, 0xD6, 0x48, 0x89, 0xCB, 0xC7, 0x45,
+    0xB0, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x4D, 0xB8, 0x4C, 0x8D, 0x7D,
+    0x08, 0x41, 0xB8, 0x78, 0x01, 0x00, 0x00, 0x31, 0xD2, 0xE8, 0xA6, 0xB2,
+    0x16, 0x00, 0x4C, 0x89, 0x7D, 0xF0, 0x48, 0xB8, 0x10, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x80, 0x48, 0x89, 0x45, 0x00, 0x48, 0xC7, 0x85, 0x08,
+    0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x66, 0xC7, 0x45, 0xB4, 0x21,
+    0x40, 0x41, 0x83, 0xFE, 0x03, 0x77, 0x51,
+};
+
+constexpr std::uint8_t CoreFlagStore[] { 0x66, 0xC7, 0x45, 0xB4, 0x21, 0x40 };
+
+static_assert(CoreAttackerHandler[CoreHandlerCallOffset] == 0xE8, "The helper call is not where the handler map says it is.");
+static_assert(CoreHandlerReturnOffset == CoreHandlerCallOffset + 5 && sizeof(CoreAttackerHandler) == CoreHandlerReturnOffset);
+static_assert(CoreRegisterStub[CoreRegisterTableLeaOffset] == 0x48 && CoreRegisterStub[CoreRegisterTableLeaOffset + 1] == 0x8D
+    && CoreRegisterStub[CoreRegisterTableLeaOffset + 2] == 0x3D, "The table lea is not lea rdi,[rip+disp32].");
+static_assert(CoreReflectHelper[CoreHelperFlagOffset] == 0x66 && CoreReflectHelper[CoreHelperFlagOffset + 4] == 0x21
+    && CoreReflectHelper[CoreHelperFlagOffset + 5] == 0x40, "The flag store is not where the helper map says it is.");
+static_assert(CoreHelperResumeOffset == CoreHelperFlagOffset + sizeof(CoreFlagStore));
+// The return address check relies on this exact frame: six pushes, then
+// sub rsp,1B8h (48 81 EC B8 01 00 00) and lea rbp,[rsp+80h] (48 8D AC 24 80 00 00 00).
+static_assert(CoreReflectHelper[8] == 0x48 && CoreReflectHelper[9] == 0x81 && CoreReflectHelper[10] == 0xEC
+    && CoreReflectHelper[11] == 0xB8 && CoreReflectHelper[12] == 0x01, "The helper frame changed.");
+static_assert(CoreReflectHelper[15] == 0x48 && CoreReflectHelper[16] == 0x8D && CoreReflectHelper[17] == 0xAC
+    && CoreReflectHelper[18] == 0x24 && CoreReflectHelper[19] == 0x80, "The helper frame changed.");
+
+// push rax / mov rax, <event 6 return address> / cmp [rbp+168h], rax / pop rax
+// jne stock / mov word [rbp-4Ch], 1 / jmp resume / stock: mov word [rbp-4Ch], 4021h
+// resume: jmp qword ptr [rip+0] -> helper+6Dh. No flags are live at the store:
+// the next instruction, cmp r14d,3, sets them.
+constexpr std::uint8_t CoreFlagStub[] {
+    0x50,
+    0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0,
+    0x48, 0x39, 0x85, 0x68, 0x01, 0x00, 0x00,
+    0x58,
+    0x75, 0x08,
+    0x66, 0xC7, 0x45, 0xB4, 0x01, 0x00,
+    0xEB, 0x06,
+    0x66, 0xC7, 0x45, 0xB4, 0x21, 0x40,
+    0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0, 0,
+};
+constexpr std::size_t CoreFlagStubReturnSlot = 3;
+constexpr std::size_t CoreFlagStubResumeSlot = 41;
+static_assert(sizeof(CoreFlagStub) == 49 && CoreFlagStub[CoreFlagStubResumeSlot - 6] == 0xFF);
+
 constexpr std::size_t MaxPatchBytes  = 16;
 constexpr std::size_t MaxConfigBytes = 16'384;
 
@@ -253,7 +365,7 @@ constexpr std::array<Site, 5> Sites {{
     },
     {
         .key              = "attacker_takes_damage",
-        .name             = "Attacker Takes Damage (event function 6)",
+        .name             = "Attacker Takes Damage (event function 6, in D2RCore)",
         .windowRva        = AttackerTakesDamageWindowRva,
         .window           = AttackerTakesDamageWindow,
         .windowSize       = sizeof(AttackerTakesDamageWindow),
@@ -357,6 +469,9 @@ iron_maiden = true
 # the switch writes 0x0001, a plain successful hit, the same value the 2.4
 # patch wrote. That also clears 0x4000, which only changes how the struck unit
 # reacts to the hit and does not affect events.
+# Under D2RLoader 1.3 this event runs inside D2RCore.dll, so the change is made
+# there, for event function 6 only: the lightning and fire versions (event
+# functions 10 and 11), which share D2RCore's reflect code, keep stock flags.
 attacker_takes_damage = true
 
 # The percent reflect of itemstatcost thorns_percent (stat 131), and of stat
@@ -510,6 +625,174 @@ auto PatchedWindow(const Site& site) noexcept -> std::array<std::uint8_t, MaxWin
     return bytes;
 }
 
+// ---------------------------------------------------------------------------
+// Site 4, applied in D2RCore
+// ---------------------------------------------------------------------------
+
+constexpr std::size_t AttackerTakesDamageIndex = 3;
+
+constexpr auto SameText(const char* a, const char* b) noexcept -> bool {
+    while (*a != '\0' && *a == *b) {
+        ++a;
+        ++b;
+    }
+    return *a == *b;
+}
+static_assert(SameText(Sites[AttackerTakesDamageIndex].key, "attacker_takes_damage"));
+
+constexpr std::size_t CoreStubPageBytes = 4096;
+
+std::uint8_t* CoreFlagSite = nullptr;  // helper+67h while it holds the jump
+void*         CoreStubPage = nullptr;  // never freed: a thread may be inside the stub
+std::uintptr_t CoreBase    = 0;
+
+auto IsReadable(const void* address, std::size_t size) noexcept -> bool {
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT
+            || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        return false;
+    }
+    const auto end = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+    return reinterpret_cast<std::uintptr_t>(address) + size <= end;
+}
+
+// First free granule on either side of target, within rel32 reach of it.
+auto AllocateNear(std::uintptr_t target, std::size_t size) noexcept -> void* {
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const std::uintptr_t granularity =
+        systemInfo.dwAllocationGranularity != 0 ? systemInfo.dwAllocationGranularity : 0x10000;
+    const std::uintptr_t start = target & ~(granularity - 1);
+    for (std::uintptr_t delta = granularity; delta < 0x70000000ULL; delta += granularity) {
+        if (void* up = VirtualAlloc(reinterpret_cast<void*>(start + delta), size, MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE)) {
+            return up;
+        }
+        if (delta + 0x10000 <= start) {
+            if (void* down = VirtualAlloc(reinterpret_cast<void*>(start - delta), size, MEM_COMMIT | MEM_RESERVE,
+                    PAGE_READWRITE)) {
+                return down;
+            }
+        }
+    }
+    return nullptr;
+}
+
+auto WriteCoreBytes(std::uint8_t* at, const std::uint8_t* bytes, std::size_t size) noexcept -> bool {
+    DWORD previous = 0;
+    if (!VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &previous)) {
+        return false;
+    }
+    std::memcpy(at, bytes, size);
+    DWORD ignored = 0;
+    VirtualProtect(at, size, previous, &ignored);
+    FlushInstructionCache(GetCurrentProcess(), at, size);
+    return std::memcmp(at, bytes, size) == 0;
+}
+
+auto ApplyCoreAttackerTakesDamage(const char* name) noexcept -> SiteState {
+    const HMODULE core = GetModuleHandleW(CoreModuleName);
+    if (core == nullptr) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: D2RCore.dll is not loaded. Nothing written.", name);
+        return SiteState::Refused;
+    }
+    CoreBase = reinterpret_cast<std::uintptr_t>(core);
+
+    const auto* stub = reinterpret_cast<const std::uint8_t*>(GetProcAddress(core, CoreRegisterExport));
+    if (stub == nullptr || !IsReadable(stub, sizeof(CoreRegisterStub))
+            || std::memcmp(stub, CoreRegisterStub, sizeof(CoreRegisterStub)) != 0) {
+        D2RL::LogErrorF(Context,
+            "SoftHitRemoval: %s: D2RCore's RegisterWideSkillEffect is not the verified D2RLoader 1.3.1 code. "
+            "Nothing written.", name);
+        return SiteState::Refused;
+    }
+
+    std::int32_t tableDisp = 0;
+    std::memcpy(&tableDisp, stub + CoreRegisterTableLeaOffset + 3, sizeof(tableDisp));
+    const auto* table = stub + CoreRegisterTableLeaOffset + 7 + tableDisp;
+    if (!IsReadable(table, (CoreAttackerHandlerIndex + 1) * sizeof(void*))) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: D2RCore's event handler table is not readable. Nothing written.",
+            name);
+        return SiteState::Refused;
+    }
+    const std::uint8_t* handler = nullptr;
+    std::memcpy(&handler, table + CoreAttackerHandlerIndex * sizeof(void*), sizeof(handler));
+    if (handler == nullptr || !IsReadable(handler, sizeof(CoreAttackerHandler))
+            || std::memcmp(handler, CoreAttackerHandler, sizeof(CoreAttackerHandler)) != 0) {
+        D2RL::LogErrorF(Context,
+            "SoftHitRemoval: %s: D2RCore's event function 6 handler is not the verified D2RLoader 1.3.1 code. "
+            "Nothing written.", name);
+        return SiteState::Refused;
+    }
+
+    std::int32_t callRel = 0;
+    std::memcpy(&callRel, handler + CoreHandlerCallOffset + 1, sizeof(callRel));
+    auto* helper = const_cast<std::uint8_t*>(handler + CoreHandlerReturnOffset + callRel);
+    if (!IsReadable(helper, sizeof(CoreReflectHelper))
+            || std::memcmp(helper, CoreReflectHelper, sizeof(CoreReflectHelper)) != 0) {
+        D2RL::LogErrorF(Context,
+            "SoftHitRemoval: %s: D2RCore's reflect helper is not the verified D2RLoader 1.3.1 code, or another "
+            "plugin already changed it. Nothing written.", name);
+        return SiteState::Refused;
+    }
+
+    auto* site = helper + CoreHelperFlagOffset;
+    if (CoreStubPage == nullptr) {
+        CoreStubPage = AllocateNear(reinterpret_cast<std::uintptr_t>(site), CoreStubPageBytes);
+    }
+    if (CoreStubPage == nullptr) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: no page within jump range of D2RCore. Nothing written.", name);
+        return SiteState::Refused;
+    }
+    auto* page = static_cast<std::uint8_t*>(CoreStubPage);
+    const std::int64_t delta =
+        static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(page))
+        - static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(site) + 5);
+    if (delta < INT32_MIN || delta > INT32_MAX) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: the stub page is out of jump range of D2RCore. Nothing written.",
+            name);
+        return SiteState::Refused;
+    }
+
+    DWORD previous = 0;
+    if (!VirtualProtect(page, CoreStubPageBytes, PAGE_READWRITE, &previous)) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: the stub page could not be written. Nothing written.", name);
+        return SiteState::Refused;
+    }
+    std::memset(page, 0xCC, CoreStubPageBytes);
+    std::memcpy(page, CoreFlagStub, sizeof(CoreFlagStub));
+    const auto returnAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(handler + CoreHandlerReturnOffset));
+    const auto resume        = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(helper + CoreHelperResumeOffset));
+    std::memcpy(page + CoreFlagStubReturnSlot, &returnAddress, sizeof(returnAddress));
+    std::memcpy(page + CoreFlagStubResumeSlot, &resume, sizeof(resume));
+    if (!VirtualProtect(page, CoreStubPageBytes, PAGE_EXECUTE_READ, &previous)) {
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: the stub page could not be made executable. Nothing written.",
+            name);
+        return SiteState::Refused;
+    }
+    FlushInstructionCache(GetCurrentProcess(), page, CoreStubPageBytes);
+
+    std::uint8_t jump[sizeof(CoreFlagStore)] { 0xE9, 0, 0, 0, 0, 0x90 };
+    const auto rel32 = static_cast<std::int32_t>(delta);
+    std::memcpy(jump + 1, &rel32, sizeof(rel32));
+    if (!WriteCoreBytes(site, jump, sizeof(jump))) {
+        const bool restored = WriteCoreBytes(site, CoreFlagStore, sizeof(CoreFlagStore));
+        D2RL::LogErrorF(Context, "SoftHitRemoval: %s: the D2RCore write did not read back; %s.", name,
+            restored ? "the stock bytes were put back" : "putting the stock bytes back failed too");
+        return SiteState::Refused;
+    }
+    CoreFlagSite = site;
+    D2RL::LogInfoF(Context, "SoftHitRemoval: %s: applied in D2RCore at RVA 0x%llX.", name,
+        static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(site) - CoreBase));
+    return SiteState::Applied;
+}
+
+void RestoreCoreAttackerTakesDamage() noexcept {
+    if (CoreFlagSite != nullptr && WriteCoreBytes(CoreFlagSite, CoreFlagStore, sizeof(CoreFlagStore))) {
+        CoreFlagSite = nullptr;
+    }
+}
+
 void ApplySite(std::size_t index) noexcept {
     const Site&  site    = Sites[index];
     SiteRuntime& runtime = Runtime[index];
@@ -517,6 +800,12 @@ void ApplySite(std::size_t index) noexcept {
 
     if (!MasterEnabled || !runtime.enabled) {
         runtime.state = SiteState::Disabled;
+        return;
+    }
+
+    // Event function 6 never reaches the game's handler under D2RLoader 1.3.
+    if (index == AttackerTakesDamageIndex) {
+        runtime.state = ApplyCoreAttackerTakesDamage(site.name);
         return;
     }
 
@@ -592,6 +881,13 @@ void RestoreSite(std::size_t index) noexcept {
     if (runtime.state != SiteState::Applied) {
         return;
     }
+    if (index == AttackerTakesDamageIndex) {
+        RestoreCoreAttackerTakesDamage();
+        if (CoreFlagSite == nullptr) {
+            runtime.state = SiteState::NotLoaded;
+        }
+        return;
+    }
     if (Context->PatchBytes(PatchRva(site), site.replacement, site.patchSize,
             site.window + site.patchOffset, site.patchSize)
             && std::memcmp(BytesAt(site.windowRva), site.window, site.windowSize) == 0) {
@@ -626,8 +922,15 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
     char line[256];
     for (std::size_t index = 0; index < Sites.size(); ++index) {
-        std::snprintf(line, sizeof(line), "  %-26s %s (RVA 0x%llX)", Sites[index].key,
-            StateName(Runtime[index].state), static_cast<unsigned long long>(PatchRva(Sites[index])));
+        if (index == AttackerTakesDamageIndex) {
+            const auto coreRva = CoreFlagSite != nullptr
+                ? static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(CoreFlagSite) - CoreBase) : 0ULL;
+            std::snprintf(line, sizeof(line), "  %-26s %s (D2RCore RVA 0x%llX)", Sites[index].key,
+                StateName(Runtime[index].state), coreRva);
+        } else {
+            std::snprintf(line, sizeof(line), "  %-26s %s (RVA 0x%llX)", Sites[index].key,
+                StateName(Runtime[index].state), static_cast<unsigned long long>(PatchRva(Sites[index])));
+        }
         command->plugin->WriteConsoleMessage(line);
     }
     return D2RL::ConsoleCommandResult::Handled;
@@ -635,10 +938,10 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
 constexpr D2RL::PluginInfo Info {
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.soft-hit-removal",
     .name        = "Soft Hit Removal",
-    .version     = "1.0.0",
+    .version     = "1.1.0",
     .author      = "CelestialRayOne",
     .description = "Holy Fire, Holy Shock, Holy Freeze, Iron Maiden and reflected damage no longer "
                    "deal soft hits, so their kills give kill credit and trigger on-kill effects.",

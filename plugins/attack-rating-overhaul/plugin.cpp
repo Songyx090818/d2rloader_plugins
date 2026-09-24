@@ -1526,7 +1526,7 @@ void RegisterStatusCommand() noexcept {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.attack-rating",
     .name = "Attack Rating",
     .version = "1.1.3",

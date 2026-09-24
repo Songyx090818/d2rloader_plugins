@@ -49,6 +49,7 @@ struct Site {
 	const char* stubHex;       // stub template, trace slots left as zero
 	uint32_t    traceAt[4];    // byte offsets of the four trace destinations
 	uint32_t    callAt;        // byte offset of an imm64 to fill with a plugin function pointer, 0 = none
+	const char* exitExpectedHex = nullptr;  // when set, bytes the rejoin target must contain
 };
 
 const Site kSites[] = {
@@ -427,11 +428,11 @@ const Site kSites[] = {
 	 "498BCB412BD8",
 	 "4863C34963D04829D049C7C2FFFFFF7F4863D74929D231D24D85D24C0F48D24C39D0490F4FC289C34C89D9",
 	 {0,0,0,0}},
-	{"statwatch", "stat_write_watch", "statlist stat setter, records the value, the owning unit type and the writer for stats 48-58",
-	 0x2F3030u, 0x2F3035u,
-	 "48895C2408",
-	 "48895C240850515241504151415241534883EC204989D24489C14489CA4D89D04C8B4C245848B88877665544332211FFD04883C420415B415A415941585A5958",
-	 {0,0,0,0}, 39},
+	{"statwatch", "stat_write_watch", "statlist stat setter (D2RCore SetWideListStat behind the 0x2F3030 thunk), records the value, the owning unit type and the writer for stats 48-58",
+	 0x2F3030u, 0x2F7C00u,
+	 "FF25FA71B30390909090",
+	 "50515241504151415241534883EC204989D24489C14489CA4D89D04C8B4C245848B88877665544332211FFD04883C420415B415A415941585A5958",
+	 {0,0,0,0}, 34, "FF252A26B303"},
 	{"phys_melee_weap_shift", "melee_physical", "melee physical, weapon min and max damage stats shifted into 256ths",
 	 0x44D7E4u, 0x44D7EAu,
 	 "C1E608C1E508",
@@ -903,6 +904,12 @@ bool GroupEnabled(const char* group) {
 // return address is still at [rsp]. For stat ids 48..58 we record the value,
 // the type of unit that owns the statlist, and who wrote it.
 //
+// D2RLoader 1.3.1 moved the setter into D2RCore (SetWideListStat): 0x2F3030 is
+// now jmp [0x3E2A230] and four nops. The site takes those ten bytes and the
+// stub rejoins at 0x2F7C00, the loader's other thunk through the same slot,
+// so the write still reaches D2RCore with every register as the caller left
+// it. The stub no longer replays a prologue: there is none left to replay.
+//
 // The unit type is the part that matters: the same stat id holds whole damage
 // units on a player and 256ths on a missile, so a number that looks impossible
 // on one is correct on the other.
@@ -1025,10 +1032,15 @@ const char* StateName(State s) {
 // patching
 // ---------------------------------------------------------------------------
 
+constexpr uint32_t MaxWindowBytes = 512;
+
 bool ApplySite(const D2RL::PluginContext* ctx, size_t index) {
 	const Site& site = kSites[index];
 
-	uint8_t expected[64];
+	// Sized for the longest window in the table: srcdam_missile_scale replaces
+	// 323 bytes. Up to 2.0.0 both buffers were 64 bytes, so that site was
+	// rejected as a bad table entry and never installed.
+	uint8_t expected[MaxWindowBytes];
 	const uint32_t expectedSize = HexDecode(site.expectedHex, expected, sizeof(expected));
 	if (expectedSize < 5) {
 		g_state[index] = State::Failed;
@@ -1036,10 +1048,29 @@ bool ApplySite(const D2RL::PluginContext* ctx, size_t index) {
 		return false;
 	}
 
+	// A site another plugin already redirected starts with its jmp. That is not
+	// a foreign build: critical-strike-damage, for one, owns deadly_strike_double
+	// (0x44C3C8) and already does that doubling in 64 bits, saturated.
+	if (expected[0] != 0xE9 && *reinterpret_cast<const uint8_t*>(ctx->exeBase + site.rva) == 0xE9) {
+		g_state[index] = State::Disabled;
+		D2RL::LogInfoF(ctx, "[%s] 0x%06X is already redirected by another plugin, site left to it", site.id, site.rva);
+		return false;
+	}
+
 	if (!ctx->CheckExpectedBytes(site.rva, expected, expectedSize)) {
 		g_state[index] = State::Mismatch;
 		D2RL::LogWarnF(ctx, "[%s] bytes at 0x%06X are not what 3.3 should have, site skipped", site.id, site.rva);
 		return false;
+	}
+
+	if (site.exitExpectedHex != nullptr) {
+		uint8_t exitExpected[16];
+		const uint32_t exitSize = HexDecode(site.exitExpectedHex, exitExpected, sizeof(exitExpected));
+		if (exitSize == 0 || !ctx->CheckExpectedBytes(site.exitRva, exitExpected, exitSize)) {
+			g_state[index] = State::Mismatch;
+			D2RL::LogWarnF(ctx, "[%s] the rejoin target at 0x%06X is not what 3.3 should have, site skipped", site.id, site.exitRva);
+			return false;
+		}
 	}
 
 	if (g_dryRun) {
@@ -1094,7 +1125,7 @@ bool ApplySite(const D2RL::PluginContext* ctx, size_t index) {
 		return false;
 	}
 
-	uint8_t patch[64];
+	uint8_t patch[MaxWindowBytes];
 	memset(patch, 0x90, sizeof(patch));
 	const int32_t outRel = static_cast<int32_t>(out);
 	patch[0]             = 0xE9;
@@ -1160,9 +1191,9 @@ void ReportTrace(const D2RL::PluginContext* plugin) {
 }
 
 void ReportVerify(const D2RL::PluginContext* plugin) {
-	const D2RL::DiagnosticsServiceV1* diag = nullptr;
-	const D2RL::ServiceQueryResult    q    = plugin->QueryService(D2RL::ServiceId::Diagnostics, D2RL::DiagnosticsServiceV1Version, &diag);
-	if (q != D2RL::ServiceQueryResult::Success || !D2RL::HasDiagnosticsServiceV1Field(diag, D2RL::DiagnosticsServiceV1RequiredSize)) {
+	const D2RL::DiagnosticsService* diag = nullptr;
+	const D2RL::ServiceQueryResult    q    = plugin->QueryService(&diag);
+	if (q != D2RL::ServiceQueryResult::Success || !D2RL::HasDiagnosticsServiceField(diag, D2RL::DiagnosticsServiceRequiredSize)) {
 		Say(plugin, "diagnostics service unavailable on this D2RLoader build");
 		return;
 	}
@@ -1266,10 +1297,10 @@ extern "C" {
 D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept -> const D2RL::PluginInfo* {
 	static const D2RL::PluginInfo info = {
 		.infoSize    = D2RL::PluginInfoSize,
-		.apiVersion  = D2RL_PLUGIN_API_VERSION,
+		.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 		.id          = kPluginId,
 		.name        = "Damage Overflow Fix",
-		.version     = "2.0.0",
+		.version     = "2.0.2",
 		.author      = "CelestialRayOne",
 		.description = "Runs D2R's damage percent and SrcDam scaling in 64-bit with saturation so high damage stops wrapping to zero. Records what it sees at every site for the dmgoverflow console command.",
 		.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,

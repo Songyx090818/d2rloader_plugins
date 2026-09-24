@@ -73,8 +73,15 @@
 //   438536 is the helper's only registrar call. The registrar's other callers (42FB5D,
 //   43843A, 43861C) are not redirected.
 //
-// Built against D2R 3.3 (module 140000000.D2RLoader.exe) for D2RLoader 1.3.0 and
-// PluginSDK v4.
+// D2RLoader 1.3.1 accepts a call-rel32 patch only when its target is inside
+// D2R.exe, and the relay page is not. The call at 438536 therefore goes to a
+// 5-byte "jmp relay" trampoline in the int3 run after sub_140438470's ret at
+// 43856A (43856B..43856F, the next function starts at 438570), and the
+// trampoline jumps on to the relay. A call through a jmp returns exactly where
+// the direct call did, with the same registers and stack.
+//
+// Built against D2R 3.3 (module 140000000.D2RLoader.exe) for D2RLoader 1.3.1 and
+// PluginSDK 0.3.0.
 
 #include <D2RLPlugin/api.h>
 
@@ -132,6 +139,13 @@ constexpr std::uint8_t ExpectedInstallCallWindow[] {
 	0x44, 0x24, 0x30, 0x8B, 0x84, 0x24, 0xA0, 0x00, 0x00, 0x00, 0x89, 0x44, 0x24, 0x28,
 	0x44, 0x89, 0x64, 0x24, 0x20, 0xE8, 0xF5, 0xFC, 0xFF, 0xFF,
 };
+
+// In-image trampoline for the call at 438536: the helper's ret, then its whole
+// int3 run.
+constexpr std::uint64_t InstallTrampolineRva        = 0x0043856B;
+constexpr std::uint64_t InstallTrampolinePaddingRva = 0x0043856A;
+constexpr std::uint8_t ExpectedTrampolinePadding[] { 0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC };
+constexpr std::uint8_t TrampolineSlotExpected[] { 0xCC, 0xCC, 0xCC, 0xCC, 0xCC };
 
 // The loader stub the jmp at 438510 enters, 20 bytes up to its jmp back:
 // mov [rsp+40h], ecx / mov dword [rsp+44h], 0 / mov ecx, [rsp+0A8h] / jmp.
@@ -309,8 +323,38 @@ auto ReadBool(const char* text, const char* key, bool fallback) noexcept -> bool
 	return fallback;
 }
 
+// Written by EnsureConfig when the file does not exist yet. It is the plugin's
+// documentation as shipped.
+constexpr char DefaultConfigToml[] = R"toml(# celestialrayone.hex-debuff-installer
+#
+# Hex Debuff Installer (skills.txt auraeventfunc 36, WarApplyHexDebuff)
+#
+# auraeventfunc 36 puts the skill's auratargetstate on the unit it hits. In the
+# stock game it registers the skill's Param1 as an event function on that unit
+# (damagedbymissile, damagedinmelee, hextrigger) only when the state is 217,
+# hexpurgedebuff, and it registers those events with no installer. An
+# auraeventfunc 33 (SkillActivateSubskill) registered that way looks for its
+# caster through the installer, finds nothing and never casts.
+#
+# Changes are read when the plugin loads. Restart the game after editing.
+# Built for D2RLoader 1.3.1 (Diablo II: Resurrected 3.3). On any other build
+# the byte checks fail and that part is not installed.
+
+# Register Param1 for every auratargetstate, not only hexpurgedebuff (217).
+any_target_state = true
+
+# Store the hex caster as the installer of the events auraeventfunc 36
+# registers, so an auraeventfunc 33 Param1 finds its caster and casts.
+record_installer = true
+)toml";
+
 auto LoadSettings(const D2RL::PluginContext* context) noexcept -> Settings {
 	Settings settings {};
+
+	if (!context->EnsureConfig(DefaultConfigToml)) {
+		context->LogWarn("Could not create celestialrayone.hex-debuff-installer.toml; using defaults.");
+		return settings;
+	}
 
 	std::array<char, 16'384> buffer {};
 	if (!context->ReadConfig(buffer.data(), ByteSize(buffer.size()))) {
@@ -453,7 +497,7 @@ auto RestoreInstallCall() noexcept -> bool {
 	if (!CallPatched) {
 		return true;
 	}
-	const auto current      = EncodeCall(ImageBase + InstallCallRva, reinterpret_cast<std::uintptr_t>(RelayPage));
+	const auto current      = EncodeCall(ImageBase + InstallCallRva, ImageBase + InstallTrampolineRva);
 	const auto* original    = ExpectedInstallCallWindow + (InstallCallRva - InstallCallWindowRva);
 	if (!Context->PatchBytes(InstallCallRva, current.data(), CallBytes, original, CallBytes)) {
 		return false;
@@ -466,14 +510,18 @@ auto RestoreInstallCall() noexcept -> bool {
 auto InstallRegistrarCall(const D2RL::PluginContext* context) noexcept -> bool {
 	if (!context->CheckExpectedBytes(RegisterEventRva, ExpectedRegisterThunkJump, ByteCount(ExpectedRegisterThunkJump))
 	    || !context->CheckExpectedBytes(RegisterThunkTailRva, ExpectedRegisterThunkTail, ByteCount(ExpectedRegisterThunkTail))) {
-		context->LogError("0x438230 is not the D2RLoader 1.3.0 thunk to D2RCore RegisterWideSkillEffect; "
+		context->LogError("0x438230 is not the D2RLoader 1.3.1 thunk to D2RCore RegisterWideSkillEffect; "
 		                  "record_installer not applied.");
 		return false;
 	}
 	if (!context->CheckExpectedBytes(InstallSetupRva, ExpectedInstallSetup, ByteCount(ExpectedInstallSetup))
 	    || !context->CheckExpectedBytes(InstallCallWindowRva, ExpectedInstallCallWindow, ByteCount(ExpectedInstallCallWindow))) {
 		context->LogError("The registrar call at 0x438536 or its argument setup does not match the D2RLoader "
-		                  "1.3.0 image, or another plugin already owns it; record_installer not applied.");
+		                  "1.3.1 image, or another plugin already owns it; record_installer not applied.");
+		return false;
+	}
+	if (!context->CheckExpectedBytes(InstallTrampolinePaddingRva, ExpectedTrampolinePadding, ByteCount(ExpectedTrampolinePadding))) {
+		context->LogError("The int3 padding at 0x43856B is not free; record_installer not applied.");
 		return false;
 	}
 	if (!LoaderStubMatches()) {
@@ -504,10 +552,35 @@ auto InstallRegistrarCall(const D2RL::PluginContext* context) noexcept -> bool {
 	}
 	FlushInstructionCache(GetCurrentProcess(), page, RelayPageBytes);
 
+	// "jmp relay" into the padding first; nothing reaches it until the call
+	// below is aimed at it.
+	const auto trampolineNext = static_cast<std::int64_t>(ImageBase + InstallTrampolineRva + 5);
+	const auto trampolineDelta = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(RelayPage)) - trampolineNext;
+	if (trampolineDelta < INT32_MIN || trampolineDelta > INT32_MAX) {
+		context->LogError("The relay page is out of reach of the trampoline at 0x43856B; record_installer not applied.");
+		VirtualFree(RelayPage, 0, MEM_RELEASE);
+		RelayPage = nullptr;
+		return false;
+	}
+	std::array<std::uint8_t, 5> trampoline { 0xE9, 0, 0, 0, 0 };
+	const auto trampolineRel32 = static_cast<std::int32_t>(trampolineDelta);
+	std::memcpy(trampoline.data() + 1, &trampolineRel32, sizeof(trampolineRel32));
+	if (!context->PatchBytes(InstallTrampolineRva, TrampolineSlotExpected, ByteCount(TrampolineSlotExpected),
+	                        trampoline.data(), ByteSize(trampoline.size()))) {
+		context->LogError("The trampoline at 0x43856B could not be written; record_installer not applied.");
+		VirtualFree(RelayPage, 0, MEM_RELEASE);
+		RelayPage = nullptr;
+		return false;
+	}
+
 	const auto* original = ExpectedInstallCallWindow + (InstallCallRva - InstallCallWindowRva);
-	if (!context->PatchCallRel32(InstallCallRva, original, CallBytes,
-	                             reinterpret_cast<std::uintptr_t>(RelayPage) - ImageBase, CallBytes)) {
+	if (!context->PatchCallRel32(InstallCallRva, original, CallBytes, InstallTrampolineRva, CallBytes)) {
 		context->LogError("The registrar call at 0x438536 could not be redirected; record_installer not applied.");
+		if (!context->PatchBytes(InstallTrampolineRva, trampoline.data(), ByteSize(trampoline.size()),
+		                         TrampolineSlotExpected, ByteCount(TrampolineSlotExpected))) {
+			context->LogError("The trampoline at 0x43856B could not be taken back out.");
+			return false;
+		}
 		VirtualFree(RelayPage, 0, MEM_RELEASE);
 		RelayPage = nullptr;
 		return false;
@@ -564,10 +637,10 @@ auto ApplyAnyTargetState(const D2RL::PluginContext* context) noexcept -> bool {
 
 constexpr D2RL::PluginInfo HexDebuffInstallerInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.hex-debuff-installer",
 	.name        = "Hex Debuff Installer",
-	.version     = "1.2.1",
+	.version     = "1.2.2",
 	.author      = "CelestialRayOne",
 	.description = "auraeventfunc 36 registers Param1 on the hexed unit for every auratargetstate, "
 	               "and those event nodes record the hex caster as installer, so auraeventfunc 33 "

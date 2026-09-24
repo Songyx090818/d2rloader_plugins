@@ -311,7 +311,7 @@ enum class BankState : std::uint8_t {
 };
 
 const D2RL::PluginContext*       Context{};
-const D2RL::DataTableServiceV1*  DataTables{};
+const D2RL::DataTableService*  DataTables{};
 Config                           Settings{};
 std::uint32_t                    RuleStatId = 512;
 
@@ -968,19 +968,17 @@ void __cdecl OnGameChanged(const D2RL::PluginContext*, const D2RL::Lifecycle::Ga
 }
 
 auto RegisterTablesCheck() noexcept -> bool {
-    if (Context->QueryService(D2RL::ServiceId::DataTable, D2RL::DataTableServiceV1Version,
-            &DataTables) != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasDataTableServiceV1Field(DataTables,
-                D2RL::DataTableServiceV1RequiredSize)) {
+    if (Context->QueryService(&DataTables) != D2RL::ServiceQueryResult::Success
+            || !D2RL::HasDataTableServiceField(DataTables,
+                D2RL::DataTableServiceRequiredSize)) {
         DataTables = nullptr;
         D2RL::LogError(Context, "MaxLifeOne: the data table service is unavailable.");
         return false;
     }
-    const D2RL::LifecycleServiceV1* lifecycle = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Lifecycle, D2RL::LifecycleServiceV1Version,
-            &lifecycle) != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasLifecycleServiceV1Field(lifecycle,
-                D2RL::LifecycleServiceV1RequiredSize)) {
+    const D2RL::LifecycleService* lifecycle = nullptr;
+    if (Context->QueryService(&lifecycle) != D2RL::ServiceQueryResult::Success
+            || !D2RL::HasLifecycleServiceField(lifecycle,
+                D2RL::LifecycleServiceRequiredSize)) {
         D2RL::LogError(Context, "MaxLifeOne: the lifecycle service is unavailable.");
         return false;
     }
@@ -1164,7 +1162,7 @@ void RegisterStatusCommand() noexcept {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.max-life-one",
     .name        = "Max Life One",
     .version     = "1.0.2",

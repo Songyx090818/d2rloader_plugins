@@ -385,7 +385,7 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
 constexpr D2RL::PluginInfo PluginInfoData{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.petmax-lock",
     .name        = "Pet Max Lock",
     .version     = "1.1.0",

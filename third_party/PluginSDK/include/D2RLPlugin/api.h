@@ -6,6 +6,7 @@
 #include <D2RLPlugin/custom_tables.h>
 #include <D2RLPlugin/data_tables.h>
 #include <D2RLPlugin/diagnostics.h>
+#include <D2RLPlugin/encounters.h>
 #include <D2RLPlugin/game_rules.h>
 #include <D2RLPlugin/handles.h>
 #include <D2RLPlugin/hooks.h>
@@ -18,9 +19,12 @@
 #include <D2RLPlugin/lifecycle_events.h>
 #include <D2RLPlugin/localization.h>
 #include <D2RLPlugin/logging.h>
+#include <D2RLPlugin/mutations.h>
 #include <D2RLPlugin/network.h>
+#include <D2RLPlugin/overlay.h>
 #include <D2RLPlugin/panels.h>
 #include <D2RLPlugin/patching.h>
+#include <D2RLPlugin/plugin_communication.h>
 #include <D2RLPlugin/reimplementation_exports.h>
 #include <D2RLPlugin/resource.h>
 #include <D2RLPlugin/resources.h>

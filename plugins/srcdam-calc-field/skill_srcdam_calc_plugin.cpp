@@ -507,7 +507,7 @@ void ApplyMissileUngate(const D2RL::PluginContext* context) noexcept {
 
 constexpr D2RL::PluginInfo SkillSrcDamCalcInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.skill-srcdam-calc",
 	.name        = "Skill SrcDam from Calc",
 	.version     = "1.0.0",

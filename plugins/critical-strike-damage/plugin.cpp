@@ -720,12 +720,11 @@ auto BuildCriticalRelay(std::uint8_t* out, const void* callback,
 void DescribeOwner(std::uintptr_t rva, const std::uint8_t* expected,
         std::uint32_t expectedSize, char* out, std::size_t outSize) noexcept {
     out[0] = '\0';
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics,
-            D2RL::DiagnosticsServiceV1Version, &diagnostics)
+    const D2RL::DiagnosticsService* diagnostics = nullptr;
+    if (Context->QueryService(&diagnostics)
                 != D2RL::ServiceQueryResult::Success
-            || !D2RL::HasDiagnosticsServiceV1Field(diagnostics,
-                D2RL::DiagnosticsServiceV1RequiredSize)
+            || !D2RL::HasDiagnosticsServiceField(diagnostics,
+                D2RL::DiagnosticsServiceRequiredSize)
             || diagnostics->queryHookStatus == nullptr) {
         return;
     }
@@ -974,7 +973,7 @@ auto __cdecl StatusCommand(D2R::Game::Client*,
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.critical-strike-damage",
     .name = "Critical Strike Damage",
     .version = "1.0.2",

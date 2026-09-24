@@ -873,7 +873,7 @@ void RegisterStatusCommand() noexcept {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.cube-cloneitem",
     .name = "Cube Clone Item",
     .version = "1.0.1",

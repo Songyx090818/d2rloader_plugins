@@ -216,6 +216,15 @@ constexpr std::uint64_t ShieldDamageReadRva   = 0x283B34;
 constexpr std::uint64_t ShieldDamageResumeRva = 0x283B44;
 constexpr std::uint32_t ShieldDamageReadSize  = 16;
 
+// D2RLoader 1.3.1 accepts a jmp-rel32 patch only when its target is inside
+// D2R.exe, and the relay page is not. The read at 0x283B34 therefore jumps to
+// a 5-byte "jmp relay" trampoline in the int3 run after the handler's ret at
+// 0x283DB4 (0x283DB5..0x283DBF, the next function starts at 0x283DC0), and the
+// trampoline jumps on to the relay. A jmp changes no register, flag or stack
+// slot, so the relay sees exactly what the read site saw.
+constexpr std::uint64_t ShieldTrampolineRva        = 0x283DB5;
+constexpr std::uint64_t ShieldTrampolinePaddingRva = 0x283DB4;
+
 constexpr std::size_t   GameVersionOffset   = 262;
 constexpr std::size_t   SkillRecordCalc1    = 400;
 constexpr std::size_t   SkillRecordCalcStep = 4;
@@ -292,6 +301,14 @@ constexpr auto HolyShieldMaxDamExpected = std::to_array<std::uint8_t>({
 constexpr auto ShieldDamageReadExpected = std::to_array<std::uint8_t>({
     0x44, 0x0F, 0xB6, 0xA0, 0x0F, 0x01, 0x00, 0x00,
     0x44, 0x0F, 0xB6, 0xA8, 0x10, 0x01, 0x00, 0x00,
+});
+
+// 0x283DB4: the handler's ret, then its whole int3 run.
+constexpr auto ShieldTrampolinePadding = std::to_array<std::uint8_t>({
+    0xC3, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+});
+constexpr auto TrampolineSlotExpected = std::to_array<std::uint8_t>({
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
 });
 
 // The vanilla immediate the three skill-id writes replace.
@@ -832,7 +849,9 @@ auto InstallHolyShieldDisplay() noexcept -> bool {
 }
 
 auto InstallNormalDamageDisplay() noexcept -> bool {
-    if (!Verify(ShieldDamageReadRva, ShieldDamageReadExpected,
+    if (!Verify(ShieldTrampolinePaddingRva, ShieldTrampolinePadding,
+            "the int3 padding after the Smite damage line handler")
+        || !Verify(ShieldDamageReadRva, ShieldDamageReadExpected,
                 "the shield damage read in the Smite damage line")
         || !Verify(GetUnitStatRva, GetUnitStatThunkJump, "the unit stat getter thunk")
         || !Verify(GetUnitStatThunkNopsRva, GetUnitStatThunkNops, "the unit stat getter thunk padding")
@@ -864,8 +883,26 @@ auto InstallNormalDamageDisplay() noexcept -> bool {
     }
     FlushInstructionCache(GetCurrentProcess(), relay, RelayBytes);
 
-    if (!CanEncodeRel32(imageBase + ShieldDamageReadRva, relayBase)) {
+    const auto trampolineNext = imageBase + ShieldTrampolineRva + 5;
+    if (!CanEncodeRel32(imageBase + ShieldDamageReadRva, relayBase)
+        || !CanEncodeRel32(imageBase + ShieldTrampolineRva, relayBase)) {
         Context->LogError("Smite: relay displacement validation failed.");
+        return false;
+    }
+
+    // "jmp relay" into the padding first; nothing reaches it until the read
+    // below is aimed at it.
+    std::array<std::uint8_t, 5> trampoline{0xE9, 0, 0, 0, 0};
+    const auto trampolineRel32 = static_cast<std::int32_t>(
+        static_cast<std::int64_t>(relayBase) - static_cast<std::int64_t>(trampolineNext));
+    std::memcpy(trampoline.data() + 1, &trampolineRel32, sizeof(trampolineRel32));
+    if (!Context->PatchBytes(
+            ShieldTrampolineRva,
+            TrampolineSlotExpected.data(),
+            static_cast<std::uint32_t>(TrampolineSlotExpected.size()),
+            trampoline.data(),
+            static_cast<std::uint32_t>(trampoline.size()))) {
+        Context->LogError("Smite: the trampoline at 0x283DB5 could not be written.");
         return false;
     }
 
@@ -873,7 +910,7 @@ auto InstallNormalDamageDisplay() noexcept -> bool {
             ShieldDamageReadRva,
             ShieldDamageReadExpected.data(),
             static_cast<std::uint32_t>(ShieldDamageReadExpected.size()),
-            relayBase - imageBase,
+            ShieldTrampolineRva,
             ShieldDamageReadSize)) {
         Context->LogError("Smite: the shield damage read could not be redirected.");
         return false;
@@ -917,10 +954,10 @@ auto __cdecl StatusCommand(D2R::Game::Client*,
 
 constexpr D2RL::PluginInfo Info{
     .infoSize = D2RL::PluginInfoSize,
-    .apiVersion = D2RL_PLUGIN_API_VERSION,
+    .abiVersion = D2RL_PLUGIN_ABI_VERSION,
     .id = "celestialrayone.smite-multihit",
     .name = "Smite",
-    .version = "1.1.1",
+    .version = "1.1.2",
     .author = "CelestialRayOne",
     .description =
         "Smite multi-hit driven by a skills.txt calc column, plus the Holy "

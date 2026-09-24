@@ -187,7 +187,7 @@ extern "C" {
 D2RL_PLUGIN_EXPORT const D2RL::PluginInfo* D2RLoaderGetPluginInfo() noexcept {
     static const D2RL::PluginInfo info{
         .infoSize    = D2RL::PluginInfoSize,
-        .apiVersion  = D2RL_PLUGIN_API_VERSION,
+        .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
         .id          = "celestialrayone.chain-limit",
         .name        = "Chain Limit",
         .version     = "1.0.0",

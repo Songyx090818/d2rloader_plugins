@@ -122,7 +122,7 @@ constexpr const char DefaultConfigToml[] = R"TOML(# celestialrayone.item-quantit
 #   find is granted.
 #
 # Changes are read when the plugin loads. Restart the game after editing.
-# Built for D2RLoader 1.3.0 (Diablo II: Resurrected 3.3). On any other build
+# Built for D2RLoader 1.3.1 (Diablo II: Resurrected 3.3). On any other build
 # the byte checks fail and the plugin loads without changing the game.
 
 # Master switch. false loads the plugin without touching the game.
@@ -524,7 +524,7 @@ inline auto ParseConfig(std::string_view text, Settings& result, std::string& er
 // LOGIC-END
 
 // ---------------------------------------------------------------------------
-//  Native layout (D2R 3.3, D2RLoader 1.3.0 process image)
+//  Native layout (D2R 3.3, D2RLoader 1.3.1 process image)
 // ---------------------------------------------------------------------------
 constexpr std::int32_t UnitTypePlayer  = 0;
 constexpr std::int32_t UnitTypeMonster = 1;
@@ -610,7 +610,8 @@ constexpr auto GetMonStatsEntry = std::to_array<std::uint8_t>({
     0x8B, 0xF8, 0x48, 0x8B, 0xDE, 0x85, 0xF6, 0x78,
 });
 // The stat read is an import thunk into D2RCore, the same door the roll uses.
-constexpr auto ReadUnitStatThunk = std::to_array<std::uint8_t>({0xFF, 0x25, 0x9A, 0x51, 0xB3, 0x03});
+// D2RLoader 1.3.1 moved its import slot (disp32 9A51B303 in 1.3.0).
+constexpr auto ReadUnitStatThunk = std::to_array<std::uint8_t>({0xFF, 0x25, 0xF2, 0x51, 0xB3, 0x03});
 
 using GetUnitTypeFn  = std::int32_t(__fastcall*)(void* unit) noexcept;
 using GetClassIdFn   = std::int32_t(__fastcall*)(void* unit, const char* file, std::int32_t line) noexcept;
@@ -798,7 +799,7 @@ auto CheckExact(std::uint64_t rva, const std::uint8_t* bytes, std::size_t size, 
     if (Context->CheckExpectedBytes(rva, bytes, static_cast<std::uint32_t>(size))) {
         return true;
     }
-    LogError("ItemQuantity: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name,
+    LogError("ItemQuantity: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name,
              static_cast<unsigned long long>(rva));
     return false;
 }
@@ -810,10 +811,10 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         return true;
     }
 
-    const D2RL::DiagnosticsServiceV1* diagnostics = nullptr;
-    if (Context->QueryService(D2RL::ServiceId::Diagnostics, D2RL::DiagnosticsServiceV1Version, &diagnostics)
+    const D2RL::DiagnosticsService* diagnostics = nullptr;
+    if (Context->QueryService(&diagnostics)
             == D2RL::ServiceQueryResult::Success
-        && D2RL::HasDiagnosticsServiceV1Field(diagnostics, D2RL::DiagnosticsServiceV1RequiredSize)
+        && D2RL::HasDiagnosticsServiceField(diagnostics, D2RL::DiagnosticsServiceRequiredSize)
         && diagnostics->queryHookStatus != nullptr) {
         D2RL::Diagnostics::HookQuery query{
             .structSize   = D2RL::Diagnostics::HookQuerySize,
@@ -835,7 +836,7 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
         }
     }
 
-    LogError("ItemQuantity: %s at RVA 0x%llX does not match D2RLoader 1.3.0.", name,
+    LogError("ItemQuantity: %s at RVA 0x%llX does not match D2RLoader 1.3.1.", name,
              static_cast<unsigned long long>(rva));
     return false;
 }
@@ -1024,7 +1025,7 @@ void RestoreHook() noexcept {
 
 void Install() noexcept {
     if (!ValidateImage()) {
-        SetInactive("the game image does not match D2RLoader 1.3.0");
+        SetInactive("the game image does not match D2RLoader 1.3.1");
         return;
     }
     ResolveGameFunctions();
@@ -1140,10 +1141,10 @@ namespace {
 
 constexpr D2RL::PluginInfo Info{
     .infoSize    = D2RL::PluginInfoSize,
-    .apiVersion  = D2RL_PLUGIN_API_VERSION,
+    .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.item-quantity",
     .name        = "Item Quantity",
-    .version     = "1.1.0",
+    .version     = "1.1.1",
     .author      = "CelestialRayOne",
     .description = "A stat on the killer adds extra picks to the monster's own treasure class.",
     .flags       = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,

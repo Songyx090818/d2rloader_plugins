@@ -615,7 +615,7 @@ auto PlayermodeStatCommand(
 
 constexpr D2RL::PluginInfo PlayermodeStatInfo {
 	.infoSize    = D2RL::PluginInfoSize,
-	.apiVersion  = D2RL_PLUGIN_API_VERSION,
+	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.playermode-stat",
 	.name        = "Playermode Stat",
 	.version     = "0.1.0",

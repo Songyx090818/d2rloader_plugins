@@ -14,6 +14,8 @@
 //   whirlwind_with_bows        sequence skills work with bows and crossbows
 //   whirlwind_speed_sync       the server starts Whirlwind at the same movement
 //                              speed the client does
+//   pets_follow_whirlwind      summons, pets and hirelings follow a
+//                              Whirlwinding player
 //
 // Every address is an RVA against the executable base. Nothing is written
 // unless the bytes at the site, and at every game function the part calls,
@@ -40,6 +42,7 @@
 #include <Windows.h>
 
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -250,6 +253,25 @@ constexpr Witness SpeedSyncWitnesses[] = {
 	{0x1D00518ULL, W_PlayerModeSpeedRules_1D00518, 20, "SpeedRules"},
 	{0x1D00B90ULL, W_MoveRateStat_1D00B90, 12, "MoveRateStat"},
 };
+// 00429B8E..00429CBB, inside the player walk/run/knockback frame handler
+// 00429A40 (player mode table 0238E340, rows 2, 3, 6 and 19). Every 25 ms,
+// once the player stands more than sqrt(45) subtiles from the newest point,
+// it writes the position into the 20-slot owner trail in the player data
+// (0034B240): write index byte at +110h, GetTickCount64 of the last write at
+// +118h, points at +120h as x, y dwords. The pet follow code reads that trail
+// (005BC940 mode 1, 005C1460 mode 1). Witnessed for those offsets and for the
+// calls it makes: 0034B240, 00341A20 / 00341A30 (path x / y) and 003412C0.
+constexpr std::uint8_t W_RunFrameTrail_429B8E[] = {0xE8,0x8D,0x3B,0xDE,0x00,0x48,0x8B,0xCF,0x48,0x89,0x44,0x24,0x38,0x4C,0x8B,0xF0,0xE8,0x9D,0x16,0xF2,0xFF,0x45,0x33,0xFF,0x48,0x8B,0xD8,0x48,0x8B,0x88,0x18,0x01,0x00,0x00,0x48,0x83,0xC1,0x19,0x4C,0x3B,0xF1,0x0F,0x8E,0x0C,0x01,0x00,0x00,0x4C,0x89,0x64,0x24,0x78,0x4C,0x89,0xAC,0x24,0x80,0x00,0x00,0x00,0x44,0x0F,0xB6,0xA8,0x10,0x01,0x00,0x00,0x45,0x84,0xED,0x75,0x05,0x41,0xB4,0x13,0xEB,0x04,0x45,0x8D,0x65,0xFF,0x48,0x85,0xFF,0x75,0x0F,0x48,0x8D,0x4C,0x24,0x30,0xE8,0x41,0xBC,0xC5,0xFF,0x84,0xC0,0x74,0x01,0xCC,0x8B,0x17,0x8B,0xCA,0x83,0xE9,0x02,0x74,0x1F,0x83,0xE9,0x02,0x74,0x1A,0x83,0xF9,0x01,0x74,0x15,0x48,0x8B,0x4F,0x38,0x48,0x85,0xC9,0x74,0x14,0xE8,0x0B,0x7E,0xF1,0xFF,0x8B,0x17,0x44,0x8B,0xF8,0xEB,0x08,0x48,0x8B,0x47,0x38,0x44,0x8B,0x78,0x10,0x83,0xEA,0x02,0x74,0x22,0x83,0xEA,0x02,0x74,0x1D,0x83,0xFA,0x01,0x74,0x18,0x48,0x8B,0x4F,0x38,0x48,0x85,0xC9,0x74,0x0A,0xE8,0xEF,0x7D,0xF1,0xFF,0x44,0x8B,0xF0,0xEB,0x0D,0x45,0x33,0xF6,0xEB,0x08,0x48,0x8B,0x47,0x38,0x44,0x8B,0x70,0x14,0x41,0x0F,0xB6,0xC4,0x41,0x8B,0xD6,0x41,0x8B,0xCF,0x44,0x8B,0x8C,0xC3,0x24,0x01,0x00,0x00,0x44,0x8B,0x84,0xC3,0x20,0x01,0x00,0x00,0xE8,0x4E,0x76,0xF1,0xFF,0x4C,0x8B,0x64,0x24,0x78,0x83,0xF8,0x2D,0x7E,0x42,0x48,0x8B,0x44,0x24,0x38,0x46,0x89,0xBC,0xEB,0x20,0x01,0x00,0x00,0x41,0xBF,0x00,0x00,0x00,0x00,0x46,0x89,0xB4,0xEB,0x24,0x01,0x00,0x00,0xFE,0x83,0x10,0x01,0x00,0x00,0x80,0xBB,0x10,0x01,0x00,0x00,0x14,0x48,0x89,0x83,0x18,0x01,0x00,0x00,0x0F,0xB6,0x83,0x10,0x01,0x00,0x00,0x41,0x0F,0x43,0xC7,0x88,0x83,0x10,0x01,0x00,0x00};
+// 003412C0: (x2 - x1)^2 + (y2 - y1)^2, 32-bit.
+constexpr std::uint8_t W_SquaredDistance_3412C0[] = {0x44,0x2B,0xC1,0x44,0x2B,0xCA,0x45,0x0F,0xAF,0xC9,0x45,0x0F,0xAF,0xC0,0x43,0x8D,0x04,0x08,0xC3};
+constexpr Witness PetTrailWitnesses[] = {
+	{0x429B8EULL, W_RunFrameTrail_429B8E, 302, "RunFrameTrail"},
+	{0x3412C0ULL, W_SquaredDistance_3412C0, 19, "SquaredDistance"},
+	{0x341A20ULL, W_PathGetX_341A20, 5, "PathGetX"},
+	{0x341A30ULL, W_PathGetY_341A30, 5, "PathGetY"},
+	{0x34BA40ULL, W_GetUsedSkill_34BA40, 14, "GetUsedSkill"},
+	{0x33CBC0ULL, W_SkillRecFlags_33CBC0, 76, "SkillRecFlags"},
+};
 constexpr std::uint8_t P_Executor[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x50};
 constexpr std::uint8_t P_HeldRight[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x8B,0xDA};
 constexpr std::uint8_t P_HeldLeft[] = {0x40,0x55,0x57,0x48,0x83,0xEC,0x38,0x48,0x8B,0xF9,0x33,0xED,0x48,0x8B,0x49,0x08};
@@ -280,6 +302,7 @@ enum class Part : std::size_t {
 	PotionsWhileWhirlwindingClient,
 	WhirlwindWithBows,
 	WhirlwindSpeedSync,
+	PetsFollowWhirlwind,
 	Count,
 };
 
@@ -297,6 +320,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(Part::Count)> PartNam
 	"Potions while Whirlwinding (client)",
 	"Whirlwind with bows and crossbows",
 	"Whirlwind speed sync (server start)",
+	"Pets follow during Whirlwind",
 };
 
 std::array<PartState, static_cast<std::size_t>(Part::Count)> g_parts {};
@@ -315,7 +339,7 @@ auto PartIs(Part part, PartState state) noexcept -> bool {
 
 constexpr const char* DefaultConfigToml = R"toml(# Whirlwind - Whirlwind rework for Diablo II: Resurrected 3.3
 #
-# Eight parts, each behind its own switch:
+# Nine parts, each behind its own switch:
 #   [ctc_while_uninterruptible]  item procs (chance to cast) fire while the
 #                                caster is Uninterruptible, optionally filtered
 #   [proc_start_fix]             a proc no longer takes over the caster's skill
@@ -331,6 +355,8 @@ constexpr const char* DefaultConfigToml = R"toml(# Whirlwind - Whirlwind rework 
 #   [whirlwind_with_bows]        Whirlwind works with bows and crossbows
 #   [whirlwind_speed_sync]       the server starts Whirlwind at the same
 #                                movement speed the client does
+#   [pets_follow_whirlwind]      summons, pets and hirelings follow the
+#                                character during Whirlwind
 #
 # Safety: the plugin verifies the original bytes of every site it touches, and
 # of every game function it calls, before it installs anything. On a game build
@@ -517,6 +543,24 @@ enabled = true
 # Site: RVA 0056A420 (server Whirlwind start, srvstfunc 38).
 # Default: true
 enabled = true
+
+
+[pets_follow_whirlwind]
+
+# Summons, pets and hirelings that fall behind follow their owner's trail:
+# the last 20 spots the character passed. Only walking, running and
+# knockback write that trail, never a skill, so during Whirlwind it stays
+# frozen where the Whirlwind started and every pet keeps heading back there.
+# A cyclone Whirlwind never ends, so they never catch up. With this on,
+# Whirlwind writes the trail exactly the way walking does: the character's
+# spot every 25 ms, once it is more than about 7 subtiles (squared distance
+# 45) from the last one. Pets then follow you as they do when you run.
+# Players only. The whirlwind console command shows how many trail points
+# Whirlwind has written.
+# Sites: shares the redirect at RVA 0042A99F (server); the trail is written
+# the same way as RVA 00429B8E (walk/run frame handler).
+# Default: true
+enabled = true
 )toml";
 
 struct Config {
@@ -535,6 +579,7 @@ struct Config {
 	bool potionsWhileWhirlwinding = true;
 	bool whirlwindWithBows = true;
 	bool whirlwindSpeedSync = true;
+	bool petsFollowWhirlwind = true;
 };
 
 Config                      g_config {};
@@ -656,16 +701,17 @@ void LoadConfiguration(const D2RL::PluginContext* context) noexcept {
 		ReadBool(t, "potions_while_whirlwinding", "enabled", g_config.potionsWhileWhirlwinding);
 		ReadBool(t, "whirlwind_with_bows", "enabled", g_config.whirlwindWithBows);
 		ReadBool(t, "whirlwind_speed_sync", "enabled", g_config.whirlwindSpeedSync);
+		ReadBool(t, "pets_follow_whirlwind", "enabled", g_config.petsFollowWhirlwind);
 	}
 	// The server keeps a Whirlwind alive a little longer than the client does,
 	// so a client aim can never reach a server whose Whirlwind already ended.
 	g_serverGraceFrames = static_cast<std::uint32_t>((g_config.holdGraceMs + 39) / 40 + 2);
 	D2RL::LogInfoF(
 		context,
-		"config: enabled=%d ctc=%d chance=%d allow_list=%d proc_fix=%d dual_wield=%d cyclone=%d grace_ms=%d keep_heading=%d radius=%d mana_frames=%d spin_melee=%d death=%d potions=%d bows=%d speed_sync=%d",
+		"config: enabled=%d ctc=%d chance=%d allow_list=%d proc_fix=%d dual_wield=%d cyclone=%d grace_ms=%d keep_heading=%d radius=%d mana_frames=%d spin_melee=%d death=%d potions=%d bows=%d speed_sync=%d pets=%d",
 		g_config.enabled, g_config.ctcEnabled, g_config.ctcChancePercent, g_ctcAllowListActive, g_config.procStartFix,
 		g_config.dualWieldSameTarget, g_config.cycloneEnabled, g_config.holdGraceMs, g_config.keepHeading,
-		g_config.nearCursorRadius, g_config.manaIntervalFrames, g_config.spinAtMeleeTargets, g_config.deathWhileWhirlwinding, g_config.potionsWhileWhirlwinding, g_config.whirlwindWithBows, g_config.whirlwindSpeedSync);
+		g_config.nearCursorRadius, g_config.manaIntervalFrames, g_config.spinAtMeleeTargets, g_config.deathWhileWhirlwinding, g_config.potionsWhileWhirlwinding, g_config.whirlwindWithBows, g_config.whirlwindSpeedSync, g_config.petsFollowWhirlwind);
 }
 
 // ---------------------------------------------------------------------------
@@ -783,6 +829,14 @@ inline auto TokenDestY(void* skill) noexcept -> std::uint32_t& { return U32(skil
 inline auto UnitCastId(void* unit) noexcept -> std::uint32_t& { return U32(unit, 0x12C); }     // 0034F430: unit+300
 inline auto PathVelocity(void* path) noexcept -> std::uint32_t { return U32(path, 0xA0); }     // 00342B24: mov [rbx+0A0h],edi
 
+// Owner trail in the player data, as the walk/run frame handler writes it.
+constexpr std::size_t  PlayerTrailIndex  = 0x110; // 00429BCA: byte, next slot to write
+constexpr std::size_t  PlayerTrailTick   = 0x118; // 00429BA9 / 00429CA4: GetTickCount64 of the last write
+constexpr std::size_t  PlayerTrailPoints = 0x120; // 00429C81 / 00429C8F: x, y dwords per slot
+constexpr std::uint8_t PlayerTrailSlots  = 20;    // 00429BD7 / 00429C9D
+constexpr std::int64_t TrailIntervalMs   = 25;    // 00429BB0: add rcx,19h
+constexpr std::int32_t TrailMinSquared   = 45;    // 00429C77: cmp eax,2Dh
+
 // Native functions (RVA noted; each is proven by a witness).
 struct Native {
 	void* (*getUsedSkill)(void*)                                        = nullptr; // 0034BA40
@@ -824,6 +878,8 @@ struct Native {
 	void* (*playerFromIndex)(std::int32_t)                              = nullptr; // 0009A480
 	void* (*getServerUnit)(void*, std::int32_t, std::uint32_t)          = nullptr; // 0048FE80
 	std::int32_t (*checkItemTypeId)(void*, std::int32_t)                = nullptr; // 00373890
+	void* (*getPlayerData)(void*)                                       = nullptr; // 0034B240
+	std::int32_t (*squaredDistance)(std::int32_t, std::int32_t, std::int32_t, std::int32_t) = nullptr; // 003412C0
 	// Originals of redirected calls.
 	std::int32_t (*serverPathStatus)(void*, void*)                      = nullptr; // 00491AC0
 	std::int32_t (*clientPathStep)(void*, std::int32_t)                 = nullptr; // 000F9A00
@@ -872,6 +928,8 @@ void BindNatives(std::uintptr_t base) noexcept {
 	Bind(g_native.playerFromIndex, base, 0x09A480);
 	Bind(g_native.getServerUnit, base, 0x48FE80);
 	Bind(g_native.checkItemTypeId, base, 0x373890);
+	Bind(g_native.getPlayerData, base, 0x34B240);
+	Bind(g_native.squaredDistance, base, 0x3412C0);
 	Bind(g_native.serverPathStatus, base, 0x491AC0);
 	Bind(g_native.clientPathStep, base, 0x0F9A00);
 	Bind(g_native.procStart, base, 0x217640);
@@ -1054,9 +1112,56 @@ auto ChargeWhirlwind(void* game, void* unit, void* skill) noexcept -> bool {
 // removes Whirlwind. While the button is held, a finished path is reported as
 // still running, so the character spins where it stands until the next aim.
 // When the hold lapses, or the recurring cost cannot be paid, status 2 is
-// reported so the native finish ends Whirlwind at once.
+// reported so the native finish ends Whirlwind at once. Every frame a
+// player's Whirlwind runs through here it also writes the owner trail the
+// pets follow (RecordPetTrail), since the skill mode never does.
 bool g_cycloneServerActive = false;
 bool g_deathFixActive      = false;
+bool g_petTrailActive      = false;
+
+std::atomic<std::uint64_t> g_petTrailWrites {0};
+
+// The owner trail write of the walk/run frame handler (00429B8E..00429CBB),
+// done for a player whose Whirlwind moved them this frame. Same clock, same
+// 25 ms spacing, same squared-distance threshold of 45 against the newest
+// point, same 20-slot ring. Called right after the path status, which is
+// where the walk/run handler does it too.
+void RecordPetTrail(void* unit) noexcept {
+	const auto now = static_cast<std::int64_t>(GetTickCount64());
+	auto* const data = static_cast<std::uint8_t*>(g_native.getPlayerData(unit));
+	if (data == nullptr) {
+		return;
+	}
+	std::int64_t last = 0;
+	std::memcpy(&last, data + PlayerTrailTick, sizeof(last));
+	if (now <= last + TrailIntervalMs) {
+		return;
+	}
+	const std::uint8_t index = data[PlayerTrailIndex];
+	if (index >= PlayerTrailSlots) {
+		return; // never written by the game; refuse rather than write past the ring
+	}
+	const std::uint8_t newest = index != 0 ? static_cast<std::uint8_t>(index - 1) : static_cast<std::uint8_t>(PlayerTrailSlots - 1);
+	void* const path = g_native.getDynamicPath(unit);
+	if (path == nullptr) {
+		return;
+	}
+	const std::int32_t x = g_native.pathGetX(path);
+	const std::int32_t y = g_native.pathGetY(path);
+	auto* const points = data + PlayerTrailPoints;
+	std::int32_t newestX = 0;
+	std::int32_t newestY = 0;
+	std::memcpy(&newestX, points + 8 * newest, sizeof(newestX));
+	std::memcpy(&newestY, points + 8 * newest + 4, sizeof(newestY));
+	if (g_native.squaredDistance(x, y, newestX, newestY) <= TrailMinSquared) {
+		return;
+	}
+	std::memcpy(points + 8 * index, &x, sizeof(x));
+	std::memcpy(points + 8 * index + 4, &y, sizeof(y));
+	std::memcpy(data + PlayerTrailTick, &now, sizeof(now));
+	data[PlayerTrailIndex] = index + 1 >= PlayerTrailSlots ? 0 : static_cast<std::uint8_t>(index + 1);
+	g_petTrailWrites.fetch_add(1, std::memory_order_relaxed);
+}
 
 void ForgetServerSession(void* unit) noexcept {
 	for (ServerSession& s : g_serverSessions) {
@@ -1074,6 +1179,9 @@ std::int32_t __fastcall OnServerPathStatus(void* game, void* unit) noexcept {
 	void* const skill = g_native.getUsedSkill(unit);
 	if (!IsWhirlwindSkill(skill)) {
 		return status;
+	}
+	if (g_petTrailActive) {
+		RecordPetTrail(unit);
 	}
 	const std::uint32_t flags = g_native.getSkillFlags(skill);
 	if ((flags & TokenActive) == 0 || (flags & TokenFinishing) != 0) {
@@ -1688,8 +1796,8 @@ void InstallDualWield(const D2RL::PluginContext* context) noexcept {
 	SetPart(Part::DualWield, ok ? PartState::Installed : PartState::InstallFailed);
 }
 
-// The redirect at 0042A99F serves both the cyclone and the death fix, and is
-// installed once for whichever of them asks first.
+// The redirect at 0042A99F serves the cyclone, the death fix and the pet
+// trail, and is installed once for whichever of them asks first.
 auto InstallServerFrameRedirect(const D2RL::PluginContext* context) noexcept -> PartState {
 	static PartState state = PartState::NotAttempted;
 	if (state != PartState::NotAttempted) {
@@ -1711,6 +1819,20 @@ void InstallDeathFix(const D2RL::PluginContext* context) noexcept {
 	const PartState frame = InstallServerFrameRedirect(context);
 	g_deathFixActive      = frame == PartState::Installed;
 	SetPart(Part::DeathWhileWhirlwinding, frame);
+}
+
+void InstallPetTrail(const D2RL::PluginContext* context) noexcept {
+	if (!g_config.petsFollowWhirlwind) {
+		SetPart(Part::PetsFollowWhirlwind, PartState::DisabledByConfig);
+		return;
+	}
+	if (!VerifyAll(context, PetTrailWitnesses, PartNames[static_cast<std::size_t>(Part::PetsFollowWhirlwind)])) {
+		SetPart(Part::PetsFollowWhirlwind, PartState::UnsupportedBuild);
+		return;
+	}
+	const PartState frame = InstallServerFrameRedirect(context);
+	g_petTrailActive      = frame == PartState::Installed;
+	SetPart(Part::PetsFollowWhirlwind, frame);
 }
 
 void InstallPotions(const D2RL::PluginContext* context) noexcept {
@@ -1837,6 +1959,9 @@ auto WhirlwindCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* com
 		std::snprintf(line, sizeof(line), "%s: %s", PartNames[i], StateText(g_parts[i]));
 		context->WriteConsoleMessage(line);
 	}
+	std::snprintf(line, sizeof(line), "Pet trail points written during Whirlwind: %llu",
+		static_cast<unsigned long long>(g_petTrailWrites.load(std::memory_order_relaxed)));
+	context->WriteConsoleMessage(line);
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -1845,9 +1970,9 @@ constexpr D2RL::PluginInfo WhirlwindInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.whirlwind",
 	.name        = "Whirlwind",
-	.version     = "0.4.0",
+	.version     = "0.5.0",
 	.author      = "CelestialRayOne",
-	.description = "Whirlwind rework: procs while Uninterruptible, proc start fix, dual wield same target, cyclone steering, death and potions while Whirlwinding, Whirlwind with bows, movement speed sync.",
+	.description = "Whirlwind rework: procs while Uninterruptible, proc start fix, dual wield same target, cyclone steering, death and potions while Whirlwinding, Whirlwind with bows, movement speed sync, pets follow during Whirlwind.",
 	.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
 };
 
@@ -1889,6 +2014,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		InstallDeathFix(context);
 		InstallPotions(context);
 		InstallSequenceFallback(context);
+		InstallPetTrail(context);
 	} else {
 		SetPart(Part::ProcStartFix, PartState::InstallFailed);
 		SetPart(Part::DualWield, PartState::InstallFailed);
@@ -1900,6 +2026,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		SetPart(Part::PotionsWhileWhirlwinding, PartState::InstallFailed);
 		SetPart(Part::PotionsWhileWhirlwindingClient, PartState::InstallFailed);
 		SetPart(Part::WhirlwindWithBows, PartState::InstallFailed);
+		SetPart(Part::PetsFollowWhirlwind, PartState::InstallFailed);
 	}
 	for (std::size_t i = 0; i < g_parts.size(); ++i) {
 		D2RL::LogInfoF(context, "%s: %s", PartNames[i], StateText(g_parts[i]));

@@ -15,6 +15,21 @@
 // the saturated total. Saturating the delta alone is not enough: the 32-bit add
 // of base plus a saturated delta wraps again.
 //
+// 2.4.0: missile_percent, the damage percent a missile applies to its own
+// physical damage on impact (sub_140465420, 0x465A13) in 32 bits.
+//
+// 2.3.0: debug_log, a text file with every stage of every player hit and
+// every player missile (stats, rolls, sites that ran, packets, resistance
+// step, target), and the dmgoverflow log console command.
+//
+// 2.2.0: the melee kill check, the physical-to-element conversion add, and
+// dmgoverflow hit, a per-hit report of every damage type at the resistance step.
+//
+// 2.1.0 (D2RLoader 1.3.1): the stat op group moved to D2RCore.dll, where the
+// loader runs the stat engine (the game-image copy 2.0.2 patched is never
+// called), and three groups were added: the resistance step, the hit's total
+// life damage, and life/mana steal. See the TOML for every site.
+//
 // Every stub also records what it saw into a per-site trace slot, readable in
 // game with the console command:
 //
@@ -30,6 +45,17 @@
 #include <D2RLPlugin/logging.h>
 
 #include <windows.h>
+
+#include <cstdarg>
+#include <cstdio>
+#include <cwchar>
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#define RETURN_ADDRESS() _ReturnAddress()
+#else
+#define RETURN_ADDRESS() __builtin_return_address(0)
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -50,6 +76,9 @@ struct Site {
 	uint32_t    traceAt[4];    // byte offsets of the four trace destinations
 	uint32_t    callAt;        // byte offset of an imm64 to fill with a plugin function pointer, 0 = none
 	const char* exitExpectedHex = nullptr;  // when set, bytes the rejoin target must contain
+	uint32_t    fixAt[3]   = {0, 0, 0};    // byte offsets of imm64 slots filled at install
+	uint8_t     fixKind[3] = {0, 0, 0};    // 1 game RVA fixRva, 2 ledger pre, 3 ledger post, 4 ledger function, 5/6 debug log
+	uint32_t    fixRva     = 0;
 };
 
 const Site kSites[] = {
@@ -288,31 +317,6 @@ const Site kSites[] = {
 	 "D3E0488BCE01472C",
 	 "4863C048A3000000000000000048D3E048A3000000000000000048634F2C4801C848A3000000000000000048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC148A3000000000000000089472C4889F1",
 	 {5,18,35,73}},
-	{"ops_percent_op1", "stat_ops", "itemstatcost op 1, percent layer on any stat",
-	 0x2F8D2Bu, 0x2F988Bu,
-	 "81FF00001000",
-	 "4863C748A300000000000000004963C048A300000000000000004963C84863C7480FAFC148C7C164000000489948F7F94963CD4801C848A3000000000000000048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC148A300000000000000004189C544896DB8",
-	 {5,18,56,94}},
-	{"ops_percent_op11", "stat_ops", "itemstatcost op 11, character-wide percent layer (masteries)",
-	 0x2F96DAu, 0x2F988Bu,
-	 "81FF00001000",
-	 "4863C748A300000000000000004963C048A300000000000000004963C84863C7480FAFC148C7C164000000489948F7F94963CD4801C848A3000000000000000048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC148A300000000000000004189C544896DB8",
-	 {5,18,56,94}},
-	{"ops_sum_init", "stat_ops", "op processor, widen the base stat total to 64-bit before the sub-list loop",
-	 0x2F8B83u, 0x2F8B88u,
-	 "410FB67604",
-	 "4863FF410FB67604",
-	 {0,0,0,0}},
-	{"ops_sublist_sum", "stat_ops", "op processor, sub-list sum accumulated in 64-bit (no clamp inside the loop)",
-	 0x2F8BD2u, 0x2F8BD9u,
-	 "74038B400403F8",
-	 "74038B40044863C048A300000000000000004889C14889F848A300000000000000004801CF4889F848A300000000000000004963C748A30000000000000000",
-	 {10,26,42,55}},
-	{"ops_sum_finish", "stat_ops", "op processor, saturate the base stat total once after the loop",
-	 0x2F8BE7u, 0x2F8BEDu,
-	 "448BEF897DB8",
-	 "4889F848A3000000000000000048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC148A3000000000000000089C74189FD897DB84963C748A300000000000000004889F848A3000000000000000041807E4E00",
-	 {5,43,64,77}},
 	{"melee_emax_01", "melee_elemental", "melee damage builder, fire max stat shifted into 256ths",
 	 0x44C3EBu, 0x44C3F2u,
 	 "448BF041C1E608",
@@ -513,34 +517,238 @@ const Site kSites[] = {
 	 "8B471803C08947188B472003C08947208B472C03C089472C8B473003C08947308B473403C08947348B473803C0894738",
 	 "486347184801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1894718486347204801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC18947204863472C4801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC189472C486347304801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1894730486347344801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1894734486347384801C048C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1894738",
 	 {0,0,0,0}},
+	{"resist_scale", "resist_apply", "resistance step: damage x (100 - resistance) / 100, the 32-bit (damage / 100) x multiplier branch",
+	 0x452557u, 0x452614u,
+	 "81FF000010007E4D8BC783E0F03D400600007D2B4863C74863C9480FAFC848B80BD7A3703D0AD7A348F7E9488D3C1148C1FF06488BC748C1E83F4803F8EB7EB81F85EB51F7EFC1FA058BFAC1EF1F03FA0FAFF9EB6881F9000001007E4C8BC183E0F03D400600007D2A4863C74863C9480FAFC848B80BD7A3703D0AD7A348F7E94803D148C1FA06488BFA48C1EF3F4803FAEB2AB81F85EB51F7E9C1FA058BC2C1E81F03D00FAFFAEB140FAFCFB81F85EB51F7E9C1FA058BFAC1EF1F03FA",
+	 "4863C748A300000000000000004863C148A300000000000000004863C74863C941BA6400000081FF000010007E0B489949F7FA480FAFC1EB2281F9000001007E114989C34889C8489949F7FA490FAFC3EB09480FAFC1489949F7FA48A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A3000000000000000089C7",
+	 {5,18,93,131}},
+	{"hit_total", "hit_total", "total life damage of the hit, the 32-bit sum of the six damage types plus life drain; also feeds dmgoverflow hit",
+	 0x44ECBDu, 0x44ECC4u,
+	 "488B8D80020000",
+	 "4989C34D6347184D634F204D01C84D634F2C4D01C84D634F304D01C84D634F344D01C84D634F384D01C84585E4740A4D638F200100004D01C84C89C048A30000000000000000496397340100004889D048A300000000000000004D89C14929D14981C1000000404981C10000004049C1F92049C1E1204C01CA4889D048A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A300000000000000004189873401000041534883EC284C89F94889F24D89E848B80000000000000000FFD04883C42858488B8D80020000",
+	 {62,82,126,164}, 0, nullptr, {196,0,0}, {4,0,0}, 0},
+	{"leech_sum", "leech", "life/mana steal base: physical plus the four elements, summed in 32 bits",
+	 0x450EBFu, 0x450ECDu,
+	 "8B463403463003462C03462003E8",
+	 "4863C548A300000000000000004863463448634E304801C848634E2C4801C848634E204801C84863CD4801C848A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A3000000000000000089C5",
+	 {5,0,46,84}},
+	{"leech_mana", "leech", "mana steal amount: damage x steal x drain percent, 32-bit branch chains",
+	 0x45103Bu, 0x45116Du,
+	 "81FD000010007E4A8BC583E0F03D400600007D27498BC84863C5480FAFC8488BC748F7E94C8D041149C1F806498BC048C1E83F4C03C0E984000000B81F85EB51F7EDC1FA058BC2C1E81F03D0440FAFC2EB6D4181F8000001007E4B418BC083E0F03D400600007D23498BC84863C5480FAFC8488BC748F7E94803D148C1FA064C8BC249C1E83F4C03C2EB34B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2440FAFC5EB19440FAFC5B81F85EB5141F7E8C1FA05448BC241C1E81F4403C24183FF64746D4181F8000010007E4B418BC083E0F03D400600007D234963C8418BC7480FAFC8488BC748F7E94803D148C1FA064C8BC249C1E83F4C03C2EB34B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2450FAFC7EB19450FAFC7B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2",
+	 "4863C548A300000000000000004963C048A3000000000000000041BA640000004C63CD4D63D881FD000010007E0E4C89C8489949F7FA490FAFC3EB234181FB000001007E0E4C89D8489949F7FA490FAFC1EB0C4C89C8490FAFC3489949F7FA48C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC24183FF64744F4C63C84589FB4181F9000010007E0E4C89C8489949F7FA490FAFC3EB0C4C89C8490FAFC3489949F7FA48A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A300000000000000004189C0",
+	 {5,18,172,210}},
+	{"leech_life", "leech", "life steal amount: damage x steal x drain percent, 32-bit branch chains",
+	 0x4511C7u, 0x4512F9u,
+	 "81FD000010007E4A8BC583E0F03D400600007D27498BC84863C5480FAFC8488BC748F7E94C8D041149C1F806498BC048C1E83F4C03C0E984000000B81F85EB51F7EDC1FA058BC2C1E81F03D0440FAFC2EB6D4181F8000001007E4B418BC083E0F03D400600007D23498BC84863C5480FAFC8488BC748F7E94803D148C1FA064C8BC249C1E83F4C03C2EB34B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2440FAFC5EB19440FAFC5B81F85EB5141F7E8C1FA05448BC241C1E81F4403C24183FF64746D4181F8000010007E4B418BC083E0F03D400600007D234963C8418BC7480FAFC8488BC748F7E94803D148C1FA064C8BC249C1E83F4C03C2EB34B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2450FAFC7EB19450FAFC7B81F85EB5141F7E8C1FA05448BC241C1E81F4403C2",
+	 "4863C548A300000000000000004963C048A3000000000000000041BA640000004C63CD4D63D881FD000010007E0E4C89C8489949F7FA490FAFC3EB234181FB000001007E0E4C89D8489949F7FA490FAFC1EB0C4C89C8490FAFC3489949F7FA48C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC24183FF64744F4C63C84589FB4181F9000010007E0E4C89C8489949F7FA490FAFC3EB0C4C89C8490FAFC3489949F7FA48A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A300000000000000004189C0",
+	 {5,18,172,210}},
+	{"kill_check", "hit_total", "melee kill flag: the six damage types plus life drain summed in 32 bits against the target's life",
+	 0x44B6B1u, 0x44B6CFu,
+	 "8B7B38037B34037B30037B2C037B20037B184183FF01750603BB20010000",
+	 "4863433848634B344801C848634B304801C848634B2C4801C848634B204801C848634B184801C84183FF01750A48638B200100004801C848A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A3000000000000000089C7",
+	 {0,0,57,95}},
+	{"convert_add", "conversion", "physical converted to an element (packet+149h type, +14Ch percent) added to that element in 32 bits",
+	 0x44CCDFu, 0x44CD7Fu,
+	 "410FB6C2FFC883F80B0F8791000000488D150B33BBFF48988B8C82C8CD44004803CAFFE1015F20EB77015F2CEB72015F30EB6D8B8718010000B932000000015F3483F8320F4CC1898718010000EB518BC3B9320000009983E20703C2C1F8030147388B473C83F8320F4CC189473CEB308B4728B932000000015F2083F8320F4CC1894728EB1A8B871C010000B932000000015F3483F8320F4CC189871C010000",
+	 "4863C348A30000000000000000410FB6C248A30000000000000000410FB6C283F801742383F802742483F803742583F804742683F805744583F80B742983F80C742EE9B20000004C8D4720EB454C8D472CEB3F4C8D4730EB394C8D47344C8D8F18010000EB584C8D47204C8D4F28EB4E4C8D47344C8D8F1C010000EB4189D89983E20701D0C1F8034C8D47384C8D4F3CEB2E89D84963084863C04801C848C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1418900EB3B89D84963084863C04801C848C7C1FFFFFF7F4839C8480F4FC148C7C1000000804839C8480F4CC1418900418B01B93200000083F8320F4CC1418901",
+	 {5,19,0,0}},
+	{"resist_ledger", "hit_report", "records every damage type going into and out of the resistance step, for dmgoverflow hit",
+	 0x44EC5Au, 0x44EC5Fu,
+	 "E837C89D03",
+	 "488B0248630049BA00000000000000004589F34183E30F4B8904DA48B80000000000000000FFD0488B0348630049BA00000000000000004589F34183E30F4B8904DA",
+	 {0,0,0,0}, 0, nullptr, {8,29,47}, {2,1,3}, 0x3E2B496u},
+	{"dbg_build", "debug_log", "debug log: copies the damage packet as it enters the damage reduction; changes nothing",
+	 0x44DFD7u, 0x44DFE6u,
+	 "4533C04489742470488BCE418D5022",
+	 "4883EC204C89F94889F24D89E848B80000000000000000FFD04883C4204531C044897424704889F1418D5022",
+	 {0,0,0,0}, 0, nullptr, {15,0,0}, {5,0,0}, 0},
+	{"dbg_missile", "debug_log", "debug log: records a player's missile damage block as it is stamped onto the missile; changes nothing",
+	 0x537A7Fu, 0x537A84u,
+	 "E81C64E8FF",
+	 "5152415041514883EC2048B80000000000000000FFD04883C420415941585A5948B80000000000000000FFD0",
+	 {0,0,0,0}, 0, nullptr, {12,34,0}, {6,1,0}, 0x3BDEA0u},
+	{"missile_percent", "missile_physical", "missile impact: the missile's damage percent (stat 25, plus demon/undead/monster-type bonus) applied to its rolled physical damage in 32 bits",
+	 0x465A13u, 0x465A3Fu,
+	 "B9A6FFFFFFB81F85EB51443BE9410F4FCD4C8BAC24700400000FAF4F18F7E9C1FA058BC2C1E81F03D0015718",
+	 "4963CD48C7C0A6FFFFFF4839C1480F4CC84863471848A300000000000000004889C848A300000000000000004C8BAC247004000048634718480FAFC148C7C164000000489948F7F948634F184801C848A3000000000000000048C7C2FFFFFF7F4839D0480F4FC248C7C2000000804839D0480F4CC248A30000000000000000894718",
+	 {23,36,81,119}},
 };
 constexpr size_t kSiteCount = sizeof(kSites) / sizeof(kSites[0]);
 
 // Every stub records these four values, in this order.
+// ---------------------------------------------------------------------------
+// D2RCore.dll sites
+//
+// D2RLoader 1.3.x moved the whole statlist engine into D2RCore.dll for its wide
+// stats. The game image keeps its own op processor (sub_1402F8AD0) and the
+// evaluate-and-update routine (0x2FA430), but nothing calls them any more: the
+// statlist entries are jumps into D2RCore, and D2RCore stores entries as 16
+// bytes where the game code walks 8. Up to 2.0.2 this plugin patched that dead
+// copy. The live one is D2RCore 0x3DC2D0: (ctx, statList, key) -> value.
+//
+// D2RCore already does the arithmetic in 64-bit with an int32 cap, but only for
+// stats 6..11 (life, max life, mana, max mana, stamina, max stamina). Every
+// branch is gated on "cmp r15w, 6" with r15w = stat id - 6, and every other stat
+// takes Blizzard's 32-bit code:
+//   3DC4A0  add r14d, r11d          the stat summed over the child statlists
+//   3DCA6D  imul eax, ecx / shl 6   ops 8 and 9
+//   3DCA8F  imul eax, ecx           ops 1, 11 and 13 (also 3DCC32, 3DCDFA)
+//   3DCAB5  imul eax, r14d          op 7 (also 3DCD2A, 3DCC52)
+//   3DCCD8  imul eax, ebp / sar cl  ops 2 to 5
+//   3DCD10  add r14d, eax           the op contribution added
+// The six gates below send every stat down the life/mana branches. Those are
+// the same formulas widened: identical results while nothing overflows, capped
+// at the int32 limit when something would. The sum loop is replaced instead of
+// gated: the life/mana loop caps after every child list, which would break a
+// stat whose partial sum overflows and a later negative value cancels. The
+// replacement keeps the loop and its binary search byte for byte, sums in
+// 64-bit and caps once after the last child list.
+//
+// The whole function is checked against D2RLoader 1.3.1 before anything is
+// written, every window again on its own, and the bytes are put back on unload.
+// enhanced-damage-fix only reads 3DC710, 3DC834..3DC86D and 3DC90F..3DC97A of
+// this function; none of the sites below touch those bytes.
+// ---------------------------------------------------------------------------
+
+constexpr wchar_t  kCoreModule[]   = L"D2RCore.dll";
+constexpr uint32_t kCoreAnchorRva  = 0x3DC2D0u;
+constexpr uint32_t kCoreAnchorSize = 0x3DCE90u - 0x3DC2D0u;
+
+const char* const kCoreAnchorHex =
+	"4157415641554154565755534881ECA80000000F29B424900000004C89C64889D7488B0588F231004831E04889842488"
+	"000000488B82A000000049C1E820488D90BD0100004885C048894C2448480F44D10FB60A4C89442450410FB7D0FF15BD"
+	"2E32004885C0744F4889442438488B4F384531F64885C97446488B573031C04989C94989C8EB11660F1F840000000000"
+	"4D89C14D85C0742949D1E84D8D140049C1E2044A39341273E74C01C048FFC049F7D04D01C8EBD94531F6E9BA0A000031"
+	"C04839C87415488B4F3048C1E0044839340175074801C1448B7108488B87900000004885C00F8489010000488B4C2438"
+	"8B4904488B54245083C2FA6683FA060F83BE000000BAA8000000EB110F1F4000488B40684885C00F8457010000448B40"
+	"1CF6C104740C4589C14181E10000004075DE4585C041B8300000004C0F48C24E8B5400084D85D2743E4E8B1C004531C9"
+	"4D89D74C89D3EB100F1F8400000000004989DF4885DB742248D1EB4E8D240B49C1E4044B39342373E74901D949FFC148"
+	"F7D34C01FBEBD94531C94D39D174814E8B040049C1E1044B3934080F856FFFFFFF4D01C8458B4008478D0C0641C1F91F"
+	"4181C1000000804501C6450F40F1E94DFFFFFFBAA8000000EB16660F1F4400004501DE488B40684885C00F8494000000"
+	"448B401CF6C104740C4589C14181E10000004075DE4585C041B8300000004C0F48C24E8B5400084D85D2743B4E8B1C00"
+	"4531C94D89D74C89D3EB0D0F1F4400004989DF4885DB742248D1EB4E8D240B49C1E4044B39342373E74901D949FFC148"
+	"F7D34C01FBEBD94531C94531DB4D39D10F847AFFFFFF4E8B040049C1E1044B3934080F8568FFFFFF4D01C8458B5808E9"
+	"5CFFFFFF488B4C243880794E000F84F60800004C8DA1DA000000488B4424504189C74183C7FA48B800000000FFFF0000"
+	"4821C6BBDA0000004C8D0DE53E25000F57F6448974244444897C2440E98D0000004963D64863C8480FAFCA4889C848BA"
+	"0BD7A3703D0AD7A348F7EA4889D04801C84889C148C1E93F48C1F8064801C8483D0100008048C7C100000080480F4CC1"
+	"483DFFFFFF7FB9FFFFFF7F480F4DC1418D0C06C1F91F81C1000000804101C6440F40F1666666662E0F1F840000000000"
+	"488B4C24384C8D24194983C4064883C3064881FB3A0100000F842B080000410FB66C240485ED0F841D0800008D45FF83"
+	"F80C77D1450FB76C240249C1E520496304814C01C8FFE04080FD037706837F080177B24080FD04720D488B074885C074"
+	"A4833801779F410FB7142481FAFFFF00007492488B87A0000000488D88BD0100004885C0480F444C24480FB609FF155D"
+	"2B32004885C00F842B060000410FB714244989D749C1E7204080FD040F83FE020000837F1C00B930000000BAA8000000"
+	"480F48CA4C8B440F084D85C00F84FC0300004C8B0C0F31D24D89C34D89C2EB0C4D89D34D85D20F84E403000049D1EA49"
+	"8D2C1248C1E5044D393C2973E34C01D248FFC249F7D24D01DAEBD50F1F440000488B87A00000004885C00F840F010000"
+	"8B08E90D010000488B87A00000004885C00F84CEFEFFFF8338000F85C5FEFFFF8B50040FB688BD010000FF1550573200"
+	"4885C00F846E050000440FB678440FB76842488B4C24484889FA4D89E8E85EFBFFFF488B57384885D20F844E0200004C"
+	"8B473031C94989D24989D1EB0F0F1F004D89CA4D85C90F843302000049D1E94D8D1C0949C1E3044F392C1873E34C01C9"
+	"48FFC149F7D14D01D1EBD54883BFA0000000000F843CFEFFFF488B4C24484889FA4D89E8E8F7FAFFFF85C00F84E60400"
+	"0089C5488B87A0000000488B48204885C90F8484010000C784248400000000000000488D942484000000FF15102A3200"
+	"448B8424840000000F1174242089E989C24531C9FF153E2A3200E94E010000B90600000083FD0B0F94C283F902410F93"
+	"C04484C20F85B6FDFFFF83FD0D0F94C283F904410F95C04484C20F85A0FDFFFF83F9040F95C183FD0B0F94C208CA488B"
+	"4C24380F84960000004885C00F8483FDFFFF837C2444000F8478FDFFFF488B4C24484889FA4D89E8E833FAFFFF664183"
+	"FF060F83D001000048635424444863C8480FAFCA4889C848BA0BD7A3703D0AD7A348F7EA4801CA4889D048C1E83F48C1"
+	"FA064801C24881FA0100008048C7C000000080480F4CD04881FAFFFFFF7FB8FFFFFF7F480F4DD0418D0416C1F81F0500"
+	"0000804101D6440F40F0E9B8030000C7442444000000004885C00F84E5FCFFFF488B88880000004885C90F84D0FCFFFF"
+	"4C8B41384D85C00F847F0200004C8B493031D24D89C34D89C2EB110F1F4400004D89D34D85D20F846202000049D1EA4D"
+	"8D3C1249C1E7044B39343973E34C01D248FFC249F7D24D01DAEBD531C04C8D0DE03A250041807C2404070F8575030000"
+	"664183FF060F82F6FBFFFF4181FE010010000F8C020100004489F1E97A030000488B0F4885C948894424680F843C0100"
+	"00488BA988000000E93201000031C94531C04839D175094C8D0D863A2500EB1C488B573048C1E1044C392C0A4C8D0D71"
+	"3A250075074801CA448B420889E9C1ED084429C066837C24500B0F45E941807C240408410FB6CF0F45CD448B7C244066"
+	"4183FF06734748980FB6C9480FAFC848C1E1064881F90100008048C7C000000080480F4CC84881F9FFFFFF7FB8FFFFFF"
+	"7F480F4DC8418D040EC1F81F05000000804101CE440F40F0E993FBFFFF0FB6C90FAFC1C1E006EB278B4C244481F90100"
+	"10004C8D0DDB3925000F8CA301000089C94869C91F85EB5148C1E9250FAFC14401F04189C6E956FBFFFF3D010001000F"
+	"8C9D01000089C04869C01F85EB5148C1E825410FAFC64101C6E932FBFFFF31D231ED4C39C20F8490010000488B0C0F48"
+	"C1E2044C393C11448B7C24400F857E0100004801D18B6908E97301000031ED488D81BD0100004885C9480F444424480F"
+	"B608FF15D82632004885ED0F848A0000004889C14885C0488B4424680F847E00000048894C24608B4D1C894C245C85C9"
+	"41B830000000B9A80000004C0F48C14E8B5405084D85D248896C24704C895424780F84F40000004E8B5C05004531C94C"
+	"89D231EDEB16662E0F1F8400000000004989D24885D20F84D400000048D1EA4A8D0C0A48C1E1044D393C0B73E34901D1"
+	"49FFC148F7D24C01D2EBD5488B442468448B7C244031EDE9B400000031D24C39C27516488B4C2438448B7C24404C8D0D"
+	"90382500E92CFAFFFF4C8B413048C1E20449393410448B7C24404C8D0D733825000F8509FAFFFF4901D0418B50088954"
+	"2444488B542438F6420502741B83791C007915488B89A00000004885C974098339010F86F6010000488B4C2438E947FC"
+	"FFFF3D010001000F8CBD01000089C04869C01F85EB5148C1E8250FAFC1E9C1010000410FAFC6E9810100004531C931ED"
+	"4C3B4C24780F85D5000000448B7C24400FB64814D3FD85ED7E4D488B4C24484889FA4D89E8E846F6FFFF410FB64C2405"
+	"664183FF06734189EA4898480FAFC280E11F48D3F8483D0100008048C7C100000080480F4CC1483DFFFFFF7FB9FFFFFF"
+	"7F480F4DC1EB16488B4C24384C8D0D91372500E92DF9FFFF0FAFC5D3F8410FB64C240483F9054C8D0D77372500740583"
+	"F9037511664183FF06731D4863542444E98FF8FFFF664183FF060F82CFF8FFFF4101C6E9E8F8FFFF8B4C244481F90100"
+	"10000F8C9200000089C94869C91F85EB5148C1E9250FAFC14101C6E9C0F8FFFF4C8B5424704B8B0C0249C1E1044E393C"
+	"09448B7C24400F8514FFFFFF4C01C98B6908837C245C000F8903FFFFFF4C8B442460418B4804BA0002000021D10F84ED"
+	"FEFFFF498B8AA00000004885C90F84DDFEFFFF8339010F87D4FEFFFF418B502839D50F8DC8FEFFFF488B4C24600FB649"
+	"14D3E289D5E9B6FEFFFF3D010001007C1889C04869C01F85EB5148C1E8250FAFC14101C6E927F8FFFF0FAFC148984869"
+	"C01F85EB514889C148C1E93F48C1F82501C84101C6E906F8FFFF0FAFC148984869C01F85EB514889C148C1E93F48C1F8"
+	"2501C84401F04189C6E9E2F7FFFF488B4C24388B5128395424440F8D49FAFFFF488B4C24380FB64914D3E2488B4C2438"
+	"89542444E930FAFFFF488B8424880000004831E0488B0D25E731004839C1751F4489F00F28B424900000004881C4A800"
+	"00005B5D5F5E415C415D415E415FC3488B8C24880000004831E1E8A1A61500CC";
+
+struct CoreSite {
+	const char* id;
+	const char* group;
+	const char* doc;
+	uint32_t    rva;           // D2RCore RVA of the first byte checked and written
+	const char* expectedHex;   // bytes there before patching
+	const char* patchHex;      // same-length replacement, nullptr for a stub site
+	const char* stubHex;       // stub template for a stub site, trace slots zero
+	uint32_t    traceAt[4];
+	uint32_t    exitRva;       // D2RCore RVA the stub resumes at
+};
+
+const CoreSite kCoreSites[] = {
+	{"stat_sum", "stat_ops", "a stat added up over items, skills and states: 64-bit sum, capped once at the end",
+	 0x3DC493u, "BAA8000000EB16", nullptr,
+	 "504963C648A30000000000000000584D63F6BAA8000000EB134D63DB4D01DE488B40684885C00F848B000000448B401CF6C104740C4589C14181E10000004075DE4585C041B8300000004C0F48C24E8B5400084D85D274364E8B1C004531C94D89D74C89D3EB084989DF4885DB742248D1EB4E8D240B49C1E4044B39342373E74901D949FFC148F7D34C01FBEBD94531C94531DB4D39D174804E8B040049C1E1044B3934080F856EFFFFFF4D01C8458B5808E962FFFFFF4C89F048A3000000000000000048C7C0FFFFFF7F4939C64C0F4FF048C7C0000000804939C64C0F4CF04C89F048A300000000000000004589F6",
+	 {6,0,188,229}, 0x3DC544u},
+	{"op_percent", "stat_ops", "ops 1, 11 and 13: percent of a stat",
+	 0x3DC89Du, "664183FF060F83D0010000", "664183FF06909090909090",
+	 nullptr, {0,0,0,0}, 0},
+	{"op_time_percent", "stat_ops", "op 7: percent by time",
+	 0x3DC990u, "664183FF060F82F6FBFFFF", "664183FF06E9F7FBFFFF90",
+	 nullptr, {0,0,0,0}, 0},
+	{"op_per_attribute", "stat_ops", "ops 8 and 9: per energy / vitality",
+	 0x3DCA1Fu, "664183FF067347", "664183FF069090",
+	 nullptr, {0,0,0,0}, 0},
+	{"op_per_level", "stat_ops", "ops 2 to 5: per level",
+	 0x3DCC90u, "664183FF067341", "664183FF069090",
+	 nullptr, {0,0,0,0}, 0},
+	{"op_per_level_percent", "stat_ops", "ops 3 and 5: percent per level",
+	 0x3DCCF4u, "664183FF06731D", "664183FF069090",
+	 nullptr, {0,0,0,0}, 0},
+	{"op_add", "stat_ops", "ops 2, 4 and 6: the add",
+	 0x3DCD05u, "664183FF060F82CFF8FFFF", "664183FF06E9D0F8FFFF90",
+	 nullptr, {0,0,0,0}, 0},
+};
+constexpr size_t kCoreSiteCount = sizeof(kCoreSites) / sizeof(kCoreSites[0]);
+
+
 const char* const kTraceLabel[4] = {"in", "scaled", "raw64", "applied"};
 
 struct Group {
 	const char* name;
 	bool        enabled;
+	bool        defaultOn;
 };
 
 Group g_groups[] = {
-	{"formula_evaluator", true},
-	{"skill_elemental", true},
-	{"skill_physical", true},
-	{"damage_roller", true},
-	{"missile_getters", true},
-	{"missile_init_elemental", true},
-	{"missile_elemental", true},
-	{"srcdam_scaling", true},
-	{"server_srcdam", true},
-	{"elem_accumulate", true},
-	{"stat_ops", true},
-	{"melee_elemental", true},
-	{"melee_physical", true},
-	{"missile_physical", true},
-	{"missile_srcdam", true},
-	{"stat_write_watch", true},
+	{"formula_evaluator", true, true},
+	{"skill_elemental", true, true},
+	{"skill_physical", true, true},
+	{"damage_roller", true, true},
+	{"missile_getters", true, true},
+	{"missile_init_elemental", true, true},
+	{"missile_elemental", true, true},
+	{"srcdam_scaling", true, true},
+	{"server_srcdam", true, true},
+	{"elem_accumulate", true, true},
+	{"stat_ops", true, true},
+	{"melee_elemental", true, true},
+	{"melee_physical", true, true},
+	{"missile_physical", true, true},
+	{"missile_srcdam", true, true},
+	{"resist_apply", true, true},
+	{"hit_total", true, true},
+	{"conversion", true, true},
+	{"hit_report", true, true},
+	{"debug_log", true, true},
+	{"leech", true, true},
+	{"stat_write_watch", false, false},
 };
 
 constexpr const char* kDefaultConfig =
@@ -549,7 +757,36 @@ constexpr const char* kDefaultConfig =
 	"# Damage Overflow Fix for Diablo II: Resurrected 3.3\n"
 	"# Port of the Eastern Sun Resurrected 2.4 damage overflow patch set.\n"
 	"#\n"
-	"# WHAT IS BROKEN IN THE GAME\n"
+	"# 2.4.0:\n"
+	"#   - missile_percent: a missile's physical damage on impact. The missile\n"
+	"#     carries your weapon damage (srcdam already applied) and your damage\n"
+	"#     percent separately; on impact sub_140465420 multiplies the two in 32\n"
+	"#     bits. 20,003 x 2030% wrapped twice and landed about 90K instead of 426K.\n"
+	"#\n"
+	"# 2.3.1:\n"
+	"#   - debug log: a missile record shows the srcdam stored in the missile's\n"
+	"#     damage block (+48h); the creator's fourth argument is a flag, not srcdam\n"
+	"#\n"
+	"# 2.3.0:\n"
+	"#   - new group debug_log: a text file with everything about every hit a\n"
+	"#     player lands and every missile a player creates (see Debug log below)\n"
+	"#   - console command  dmgoverflow log : where the file is, how many records\n"
+	"#\n"
+	"# 2.2.0:\n"
+	"#   - hit_total also fixes the melee kill check (kill_check), a second 32-bit\n"
+	"#     sum of the same six damage types\n"
+	"#   - new group conversion: physical converted to an element no longer wraps\n"
+	"#     the element it is added to\n"
+	"#   - new group hit_report and the console command  dmgoverflow hit : one hit\n"
+	"#     shows every damage type going into and coming out of the resistance step,\n"
+	"#     the hit's total and the target's damage reduction, resistances and absorb\n"
+	"#\n"
+	"# 2.1.0, for D2RLoader 1.3.1:\n"
+	"#   - stat_ops now patches D2RCore.dll, where 1.3.1 runs the whole stat engine.\n"
+	"#     The copy in the game image that 2.0.2 patched is never called.\n"
+	"#   - three new groups: resist_apply, hit_total and leech\n"
+	"#   - stat_write_watch is off by default\n"
+	"## WHAT IS BROKEN IN THE GAME\n"
 	"#\n"
 	"# Almost everywhere D2R scales a damage value by a percentage it runs\n"
 	"#     result = value + value * percent / 100\n"
@@ -689,32 +926,32 @@ constexpr const char* kDefaultConfig =
 	"#   elem_accum_04 0x3C090E lightning max elem_accum_08 0x3C0966 cold max\n"
 	"elem_accumulate = true\n"
 	"\n"
-	"# itemstatcost op processor, percent layers (2 sites).\n"
-	"# HIGHEST BLAST RADIUS GROUP. This sits under EVERY stat in the game, not just\n"
-	"# damage. sub_1402F8AD0 applies each stat's op slots, and ops 1 and 11 are the\n"
-	"# percent layers: op 11 is the character-wide multiplier that masteries and the\n"
-	"# total damage percents use. Both the multiply and the accumulate into the\n"
-	"# running total were 32-bit, which is how a damage stat can come back from the\n"
-	"# stat getter already negative, before any damage code touches it.\n"
+	"# itemstatcost op processor (7 sites, in D2RCore.dll).\n"
+	"# HIGHEST BLAST RADIUS GROUP. Every stat in the game goes through it, not just\n"
+	"# damage. Under D2RLoader 1.3.1 the stat engine lives in D2RCore.dll; the game\n"
+	"# image copy (sub_1402F8AD0) that 2.0.2 patched is never called.\n"
 	"#\n"
-	"# In 2.4 the elemental damage stats were hardcoded and never went through this\n"
-	"# function, which is why saturation in the damage pipeline alone was enough\n"
-	"# there and is not enough here.\n"
+	"# D2RCore already computes life, max life, mana, max mana, stamina and max\n"
+	"# stamina in 64-bit with a cap. Every other stat, including all damage stats,\n"
+	"# the damage percents and the masteries, kept Blizzard's 32-bit math, so a\n"
+	"# stat can come back negative or as garbage before any damage code reads it.\n"
 	"#\n"
-	"# Turn this group off on its own first if anything unrelated to damage starts\n"
-	"# behaving oddly.\n"
-	"# ops_sum_init / ops_sublist_sum / ops_sum_finish are the base total itself: the\n"
-	"# op processor sums a stat across every equipped item and sub-list with a 32-bit\n"
-	"# add before any op runs. These three MUST be enabled or disabled together. The\n"
-	"# loop is widened to 64-bit at the top, accumulates with no clamp, and saturates\n"
-	"# exactly once after the last source. Clamping inside the loop is wrong: the\n"
-	"# original relies on wrap-around so that an intermediate overflow and a later\n"
-	"# negative contribution cancel, and a mid-loop clamp destroys that.\n"
-	"#   ops_sum_init      0x2F8B83\n"
-	"#   ops_sublist_sum   0x2F8BD2\n"
-	"#   ops_sum_finish    0x2F8BE7\n"
-	"#   ops_percent_op1   0x2F8D2B\n"
-	"#   ops_percent_op11  0x2F96DA\n"
+	"#   stat_sum              D2RCore 0x3DC493  a stat added up over every item,\n"
+	"#                         skill and state list. Now summed in 64-bit and capped\n"
+	"#                         once at the end, so an overflow that a later negative\n"
+	"#                         value cancels still works exactly as before.\n"
+	"#   op_percent            D2RCore 0x3DC89D  ops 1, 11 and 13\n"
+	"#   op_time_percent       D2RCore 0x3DC990  op 7\n"
+	"#   op_per_attribute      D2RCore 0x3DCA1F  ops 8 and 9\n"
+	"#   op_per_level          D2RCore 0x3DCC90  ops 2 to 5\n"
+	"#   op_per_level_percent  D2RCore 0x3DCCF4  ops 3 and 5\n"
+	"#   op_add                D2RCore 0x3DCD05  ops 2, 4 and 6, the add\n"
+	"#\n"
+	"# The six op sites send every stat down the branches D2RCore already uses for\n"
+	"# life and mana: the same formulas widened, identical below the int32 limit and\n"
+	"# capped above it. The whole D2RCore function is checked byte for byte before\n"
+	"# anything is written, and the bytes are put back when the plugin unloads.\n"
+	"# Keep all seven on or off together.\n"
 	"stat_ops = true\n"
 	"\n"
 	"# Melee damage builder, elemental stat to 256ths conversion (21 sites).\n"
@@ -730,11 +967,17 @@ constexpr const char* kDefaultConfig =
 	"# earlier: 21/22 one-handed, 23/24 two-handed-in-both-hands.\n"
 	"melee_physical = true\n"
 	"\n"
-	"# Missile physical damage builder (5 sites).\n"
+	"# Missile physical damage (6 sites).\n"
 	"# sub_1403BF9B0, a separate routine: the weapon min/max shift, the bare-handed\n"
 	"# pair, and the fold of missiles.txt MinDamage with the SrcDamage-scaled weapon\n"
 	"# damage into the missile damage struct. Stat set by weapon kind: 159/160\n"
 	"# throwing, 23/24 two-handed, else 21/22. These sites record for  trace.\n"
+	"# On impact, sub_140465420 rolls that damage and adds roll x percent / 100,\n"
+	"# where percent is the missile's damagepercent (stat 25, your enhanced damage\n"
+	"# and other bonuses, stamped at creation) plus the demon, undead and monster\n"
+	"# type bonuses. The multiply was 32-bit; missile_percent does it in 64 bits\n"
+	"# with the same rounding and caps the result.\n"
+	"#   missile_percent  0x465A13\n"
 	"missile_physical = true\n"
 	"\n"
 	"# SrcDamage-gated sites (4). THIS GROUP IS MISSILE-ONLY BY CONSTRUCTION.\n"
@@ -758,11 +1001,93 @@ constexpr const char* kDefaultConfig =
 	"#     (physical, fire, lightning, magic, cold, poison) in 32-bit\n"
 	"missile_srcdam = true\n"
 	"\n"
-	"# Stat write watch (1 site, read only, changes no behaviour).\n"
+	"# Resistance step (1 site).\n"
+	"# The game applies each damage type's resistance as\n"
+	"#     damage x (100 - resistance) / 100\n"
+	"# Below zero resistance the multiplier passes 100 (1100 at -1000), and above\n"
+	"# 4,096 displayed damage the game takes the 32-bit branch\n"
+	"#     (damage / 100) x multiplier\n"
+	"# which wraps once the result passes 8,388,607 displayed: about 762,000 damage\n"
+	"# of one type at -1000 resistance, about 4,194,000 at -100. The replacement\n"
+	"# keeps every branch and its rounding, in 64-bit, capped at the int32 limit.\n"
+	"#   resist_scale  0x452557 .. 0x452613   (sub_1404523E0)\n"
+	"resist_apply = true\n"
+	"\n"
+	"# Total life damage of a hit (1 site).\n"
+	"# sub_14044DF10 adds physical, fire, lightning, cold, magic and poison into the\n"
+	"# hit's life damage with plain 32-bit adds (0x44EC71), then adds a monster\n"
+	"# attacker's life drain (0x44ECAF). Every type is capped at 8,388,607 displayed\n"
+	"# on its own, but two of them together still wrap: two capped types add up to\n"
+	"# exactly -2 and the hit deals nothing.\n"
+	"# poison-immunity-state, shrine-rework and bleed-damage together patch or check\n"
+	"# every byte from 0x44EC71 to 0x44ECBC, so the adds stay as they are. At the\n"
+	"# end of the function (0x44ECBD) this site rebuilds the exact total: the 32-bit\n"
+	"# result carries the low 32 bits, the six types and the drain give the rest.\n"
+	"# The total is stored capped at 8,388,607 displayed. Poison that\n"
+	"# poison-immunity-state leaves out of the total stays left out.\n"
+	"#   hit_total  0x44ECBD\n"
+	"# The melee path checks for a kill with its own 32-bit sum of the same types\n"
+	"# (sub_14044B600); kill_check makes that sum 64-bit with the same cap, so a\n"
+	"# killing blow is flagged as one.\n"
+	"#   kill_check 0x44B6B1\n"
+	"hit_total = true\n"
+	"\n"
+	"# Physical converted to an element (1 site).\n"
+	"# A skill or item that turns part of the physical damage into fire, lightning,\n"
+	"# magic, cold or poison adds the converted part to that element with a plain\n"
+	"# 32-bit add (sub_14044C030). An element already near the cap wrapped negative.\n"
+	"#   convert_add  0x44CCDF\n"
+	"conversion = true\n"
+	"\n"
+	"# Hit report (1 site, changes no damage).\n"
+	"# Records every damage type going into and coming out of the resistance step\n"
+	"# of each hit a player lands. Read the last one with  dmgoverflow hit .\n"
+	"#   resist_ledger  0x44EC5A\n"
+	"hit_report = true\n"
+	"\n"
+	"# Debug log (2 sites and 1 hook, changes no damage).\n"
+	"# Writes <this plugin's log name>.hits.log next to this plugin's log,\n"
+	"# rewritten at every game start, capped at 256 MB. Damage values are in\n"
+	"# 256ths of a point, with the displayed value in brackets.\n"
+	"# One record per hit a player lands, melee or missile:\n"
+	"#   - the attacker's damage stats as the server reads them (weapon damage,\n"
+	"#     enhanced damage, every element to attacks, the elemental masteries)\n"
+	"#   - every damage roll of the hit with its caller: weapon physical with\n"
+	"#     enhanced damage, each element to attacks with its mastery, and whether\n"
+	"#     it went through the srcdam path; min, max, percent, incoming, result\n"
+	"#   - every overflow-fix site that ran for the hit, with its values (the\n"
+	"#     srcdam sites show the srcdam the hit used)\n"
+	"#   - the damage packet entering the damage reduction, every damage type\n"
+	"#     going into and out of the resistance step, the packet leaving it, and\n"
+	"#     the hit's total life damage\n"
+	"#   - the target's life, damage reduction, resistances and absorb\n"
+	"# One record per missile a player creates: the owner's stats, the srcdam the\n"
+	"# skill passed, the missile's whole damage block as it is stamped onto the\n"
+	"# missile, and the overflow-fix sites that ran while it was built.\n"
+	"# It costs some speed while on: set false, or type  dmgoverflow log off ,\n"
+	"# when done.\n"
+	"#   dbg_build          0x44DFD7\n"
+	"#   dbg_missile        0x537A7F\n"
+	"#   damage roll hook   0x4501E0\n"
+	"debug_log = true\n"
+	"\n"
+	"# Life and mana steal (3 sites).\n"
+	"# sub_140450C90 adds the hit's physical and elemental damage in 32 bits, then\n"
+	"# runs the steal percent and the monster's drain percent through two 32-bit\n"
+	"# branch chains. At high damage the amount wraps negative and the steal\n"
+	"# silently stops working.\n"
+	"#   leech_sum   0x450EBF   physical + fire + lightning + cold + magic\n"
+	"#   leech_mana  0x45103B   mana steal amount\n"
+	"#   leech_life  0x4511C7   life steal amount\n"
+	"leech = true\n"
+	"\n"
+	"# Stat write watch (1 site, read only, changes no behaviour). OFF by default.\n"
 	"# Records per stat id 48-58 the largest and smallest absolute value written,\n"
 	"# the TYPE OF UNIT the statlist belongs to, and who wrote it.\n"
 	"#     dmgoverflow stats / dmgoverflow reset\n"
-	"stat_write_watch = true\n"
+	"# It takes over the game's jump into D2RCore's SetWideListStat at 0x2F3030,\n"
+	"# so it runs on every stat write in the game. Turn it on only to diagnose.\n"
+	"stat_write_watch = false\n"
 	"\n"
 	"\n"
 	"# --------------------------------------------------------------------------\n"
@@ -772,13 +1097,23 @@ constexpr const char* kDefaultConfig =
 	"# Every stub records the four numbers it worked with into a per-site slot.\n"
 	"# In game, the console command reads them back:\n"
 	"#\n"
+	"#   dmgoverflow log      where the debug log file is, how many records it\n"
+	"#                        holds; \"dmgoverflow log off\" / \"on\" stops or resumes it\n"
+	"#   dmgoverflow hit      the last hit a player landed: every damage type going\n"
+	"#                        into the resistance step and coming out of it, the\n"
+	"#                        hit's total life damage, and the target's damage\n"
+	"#                        reduction, resistances and absorb. One hit covers\n"
+	"#                        every damage type at once.\n"
 	"#   dmgoverflow          which sites are active, disabled or byte-mismatched\n"
 	"#   dmgoverflow trace    the last damage / percent / raw 64-bit result /\n"
 	"#                        applied value seen at each site, in 256ths\n"
+	"#                        (stat_sum records the stat's own value, the 64-bit sum\n"
+	"#                        and the stored value, in the stat's own units)\n"
 	"#   dmgoverflow verify   asks D2RLoader's diagnostics service who owns each\n"
 	"#                        patched range. \"UNTRACKED\" means something outside\n"
 	"#                        D2RLoader changed those bytes; a different plugin id\n"
-	"#                        means someone else patched the same place.\n"
+	"#                        means someone else patched the same place. D2RCore\n"
+	"#                        sites are checked directly: \"intact\" or \"CHANGED\".\n"
 	"#\n"
 	"# Nothing extra needs enabling for that, the recording is always on and costs\n"
 	"# four stores per damage calculation.\n"
@@ -957,6 +1292,445 @@ struct WatchSlot {
 WatchSlot g_watch[kWatchCount] = {};
 uintptr_t g_exeBase            = 0;
 
+
+// ---------------------------------------------------------------------------
+// hit report
+//
+// resist_ledger replaces the call at 0x44EC5A with the same call wrapped: it
+// records each of the twelve resistance records of sub_14044DF10 going in and
+// coming out (index = r14d, the loop counter). hit_total then calls
+// DmgOverflowLedgerHit at the end of the function with the packet (r15), the
+// defender (rsi) and the attacker (r13). Hits by players are kept; dmgoverflow
+// hit prints the last one.
+// ---------------------------------------------------------------------------
+
+constexpr size_t  kLedgerRecords = 12;
+constexpr int64_t kLedgerNone    = INT64_MIN;
+const char* const kLedgerName[kLedgerRecords] = {
+	"physical", "fire", "lightning", "cold", "magic", "cold length",
+	"burn length", "poison length", "poison", "life drain", "mana drain", "stamina drain",
+};
+const bool kLedgerIsDamage[kLedgerRecords] = {true, true, true, true, true, false, false, false, true, true, true, true};
+
+constexpr int32_t kDefenderStat[] = {6, 7, 34, 35, 36, 37, 39, 41, 43, 45, 142, 143, 144, 145, 146, 147, 148, 149};
+constexpr size_t  kDefenderStatCount = sizeof(kDefenderStat) / sizeof(kDefenderStat[0]);
+
+volatile int64_t g_ledgerPre[16]  = {};
+volatile int64_t g_ledgerPost[16] = {};
+
+struct HitReport {
+	uint64_t serial;
+	int32_t  attackerClass;
+	int32_t  defenderType;
+	int32_t  defenderClass;
+	int64_t  pre[kLedgerRecords];
+	int64_t  post[kLedgerRecords];
+	int64_t  component[6];
+	int32_t  total;
+	int32_t  hitFlags;
+	int32_t  resultFlags;
+	int32_t  damagePercent;
+	int32_t  damageRate;
+	int32_t  convType;
+	int32_t  convPct;
+	int32_t  stat[kDefenderStatCount];
+	bool     statsRead;
+};
+
+using ReadWideUnitStatFn = uint32_t (*)(const void* unit, uint32_t statId, uint32_t layer);
+
+HitReport          g_hit         = {};
+uint64_t           g_hitSerial   = 0;
+ReadWideUnitStatFn g_readStat    = nullptr;
+bool               g_hitReportOn = true;
+
+void ResetLedger() {
+	for (size_t i = 0; i < 16; ++i) {
+		g_ledgerPre[i]  = kLedgerNone;
+		g_ledgerPost[i] = kLedgerNone;
+	}
+}
+
+const char* UnitTypeName(int32_t t);
+constexpr const char* kPluginVersion = "2.4.0";
+
+// ---------------------------------------------------------------------------
+// debug log
+//
+// One text file next to the plugin log, <plugin id>.hits.log, rewritten at
+// every game start. A record is written for every hit a player lands and for
+// every missile a player creates:
+//   hit:     the attacker's damage stats, every roll the damage build made
+//            (sub_1404501E0 with its caller), the overflow-fix sites that ran
+//            for the hit with their values, the damage packet as it enters
+//            the damage reduction (sub_14044DF10), every damage type going
+//            into and out of the resistance step, the hit's total, and the
+//            target's life, damage reduction, resistances and absorb
+//   missile: the owner's damage stats, the srcdam the creator passed, the
+//            missile's damage block as it is stamped onto the missile
+//            (0x537A7F), and the overflow-fix sites that ran while it was
+//            built
+// ---------------------------------------------------------------------------
+
+constexpr size_t kMaxRolls = 48;
+
+struct RollEvent {
+	uint32_t caller;
+	int32_t  min, max, pmin, pmax, incoming, result;
+};
+
+thread_local RollEvent t_rolls[kMaxRolls];
+thread_local uint32_t  t_rollCount   = 0;
+thread_local uint32_t  t_rollDropped = 0;
+thread_local bool      t_builtValid  = false;
+thread_local int32_t   t_built[0x150 / 4];
+
+bool      g_debugOn      = true;
+HANDLE    g_debugFile    = INVALID_HANDLE_VALUE;
+uint64_t  g_debugBytes   = 0;
+uint64_t  g_debugLimit   = 256ull << 20;
+uint64_t  g_debugRecords = 0;
+bool      g_debugFull    = false;
+SRWLOCK   g_debugLock    = SRWLOCK_INIT;
+wchar_t   g_debugPath[MAX_PATH] = {};
+uintptr_t g_logExeBase   = 0;
+
+using RollerFn = int32_t (*)(void* unit, int32_t min, int32_t max, int32_t pmin, int32_t pmax, int32_t incoming);
+RollerFn g_rollerOriginal = nullptr;
+bool     g_rollerHooked   = false;
+
+// mov [rsp+10h],rbx / mov [rsp+18h],rsi / push rdi / sub rsp,20h
+constexpr uint8_t kRollerEntry[] = {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57, 0x48, 0x83, 0xEC, 0x20};
+constexpr uint64_t kRollerRva = 0x4501E0;
+
+struct StatName {
+	int32_t     id;
+	const char* name;
+};
+constexpr StatName kAttackerStats[] = {
+	{0, "strength"}, {2, "dexterity"}, {12, "level"},
+	{17, "item_maxdamage_percent"}, {18, "item_mindamage_percent"}, {25, "damagepercent"},
+	{21, "mindamage"}, {22, "maxdamage"}, {23, "secondary_mindamage"}, {24, "secondary_maxdamage"},
+	{111, "item_normaldamage"},
+	{48, "firemindam"}, {49, "firemaxdam"}, {315, "firelength"},
+	{50, "lightmindam"}, {51, "lightmaxdam"},
+	{52, "magicmindam"}, {53, "magicmaxdam"},
+	{54, "coldmindam"}, {55, "coldmaxdam"}, {56, "coldlength"},
+	{57, "poisonmindam"}, {58, "poisonmaxdam"}, {59, "poisonlength"}, {326, "poison_count"},
+	{329, "passive_fire_mastery"}, {330, "passive_ltng_mastery"}, {331, "passive_cold_mastery"},
+	{332, "passive_pois_mastery"}, {357, "passive_mag_mastery"},
+	{60, "lifedrainmindam"}, {62, "manadrainmindam"}, {141, "item_deadlystrike"}, {337, "passive_critical_strike"},
+};
+
+struct Text {
+	char   buf[24576];
+	size_t n = 0;
+	void add(const char* fmt, ...) {
+		if (n >= sizeof(buf) - 1) return;
+		va_list ap;
+		va_start(ap, fmt);
+		const int w = vsnprintf(buf + n, sizeof(buf) - n, fmt, ap);
+		va_end(ap);
+		if (w > 0) n = (n + static_cast<size_t>(w) < sizeof(buf)) ? n + static_cast<size_t>(w) : sizeof(buf) - 1;
+	}
+};
+
+double Disp(int64_t v) { return static_cast<double>(v) / 256.0; }
+
+const char* RollCaller(uint32_t rva) {
+	switch (rva) {
+		case 0x44D95E: return "physical: weapon damage with enhanced damage";
+		case 0x44C446: return "fire to attacks (srcdam path)";
+		case 0x44C616: return "fire to attacks";
+		case 0x44C4C5: return "lightning to attacks (srcdam path)";
+		case 0x44C67E: return "lightning to attacks";
+		case 0x44C53D: return "cold to attacks (srcdam path)";
+		case 0x44C6E6: return "cold to attacks";
+		case 0x44C5B5: return "magic to attacks (srcdam path)";
+		case 0x44C74E: return "magic to attacks";
+		case 0x44C7D3: return "life drain";
+		case 0x44C852: return "mana drain";
+		case 0x44C8CB: return "stamina drain";
+		case 0x44CA5D: return "poison to attacks";
+		default: return "other caller";
+	}
+}
+
+void DebugWriteLocked(const char* text, size_t len) {
+	if (g_debugFile == INVALID_HANDLE_VALUE || g_debugFull) return;
+	if (g_debugBytes + len > g_debugLimit) {
+		static const char kFull[] = "\r\n==== log size limit reached, no further records ====\r\n";
+		DWORD w = 0;
+		WriteFile(g_debugFile, kFull, sizeof(kFull) - 1, &w, nullptr);
+		g_debugFull = true;
+		return;
+	}
+	DWORD written = 0;
+	if (WriteFile(g_debugFile, text, static_cast<DWORD>(len), &written, nullptr)) g_debugBytes += written;
+}
+
+void AddStats(Text& t, const char* who, const int32_t* unit) {
+	if (g_readStat == nullptr || unit == nullptr) return;
+	t.add("  %s stats:", who);
+	int col = 0;
+	for (const StatName& s : kAttackerStats) {
+		const int32_t v = static_cast<int32_t>(g_readStat(unit, static_cast<uint32_t>(s.id), 0));
+		if (v == 0) continue;
+		t.add("%s%s(%d)=%d", (col % 4 == 0) ? "\r\n    " : "   ", s.name, s.id, v);
+		++col;
+	}
+	if (col == 0) t.add(" all zero");
+	t.add("\r\n");
+}
+
+// Sites whose trace slots were written since the previous record; the slots
+// are cleared after every record (and after every hit that is not logged), so
+// a record lists what ran for that hit or missile.
+void AddSitesAndClear(Text& t) {
+	bool any = false;
+	for (size_t i = 0; i < kSiteCount; ++i) {
+		Slot& s = g_slot[i];
+		if (s.v[0] == 0 && s.v[1] == 0 && s.v[2] == 0 && s.v[3] == 0) continue;
+		if (!any) t.add("  overflow-fix sites that ran (%s / %s / %s / %s):\r\n", kTraceLabel[0], kTraceLabel[1], kTraceLabel[2], kTraceLabel[3]);
+		any = true;
+		const bool capped = (s.v[2] > 0x7FFFFFFFll) || (s.v[2] < -0x80000000ll);
+		t.add("    %-22s %lld / %lld / %lld / %lld%s\r\n", kSites[i].id, static_cast<long long>(s.v[0]), static_cast<long long>(s.v[1]),
+		      static_cast<long long>(s.v[2]), static_cast<long long>(s.v[3]), capped ? "   <<< capped" : "");
+		s.v[0] = 0;
+		s.v[1] = 0;
+		s.v[2] = 0;
+		s.v[3] = 0;
+	}
+	if (!any) t.add("  overflow-fix sites that ran: none recorded\r\n");
+}
+
+void ClearSites() {
+	for (size_t i = 0; i < kSiteCount; ++i) {
+		for (int k = 0; k < 4; ++k) g_slot[i].v[k] = 0;
+	}
+}
+
+void AddPacket(Text& t, const char* title, const int32_t* p) {
+	const uint8_t* b = reinterpret_cast<const uint8_t*>(p);
+	t.add("  %s:\r\n", title);
+	t.add("    physical %d (%.1f)   fire %d (%.1f)   lightning %d (%.1f)   cold %d (%.1f)   magic %d (%.1f)   poison %d (%.1f)\r\n",
+	      p[0x18 / 4], Disp(p[0x18 / 4]), p[0x20 / 4], Disp(p[0x20 / 4]), p[0x2C / 4], Disp(p[0x2C / 4]), p[0x34 / 4], Disp(p[0x34 / 4]),
+	      p[0x30 / 4], Disp(p[0x30 / 4]), p[0x38 / 4], Disp(p[0x38 / 4]));
+	t.add("    burn %d   burn length %d   poison length %d   cold length %d   freeze length %d   life/mana/stamina drain %d/%d/%d\r\n",
+	      p[0x24 / 4], p[0x28 / 4], p[0x3C / 4], p[0x118 / 4], p[0x11C / 4], p[0x120 / 4], p[0x124 / 4], p[0x128 / 4]);
+	t.add("    hit flags 0x%X   result 0x%X   damage percent %d   damage rate %d   conversion type %u at %d%%\r\n",
+	      p[0], static_cast<unsigned>(*reinterpret_cast<const uint16_t*>(b + 4)), p[0x1C / 4], p[0x138 / 4],
+	      static_cast<unsigned>(b[0x149]), p[0x14C / 4]);
+}
+
+void WriteHitRecord(const int32_t* packet, const int32_t* defender, const int32_t* attacker) {
+	Text* tp = static_cast<Text*>(HeapAlloc(GetProcessHeap(), 0, sizeof(Text)));
+	if (tp == nullptr) return;
+	Text& t = *tp;
+	t.n = 0;
+	const HitReport& h = g_hit;
+	t.add("\r\n==== hit %llu   tick %lu   attacker player class %d   defender %s %d ====\r\n",
+	      static_cast<unsigned long long>(h.serial), static_cast<unsigned long>(GetTickCount()), attacker[1],
+	      defender ? UnitTypeName(defender[0]) : "none", defender ? defender[1] : -1);
+	AddStats(t, "attacker", attacker);
+	if (t_rollCount == 0) {
+		t.add("  rolls: none (no weapon or elemental roll ran for this hit; a missile carries rolled values)\r\n");
+	} else {
+		t.add("  rolls (256ths; min/max are before the percent, result includes the incoming value):\r\n");
+		for (uint32_t i = 0; i < t_rollCount; ++i) {
+			const RollEvent& e = t_rolls[i];
+			t.add("    %-46s @%06X  min %d (%.1f)  max %d (%.1f)  percent +%d/+%d  incoming %d  ->  %d (%.1f)\r\n", RollCaller(e.caller),
+			      e.caller, e.min, Disp(e.min), e.max, Disp(e.max), e.pmin, e.pmax, e.incoming, e.result, Disp(e.result));
+		}
+		if (t_rollDropped) t.add("    (%u more rolls not kept)\r\n", t_rollDropped);
+	}
+	AddSitesAndClear(t);
+	if (t_builtValid) AddPacket(t, "packet entering the damage reduction (sub_14044DF10)", t_built);
+	else t.add("  packet entering the damage reduction: not captured (dbg_build site inactive)\r\n");
+	t.add("  resistance step (256ths, in -> out; in = after the difficulty percent and absorb handlers):\r\n");
+	for (size_t i = 0; i < kLedgerRecords; ++i) {
+		if (h.pre[i] == kLedgerNone) {
+			t.add("    %-14s not processed\r\n", kLedgerName[i]);
+		} else if (kLedgerIsDamage[i]) {
+			t.add("    %-14s %lld (%.1f) -> %lld (%.1f)\r\n", kLedgerName[i], static_cast<long long>(h.pre[i]), Disp(h.pre[i]),
+			      static_cast<long long>(h.post[i]), Disp(h.post[i]));
+		} else {
+			t.add("    %-14s %lld -> %lld frames\r\n", kLedgerName[i], static_cast<long long>(h.pre[i]), static_cast<long long>(h.post[i]));
+		}
+	}
+	AddPacket(t, "packet leaving the damage reduction", packet);
+	t.add("  total life damage %d (%.1f)\r\n", h.total, Disp(h.total));
+	if (h.statsRead) {
+		const int32_t* s = h.stat;
+		t.add("  defender: life %.1f / %.1f   damage reduction %d   magic damage reduction %d\r\n", Disp(s[0]), Disp(s[1]), s[2], s[3]);
+		t.add("            resist physical %d magic %d fire %d lightning %d cold %d poison %d\r\n", s[4], s[5], s[6], s[7], s[8], s[9]);
+		t.add("            absorb fire %d%%+%d lightning %d%%+%d magic %d%%+%d cold %d%%+%d\r\n", s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
+	}
+	AcquireSRWLockExclusive(&g_debugLock);
+	DebugWriteLocked(t.buf, t.n);
+	++g_debugRecords;
+	ReleaseSRWLockExclusive(&g_debugLock);
+	HeapFree(GetProcessHeap(), 0, tp);
+}
+
+}  // namespace
+
+extern "C" void DmgOverflowDbgBuilt(const int32_t* packet, const int32_t* defender, const int32_t* attacker) noexcept {
+	(void)defender;
+	if (!g_debugOn || packet == nullptr || attacker == nullptr || attacker[0] != 0) return;
+	memcpy(t_built, packet, sizeof(t_built));
+	t_builtValid = true;
+}
+
+extern "C" void DmgOverflowDbgMissile(const int32_t* owner, const int32_t* missile, const int32_t* block, uint32_t srcDamage) noexcept {
+	if (!g_debugOn || owner == nullptr || owner[0] != 0 || block == nullptr) {
+		ClearSites();
+		return;
+	}
+	Text* tp = static_cast<Text*>(HeapAlloc(GetProcessHeap(), 0, sizeof(Text)));
+	if (tp == nullptr) return;
+	Text& t = *tp;
+	t.n = 0;
+	const int32_t blockSrcDam = block[0x48 / 4];
+	t.add("\r\n==== missile created   tick %lu   owner player class %d   missile class %d   srcdam %d (%d%% of the owner's damage, block +48h)   stamp flag %u ====\r\n",
+	      static_cast<unsigned long>(GetTickCount()), owner[1], missile ? missile[1] : -1, blockSrcDam, blockSrcDam * 100 / 128, srcDamage);
+	AddStats(t, "owner", owner);
+	const int32_t* d = block;
+	t.add("  damage block stamped onto the missile (256ths):\r\n");
+	t.add("    physical %d-%d (%.1f-%.1f)\r\n", d[1], d[2], Disp(d[1]), Disp(d[2]));
+	t.add("    fire %d-%d (%.1f-%.1f) length %d\r\n", d[3], d[4], Disp(d[3]), Disp(d[4]), d[5]);
+	t.add("    lightning %d-%d (%.1f-%.1f)\r\n", d[6], d[7], Disp(d[6]), Disp(d[7]));
+	t.add("    magic %d-%d (%.1f-%.1f)\r\n", d[8], d[9], Disp(d[8]), Disp(d[9]));
+	t.add("    cold %d-%d (%.1f-%.1f) length %d\r\n", d[10], d[11], Disp(d[10]), Disp(d[11]), d[12]);
+	t.add("    poison %d-%d (%.1f-%.1f) length %d count %d\r\n", d[13], d[14], Disp(d[13]), Disp(d[14]), d[15], d[16]);
+	t.add("    raw dwords:");
+	for (int i = 0; i < 32; ++i) t.add("%s%d", (i % 8 == 0) ? "\r\n      " : " ", d[i]);
+	t.add("\r\n");
+	AddSitesAndClear(t);
+	AcquireSRWLockExclusive(&g_debugLock);
+	DebugWriteLocked(t.buf, t.n);
+	++g_debugRecords;
+	ReleaseSRWLockExclusive(&g_debugLock);
+	HeapFree(GetProcessHeap(), 0, tp);
+}
+
+namespace {
+
+int32_t HookedRoller(void* unit, int32_t min, int32_t max, int32_t pmin, int32_t pmax, int32_t incoming) {
+	const int32_t result = g_rollerOriginal(unit, min, max, pmin, pmax, incoming);
+	if (g_debugOn && unit != nullptr && *static_cast<const int32_t*>(unit) == 0) {
+		if (t_rollCount < kMaxRolls) {
+			RollEvent& e = t_rolls[t_rollCount++];
+			e.caller   = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(RETURN_ADDRESS()) - g_logExeBase);
+			e.min      = min;
+			e.max      = max;
+			e.pmin     = pmin;
+			e.pmax     = pmax;
+			e.incoming = incoming;
+			e.result   = result;
+		} else {
+			++t_rollDropped;
+		}
+	}
+	return result;
+}
+
+void CopyWide(wchar_t* dst, size_t cap, const wchar_t* from) {
+	size_t i = 0;
+	if (from != nullptr) {
+		for (; i + 1 < cap && from[i] != 0; ++i) dst[i] = from[i];
+	}
+	dst[i] = 0;
+}
+
+void AppendWide(wchar_t* dst, size_t cap, const wchar_t* tail) {
+	size_t n = 0;
+	while (n < cap && dst[n] != 0) ++n;
+	for (size_t i = 0; tail[i] != 0 && n + 1 < cap; ++i, ++n) dst[n] = tail[i];
+	if (n < cap) dst[n] = 0;
+}
+
+void OpenDebugLog(const D2RL::PluginContext* ctx) {
+	const wchar_t* logPath = ctx->pluginLogPath;
+	g_debugPath[0] = 0;
+	if (logPath != nullptr && logPath[0] != 0) {
+		CopyWide(g_debugPath, MAX_PATH - 16, logPath);
+		size_t len = 0;
+		while (g_debugPath[len] != 0) ++len;
+		if (len > 4 && lstrcmpiW(g_debugPath + len - 4, L".log") == 0) g_debugPath[len - 4] = 0;
+		AppendWide(g_debugPath, MAX_PATH, L".hits.log");
+	} else if (ctx->pluginDirectory != nullptr) {
+		CopyWide(g_debugPath, MAX_PATH - 48, ctx->pluginDirectory);
+		AppendWide(g_debugPath, MAX_PATH, L"\\damage-overflow-fix.hits.log");
+	} else {
+		return;
+	}
+	g_debugFile = CreateFileW(g_debugPath, GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, CREATE_ALWAYS,
+	                          FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (g_debugFile == INVALID_HANDLE_VALUE) {
+		D2RL::LogWarnF(ctx, "debug log: cannot create %ls (error %lu)", g_debugPath, GetLastError());
+		return;
+	}
+	char head[512];
+	const int n = snprintf(head, sizeof(head),
+	    "damage-overflow-fix %s debug log\r\ngame image base 0x%llX\r\n"
+	    "All damage values are 256ths of a point (divide by 256 for displayed damage); the number in brackets is the displayed value.\r\n",
+	    kPluginVersion, static_cast<unsigned long long>(g_logExeBase));
+	AcquireSRWLockExclusive(&g_debugLock);
+	if (n > 0) DebugWriteLocked(head, static_cast<size_t>(n));
+	ReleaseSRWLockExclusive(&g_debugLock);
+}
+
+void CloseDebugLog() {
+	AcquireSRWLockExclusive(&g_debugLock);
+	if (g_debugFile != INVALID_HANDLE_VALUE) {
+		CloseHandle(g_debugFile);
+		g_debugFile = INVALID_HANDLE_VALUE;
+	}
+	ReleaseSRWLockExclusive(&g_debugLock);
+}
+
+}  // namespace
+
+extern "C" void DmgOverflowLedgerHit(const int32_t* packet, const int32_t* defender, const int32_t* attacker) noexcept {
+	if (g_hitReportOn && packet != nullptr && attacker != nullptr && attacker[0] == 0) {
+		HitReport& h    = g_hit;
+		h.serial        = ++g_hitSerial;
+		h.attackerClass = attacker[1];
+		h.defenderType  = defender != nullptr ? defender[0] : -1;
+		h.defenderClass = defender != nullptr ? defender[1] : -1;
+		for (size_t i = 0; i < kLedgerRecords; ++i) {
+			h.pre[i]  = g_ledgerPre[i];
+			h.post[i] = g_ledgerPost[i];
+		}
+		const int32_t at[6] = {0x18, 0x20, 0x2C, 0x30, 0x34, 0x38};
+		for (size_t i = 0; i < 6; ++i) h.component[i] = packet[at[i] / 4];
+		h.total         = packet[0x134 / 4];
+		h.hitFlags      = packet[0];
+		h.resultFlags   = static_cast<int32_t>(*reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(packet) + 4));
+		h.damagePercent = packet[0x1C / 4];
+		h.damageRate    = packet[0x138 / 4];
+		h.convType      = *(reinterpret_cast<const uint8_t*>(packet) + 0x149);
+		h.convPct       = packet[0x14C / 4];
+		h.statsRead     = false;
+		if (defender != nullptr && g_readStat != nullptr) {
+			for (size_t i = 0; i < kDefenderStatCount; ++i) {
+				h.stat[i] = static_cast<int32_t>(g_readStat(defender, static_cast<uint32_t>(kDefenderStat[i]), 0));
+			}
+			h.statsRead = true;
+		}
+		if (g_debugOn) WriteHitRecord(packet, defender, attacker);
+	} else if (g_debugOn) {
+		ClearSites();
+	}
+	t_rollCount   = 0;
+	t_rollDropped = 0;
+	t_builtValid  = false;
+	ResetLedger();
+}
+
+namespace {
+
 }  // namespace
 
 extern "C" void DmgOverflowStatWatch(uint32_t statId, int32_t value, uint64_t statlist, uint64_t retAddr) noexcept {
@@ -1100,6 +1874,25 @@ bool ApplySite(const D2RL::PluginContext* ctx, size_t index) {
 		memcpy(stub + site.traceAt[k], &target, sizeof(target));
 	}
 
+	// Fill the absolute addresses a stub needs.
+	for (int k = 0; k < 3; ++k) {
+		if (site.fixAt[k] == 0) continue;
+		uint64_t value = 0;
+		switch (site.fixKind[k]) {
+			case 1: value = static_cast<uint64_t>(ctx->exeBase) + site.fixRva; break;
+			case 2: value = reinterpret_cast<uint64_t>(&g_ledgerPre[0]); break;
+			case 3: value = reinterpret_cast<uint64_t>(&g_ledgerPost[0]); break;
+			case 4: value = reinterpret_cast<uint64_t>(&DmgOverflowLedgerHit); break;
+			case 5: value = reinterpret_cast<uint64_t>(&DmgOverflowDbgBuilt); break;
+			case 6: value = reinterpret_cast<uint64_t>(&DmgOverflowDbgMissile); break;
+			default:
+				g_state[index] = State::Failed;
+				D2RL::LogErrorF(ctx, "[%s] bad fixup table entry", site.id);
+				return false;
+		}
+		memcpy(stub + site.fixAt[k], &value, sizeof(value));
+	}
+
 	// Point a call stub at the plugin function it is meant to reach.
 	if (site.callAt != 0) {
 		const uint64_t fn = reinterpret_cast<uint64_t>(&DmgOverflowStatWatch);
@@ -1147,6 +1940,153 @@ bool ApplySite(const D2RL::PluginContext* ctx, size_t index) {
 }
 
 // ---------------------------------------------------------------------------
+// D2RCore patching. The loader only tracks and reverts patches in the game
+// image, so these are checked, written, read back and put back by hand.
+// ---------------------------------------------------------------------------
+
+constexpr size_t   kCoreBlockSize = 0x1000;
+constexpr uint32_t kCoreMaxWindow = 16;
+
+State     g_coreState[kCoreSiteCount]                   = {};
+Slot      g_coreSlot[kCoreSiteCount]                    = {};
+uint8_t*  g_coreAt[kCoreSiteCount]                      = {};
+uint8_t   g_coreSaved[kCoreSiteCount][kCoreMaxWindow]   = {};
+uint8_t   g_coreWritten[kCoreSiteCount][kCoreMaxWindow] = {};
+uint32_t  g_coreLen[kCoreSiteCount]                     = {};
+uintptr_t g_coreBase                                    = 0;
+uint8_t*  g_coreBlock                                   = nullptr;
+size_t    g_coreUsed                                    = 0;
+
+bool IsReadable(const void* address, size_t size) {
+	MEMORY_BASIC_INFORMATION info = {};
+	if (VirtualQuery(address, &info, sizeof(info)) == 0 || info.State != MEM_COMMIT ||
+	    (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+		return false;
+	}
+	const uintptr_t end = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
+	return reinterpret_cast<uintptr_t>(address) + size <= end;
+}
+
+bool WriteCode(uint8_t* at, const uint8_t* bytes, size_t size) {
+	DWORD previous = 0;
+	if (!VirtualProtect(at, size, PAGE_EXECUTE_READWRITE, &previous)) return false;
+	memcpy(at, bytes, size);
+	DWORD ignored = 0;
+	VirtualProtect(at, size, previous, &ignored);
+	FlushInstructionCache(GetCurrentProcess(), at, size);
+	return memcmp(at, bytes, size) == 0;
+}
+
+// The whole of D2RCore 0x3DC2D0 must be the D2RLoader 1.3.1 code before any of
+// its bytes are touched: the gates only make sense with the branches they send
+// every stat to, and the sum stub replays the original loop.
+bool CoreAnchorMatches() {
+	static uint8_t anchor[kCoreAnchorSize];
+	if (HexDecode(kCoreAnchorHex, anchor, sizeof(anchor)) != kCoreAnchorSize) return false;
+	const auto* at = reinterpret_cast<const uint8_t*>(g_coreBase + kCoreAnchorRva);
+	return IsReadable(at, kCoreAnchorSize) && memcmp(at, anchor, kCoreAnchorSize) == 0;
+}
+
+bool ApplyCoreSite(const D2RL::PluginContext* ctx, size_t index) {
+	const CoreSite& site = kCoreSites[index];
+
+	uint8_t        expected[kCoreMaxWindow];
+	const uint32_t size = HexDecode(site.expectedHex, expected, sizeof(expected));
+	if (size < 2) {
+		g_coreState[index] = State::Failed;
+		D2RL::LogErrorF(ctx, "[%s] bad D2RCore table entry", site.id);
+		return false;
+	}
+
+	uint8_t* const at = reinterpret_cast<uint8_t*>(g_coreBase + site.rva);
+	if (!IsReadable(at, size) || memcmp(at, expected, size) != 0) {
+		g_coreState[index] = State::Mismatch;
+		D2RL::LogWarnF(ctx, "[%s] D2RCore+0x%06X is not what D2RLoader 1.3.1 has there, site skipped", site.id, site.rva);
+		return false;
+	}
+
+	if (g_dryRun) {
+		g_coreState[index] = State::Applied;
+		if (g_verbose) D2RL::LogInfoF(ctx, "[dry-run] %-22s D2RCore+0x%06X  %s", site.id, site.rva, site.doc);
+		return true;
+	}
+
+	uint8_t patch[kCoreMaxWindow];
+	if (site.stubHex == nullptr) {
+		if (site.patchHex == nullptr || HexDecode(site.patchHex, patch, sizeof(patch)) != size) {
+			g_coreState[index] = State::Failed;
+			D2RL::LogErrorF(ctx, "[%s] bad D2RCore patch entry", site.id);
+			return false;
+		}
+	} else {
+		const uint32_t stubSize = HexLength(site.stubHex);
+		if (size < 5 || g_coreBlock == nullptr || g_coreUsed + stubSize + 14u + 16u > kCoreBlockSize) {
+			g_coreState[index] = State::NoRoom;
+			D2RL::LogErrorF(ctx, "[%s] no room for the D2RCore stub", site.id);
+			return false;
+		}
+		uint8_t* const stub = g_coreBlock + g_coreUsed;
+		if (HexDecode(site.stubHex, stub, static_cast<uint32_t>(kCoreBlockSize - g_coreUsed)) != stubSize) {
+			g_coreState[index] = State::Failed;
+			D2RL::LogErrorF(ctx, "[%s] bad D2RCore stub entry", site.id);
+			return false;
+		}
+		for (int k = 0; k < 4; ++k) {
+			if (site.traceAt[k] == 0) continue;
+			const uint64_t target = reinterpret_cast<uint64_t>(&g_coreSlot[index].v[k]);
+			memcpy(stub + site.traceAt[k], &target, sizeof(target));
+		}
+		// jmp qword [rip+0] / dq resume: back into D2RCore wherever it was loaded
+		uint8_t* const tail   = stub + stubSize;
+		const uint64_t resume = static_cast<uint64_t>(g_coreBase + site.exitRva);
+		tail[0]               = 0xFF;
+		tail[1]               = 0x25;
+		memset(tail + 2, 0, 4);
+		memcpy(tail + 6, &resume, sizeof(resume));
+
+		const int64_t rel = static_cast<int64_t>(reinterpret_cast<uintptr_t>(stub)) -
+		                    static_cast<int64_t>(reinterpret_cast<uintptr_t>(at) + 5);
+		if (!Rel32Fits(rel)) {
+			g_coreState[index] = State::NoRoom;
+			D2RL::LogErrorF(ctx, "[%s] the D2RCore stub is out of jump range", site.id);
+			return false;
+		}
+		memset(patch, 0x90, size);
+		const int32_t rel32 = static_cast<int32_t>(rel);
+		patch[0]            = 0xE9;
+		memcpy(patch + 1, &rel32, sizeof(rel32));
+		FlushInstructionCache(GetCurrentProcess(), stub, stubSize + 14u);
+		g_coreUsed += stubSize + 14u;
+		while ((g_coreUsed & 15u) != 0 && g_coreUsed < kCoreBlockSize) g_coreBlock[g_coreUsed++] = 0xCC;
+	}
+
+	memcpy(g_coreSaved[index], expected, size);
+	memcpy(g_coreWritten[index], patch, size);
+	g_coreLen[index] = size;
+	if (!WriteCode(at, patch, size)) {
+		const bool back    = WriteCode(at, expected, size);
+		g_coreState[index] = State::Failed;
+		D2RL::LogErrorF(ctx, "[%s] the D2RCore write did not read back; %s", site.id,
+		                back ? "the original bytes were put back" : "putting the original bytes back failed too");
+		return false;
+	}
+	g_coreAt[index]    = at;
+	g_coreState[index] = State::Applied;
+	if (g_verbose) D2RL::LogInfoF(ctx, "%-22s D2RCore+0x%06X  %s", site.id, site.rva, site.doc);
+	return true;
+}
+
+// Puts back every D2RCore window this plugin wrote, if it still holds our bytes.
+void RestoreCoreSites() {
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		uint8_t* const at = g_coreAt[i];
+		if (at == nullptr) continue;
+		if (memcmp(at, g_coreWritten[i], g_coreLen[i]) == 0) WriteCode(at, g_coreSaved[i], g_coreLen[i]);
+		g_coreAt[i] = nullptr;
+	}
+}
+
+// ---------------------------------------------------------------------------
 // console
 // ---------------------------------------------------------------------------
 
@@ -1164,9 +2104,15 @@ void ReportStatus(const D2RL::PluginContext* plugin) {
 	for (size_t i = 0; i < kSiteCount; ++i) {
 		if (g_state[i] == State::Applied) ++applied;
 	}
-	Say(plugin, "damage-overflow-fix%s: %d of %zu sites active", g_dryRun ? " (dry run)" : "", applied, kSiteCount);
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		if (g_coreState[i] == State::Applied) ++applied;
+	}
+	Say(plugin, "damage-overflow-fix%s: %d of %zu sites active", g_dryRun ? " (dry run)" : "", applied, kSiteCount + kCoreSiteCount);
 	for (size_t i = 0; i < kSiteCount; ++i) {
-		Say(plugin, "  %-22s 0x%06X  %-13s  %s", kSites[i].id, kSites[i].rva, StateName(g_state[i]), kSites[i].group);
+		Say(plugin, "  %-22s 0x%06X          %-13s  %s", kSites[i].id, kSites[i].rva, StateName(g_state[i]), kSites[i].group);
+	}
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		Say(plugin, "  %-22s D2RCore+0x%06X  %-13s  %s", kCoreSites[i].id, kCoreSites[i].rva, StateName(g_coreState[i]), kCoreSites[i].group);
 	}
 }
 
@@ -1187,6 +2133,16 @@ void ReportTrace(const D2RL::PluginContext* plugin) {
 		    kTraceLabel[3], static_cast<long long>(s.v[3]),
 		    bad ? "   <<< bad input or saturated" : "");
 	}
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		if (g_coreState[i] != State::Applied || kCoreSites[i].stubHex == nullptr) continue;
+		const Slot& s = g_coreSlot[i];
+		if (s.v[0] == 0 && s.v[2] == 0 && s.v[3] == 0) continue;
+		any = true;
+		const bool capped = (s.v[2] > 0x7FFFFFFFll) || (s.v[2] < -0x80000000ll);
+		Say(plugin, "  %-22s own=%lld  sum64=%lld  stored=%lld%s", kCoreSites[i].id,
+		    static_cast<long long>(s.v[0]), static_cast<long long>(s.v[2]), static_cast<long long>(s.v[3]),
+		    capped ? "   <<< capped" : "");
+	}
 	if (!any) Say(plugin, "  nothing recorded yet, land a hit first");
 }
 
@@ -1202,7 +2158,7 @@ void ReportVerify(const D2RL::PluginContext* plugin) {
 	for (size_t i = 0; i < kSiteCount; ++i) {
 		if (g_state[i] != State::Applied || g_dryRun) continue;
 
-		uint8_t        expected[64];
+		uint8_t        expected[MaxWindowBytes];
 		const uint32_t size = HexDecode(kSites[i].expectedHex, expected, sizeof(expected));
 
 		D2RL::Diagnostics::HookQuery query = {};
@@ -1224,8 +2180,53 @@ void ReportVerify(const D2RL::PluginContext* plugin) {
 		Say(plugin, "  %-22s %-10s owners=%u %s", kSites[i].id, state, status.ownerCount,
 		    status.ownerPluginId[0] != '\0' ? status.ownerPluginId : "");
 	}
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		if (g_coreState[i] != State::Applied || g_coreAt[i] == nullptr) continue;
+		const bool intact = memcmp(g_coreAt[i], g_coreWritten[i], g_coreLen[i]) == 0;
+		Say(plugin, "  %-22s D2RCore %s", kCoreSites[i].id, intact ? "intact" : "CHANGED by someone else");
+	}
 }
 
+
+void ReportHit(const D2RL::PluginContext* plugin) {
+	const HitReport& h = g_hit;
+	if (h.serial == 0) {
+		Say(plugin, "no player hit recorded yet%s", g_hitReportOn ? "; hit something" : " (hit_report is off)");
+		return;
+	}
+	Say(plugin, "last player hit (#%llu), attacker class %d, defender %s %d", static_cast<unsigned long long>(h.serial),
+	    h.attackerClass, UnitTypeName(h.defenderType), h.defenderClass);
+	Say(plugin, "  displayed damage (256ths / 256). 'in' = reaching the resistance step, after the");
+	Say(plugin, "  damage build, the difficulty percent and absorb handlers; 'out' = after damage");
+	Say(plugin, "  reduction, resistance and absorb.");
+	for (size_t i = 0; i < kLedgerRecords; ++i) {
+		if (h.pre[i] == kLedgerNone) {
+			Say(plugin, "  %-14s not processed", kLedgerName[i]);
+			continue;
+		}
+		if (kLedgerIsDamage[i]) {
+			Say(plugin, "  %-14s in %14.1f   out %14.1f", kLedgerName[i], static_cast<double>(h.pre[i]) / 256.0,
+			    static_cast<double>(h.post[i]) / 256.0);
+		} else {
+			Say(plugin, "  %-14s in %10lld frames   out %10lld frames", kLedgerName[i], static_cast<long long>(h.pre[i]),
+			    static_cast<long long>(h.post[i]));
+		}
+	}
+	Say(plugin, "  total life damage of the hit %.1f", static_cast<double>(h.total) / 256.0);
+	Say(plugin, "  packet: damage percent %d, damage rate %d, conversion type %d at %d%%, hit flags 0x%X, result 0x%X",
+	    h.damagePercent, h.damageRate, h.convType, h.convPct, h.hitFlags, h.resultFlags);
+	if (!h.statsRead) {
+		Say(plugin, "  defender stats unavailable (ReadWideUnitStat not found in D2RCore)");
+		return;
+	}
+	const int32_t* s = h.stat;
+	Say(plugin, "  defender life before the hit %.1f of %.1f", static_cast<double>(s[0]) / 256.0, static_cast<double>(s[1]) / 256.0);
+	Say(plugin, "  defender damage reduction %d, magic damage reduction %d (flat, subtracted before resistance)", s[2], s[3]);
+	Say(plugin, "  defender resist: physical %d, magic %d, fire %d, lightning %d, cold %d, poison %d (stat values)",
+	    s[4], s[5], s[6], s[7], s[8], s[9]);
+	Say(plugin, "  defender absorb: fire %d%% + %d, lightning %d%% + %d, magic %d%% + %d, cold %d%% + %d",
+	    s[10], s[11], s[12], s[13], s[14], s[15], s[16], s[17]);
+}
 
 void SayAddr(const D2RL::PluginContext* plugin, const char* label, uint64_t ret, int32_t value, int32_t owner) {
 	const uint64_t rva = ret - static_cast<uint64_t>(g_exeBase);
@@ -1275,7 +2276,17 @@ D2RL::ConsoleCommandResult OnCommand(D2R::Game::Client*, const D2RL::ConsoleComm
 	const char* args = (cmd->args != nullptr) ? cmd->args : "";
 	while (*args == ' ') ++args;
 
-	if (strncmp(args, "trace", 5) == 0) {
+	if (strncmp(args, "hit", 3) == 0) {
+		ReportHit(cmd->plugin);
+	} else if (strncmp(args, "log", 3) == 0) {
+		const char* rest = args + 3;
+		while (*rest == ' ') ++rest;
+		if (strncmp(rest, "off", 3) == 0) g_debugOn = false;
+		else if (strncmp(rest, "on", 2) == 0) g_debugOn = (g_debugFile != INVALID_HANDLE_VALUE);
+		Say(cmd->plugin, "debug log %s: %ls", g_debugOn ? "on" : "off", g_debugPath[0] ? g_debugPath : L"(not opened)");
+		Say(cmd->plugin, "  %llu record(s), %llu byte(s) written%s; damage roll hook %s", static_cast<unsigned long long>(g_debugRecords),
+		    static_cast<unsigned long long>(g_debugBytes), g_debugFull ? ", size limit reached" : "", g_rollerHooked ? "installed" : "not installed");
+	} else if (strncmp(args, "trace", 5) == 0) {
 		ReportTrace(cmd->plugin);
 	} else if (strncmp(args, "stats", 5) == 0) {
 		ReportStats(cmd->plugin);
@@ -1285,7 +2296,7 @@ D2RL::ConsoleCommandResult OnCommand(D2R::Game::Client*, const D2RL::ConsoleComm
 		ReportVerify(cmd->plugin);
 	} else {
 		ReportStatus(cmd->plugin);
-		Say(cmd->plugin, "  try: dmgoverflow stats | trace | reset | verify");
+		Say(cmd->plugin, "  try: dmgoverflow hit | log [on|off] | trace | verify | stats | reset");
 	}
 	return D2RL::ConsoleCommandResult::Handled;
 }
@@ -1300,9 +2311,9 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderGetPluginInfo() noexcept -> const D2RL::PluginI
 		.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 		.id          = kPluginId,
 		.name        = "Damage Overflow Fix",
-		.version     = "2.0.2",
+		.version     = kPluginVersion,
 		.author      = "CelestialRayOne",
-		.description = "Runs D2R's damage percent and SrcDam scaling in 64-bit with saturation so high damage stops wrapping to zero. Records what it sees at every site for the dmgoverflow console command.",
+		.description = "Runs D2R's damage, resistance, hit total, life/mana steal and stat op math in 64-bit with saturation so high damage stops wrapping to zero. Records what it sees at every site for the dmgoverflow console command.",
 		.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
 	};
 	return &info;
@@ -1323,8 +2334,15 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* ctx) noex
 	}
 
 	g_dryRun  = ReadBool(toml, "dry_run", false);
+	ResetLedger();
 	g_verbose = ReadBool(toml, "log_each_site", true);
-	for (size_t i = 0; i < kGroupCount; ++i) g_groups[i].enabled = ReadBool(toml, g_groups[i].name, true);
+	for (size_t i = 0; i < kGroupCount; ++i) g_groups[i].enabled = ReadBool(toml, g_groups[i].name, g_groups[i].defaultOn);
+	g_hitReportOn = GroupEnabled("hit_report");
+	g_logExeBase  = static_cast<uintptr_t>(ctx->exeBase);
+	g_debugOn     = GroupEnabled("debug_log") && !g_dryRun;
+	if (const HMODULE coreModule = GetModuleHandleW(kCoreModule)) {
+		g_readStat = reinterpret_cast<ReadWideUnitStatFn>(reinterpret_cast<void*>(GetProcAddress(coreModule, "ReadWideUnitStat")));
+	}
 	ReadList(toml, "only_sites", g_only, sizeof(g_only));
 	ReadList(toml, "skip_sites", g_skip, sizeof(g_skip));
 
@@ -1351,8 +2369,61 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* ctx) noex
 		if (ApplySite(ctx, i)) ++applied; else ++failed;
 	}
 
+	bool coreWanted[kCoreSiteCount] = {};
+	bool anyCore                    = false;
+	for (size_t i = 0; i < kCoreSiteCount; ++i) {
+		const CoreSite& site = kCoreSites[i];
+		coreWanted[i]        = (g_only[0] != '\0') ? ListHas(g_only, site.id)
+		                                           : (GroupEnabled(site.group) && !ListHas(g_skip, site.id));
+		if (coreWanted[i]) {
+			anyCore = true;
+		} else {
+			g_coreState[i] = State::Disabled;
+			++skipped;
+		}
+	}
+	if (anyCore) {
+		const HMODULE core   = GetModuleHandleW(kCoreModule);
+		g_coreBase           = reinterpret_cast<uintptr_t>(core);
+		const char* refuse   = nullptr;
+		State       refusal  = State::Mismatch;
+		if (core == nullptr) {
+			refuse  = "D2RCore.dll is not loaded";
+			refusal = State::Failed;
+		} else if (!CoreAnchorMatches()) {
+			refuse = "D2RCore's stat function 0x3DC2D0 is not the D2RLoader 1.3.1 code, or another plugin changed it";
+		} else if (!g_dryRun) {
+			g_coreBlock = AllocateNear(g_coreBase + kCoreAnchorRva, kCoreBlockSize);
+			if (g_coreBlock == nullptr) {
+				refuse  = "no executable memory within jump range of D2RCore";
+				refusal = State::NoRoom;
+			} else {
+				memset(g_coreBlock, 0xCC, kCoreBlockSize);
+			}
+		}
+		if (refuse != nullptr) D2RL::LogWarnF(ctx, "stat_ops: %s; no D2RCore byte was written", refuse);
+		for (size_t i = 0; i < kCoreSiteCount; ++i) {
+			if (!coreWanted[i]) continue;
+			if (refuse != nullptr) {
+				g_coreState[i] = refusal;
+				++failed;
+				continue;
+			}
+			if (ApplyCoreSite(ctx, i)) ++applied; else ++failed;
+		}
+	}
+
 	D2RL::LogInfoF(ctx, "%d site(s) active, %d disabled, %d failed%s", applied, skipped, failed,
 	               g_dryRun ? " (dry run, nothing written)" : "");
+
+	if (g_debugOn) {
+		OpenDebugLog(ctx);
+		g_rollerHooked = ctx->InstallInlineHook(kRollerRva, kRollerEntry, static_cast<uint32_t>(sizeof(kRollerEntry)), &HookedRoller,
+		                                        &g_rollerOriginal);
+		if (!g_rollerHooked) D2RL::LogWarnF(ctx, "debug log: the damage roll hook at 0x%06llX did not install; rolls will be missing",
+		                                    static_cast<unsigned long long>(kRollerRva));
+		D2RL::LogInfoF(ctx, "debug log: %ls", g_debugPath);
+	}
 
 	if (!ctx->RegisterConsoleCommand("dmgoverflow", OnCommand, "Damage overflow fix: site list, trace, verify")) {
 		ctx->LogWarn("console command registration failed");
@@ -1361,9 +2432,13 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* ctx) noex
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
-	// The trampoline block is left mapped on purpose. D2RLoader reverts the site
-	// patches itself, and freeing pages the game might still be executing inside
-	// is far more dangerous than leaking one 64 KiB reservation.
+	// The trampoline blocks are left mapped on purpose. D2RLoader reverts the
+	// game image patches itself and the D2RCore windows are put back here;
+	// freeing pages a thread might still be executing inside is far more
+	// dangerous than leaking two small reservations.
+	RestoreCoreSites();
+	g_debugOn = false;
+	CloseDebugLog();
 	g_ctx = nullptr;
 }
 

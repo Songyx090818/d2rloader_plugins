@@ -15,6 +15,12 @@
 //  0x3E2B652. Full-body byte witnesses guard the
 //  three functions the plugin changes, so a different build refuses cleanly.
 //
+//  Compatible with the perdelay floor static patch
+//  (celestialrayone-perdelay-floor.json). That patch changes the two bytes at
+//  0x4373D6 inside the aura tick (cmp eax,ebx -> test eax,eax), which this
+//  plugin never touches, so the aura tick witness accepts either form there
+//  and still checks every other byte of the body.
+//
 // -----------------------------------------------------------------------------
 //  HOW AN ITEM AURA RUNS
 // -----------------------------------------------------------------------------
@@ -136,7 +142,7 @@
 namespace CelestialRayOne::AuraReactivation {
 namespace {
 
-constexpr char PluginVersion[] = "1.0.4";
+constexpr char PluginVersion[] = "1.0.5";
 
 // ---------------------------------------------------------------------------
 //  Default configuration. EnsureConfig writes this text on first load, and it
@@ -1068,6 +1074,43 @@ auto CheckCallable(std::uint64_t rva, const std::uint8_t* bytes, std::size_t siz
     return false;
 }
 
+// The aura tick's period test at 0x4373D6 is the only byte range of the
+// witnessed body that the perdelay floor static patch changes: stock
+// cmp eax,ebx (a perdelay of 1 to 5 ticks every 5 frames) becomes
+// test eax,eax (1 to 4 are honoured, blank or 0 still ticks every 5 frames).
+// Either form is accepted; every other byte of the body must still match.
+constexpr std::uint64_t ItemAuraPeriodTestRva    = 0x4373D6;
+constexpr std::size_t   ItemAuraPeriodTestOffset = ItemAuraPeriodTestRva - ItemAuraEventRva;
+constexpr auto ItemAuraPeriodTestStock = std::to_array<std::uint8_t>({0x3B, 0xC3});  // cmp  eax, ebx
+constexpr auto ItemAuraPeriodTestFloor = std::to_array<std::uint8_t>({0x85, 0xC0});  // test eax, eax
+static_assert(ItemAuraPeriodTestOffset + ItemAuraPeriodTestStock.size() <= ItemAuraEventBody.size());
+static_assert(ItemAuraEventBody[ItemAuraPeriodTestOffset] == ItemAuraPeriodTestStock[0]
+              && ItemAuraEventBody[ItemAuraPeriodTestOffset + 1] == ItemAuraPeriodTestStock[1]);
+
+auto CheckItemAuraEventBody() noexcept -> bool {
+    constexpr std::size_t tailOffset = ItemAuraPeriodTestOffset + ItemAuraPeriodTestStock.size();
+    const bool rest =
+        Context->CheckExpectedBytes(ItemAuraEventRva, ItemAuraEventBody.data(),
+                                    static_cast<std::uint32_t>(ItemAuraPeriodTestOffset))
+        && Context->CheckExpectedBytes(ItemAuraEventRva + tailOffset, ItemAuraEventBody.data() + tailOffset,
+                                       static_cast<std::uint32_t>(ItemAuraEventBody.size() - tailOffset));
+    if (rest) {
+        if (Context->CheckExpectedBytes(ItemAuraPeriodTestRva, ItemAuraPeriodTestStock.data(),
+                                        static_cast<std::uint32_t>(ItemAuraPeriodTestStock.size()))) {
+            return true;
+        }
+        if (Context->CheckExpectedBytes(ItemAuraPeriodTestRva, ItemAuraPeriodTestFloor.data(),
+                                        static_cast<std::uint32_t>(ItemAuraPeriodTestFloor.size()))) {
+            LogInfo("AuraReactivation: the item aura event carries the perdelay floor patch at RVA 0x%llX, accepted.",
+                    static_cast<unsigned long long>(ItemAuraPeriodTestRva));
+            return true;
+        }
+    }
+    LogError("AuraReactivation: item aura event at RVA 0x%llX does not match D2RLoader 1.3.1.",
+             static_cast<unsigned long long>(ItemAuraEventRva));
+    return false;
+}
+
 auto ValidateCoreStatStore() noexcept -> bool;
 
 auto ValidateEventLayout() noexcept -> bool {
@@ -1084,7 +1127,7 @@ auto ValidateEventLayout() noexcept -> bool {
 auto ValidateMultiAura() noexcept -> bool {
     return CheckExact(ActivateItemAuraRva, ActivateItemAuraBody.data(), ActivateItemAuraBody.size(),
                       "item aura activation")
-        && CheckExact(ItemAuraEventRva, ItemAuraEventBody.data(), ItemAuraEventBody.size(), "item aura event")
+        && CheckItemAuraEventBody()
         && CheckExact(DeactivateItemAuraRva, DeactivateItemAuraBody.data(), DeactivateItemAuraBody.size(),
                       "item aura deactivation")
         && CheckCallable(GetSkillsTxtRecordRva, GetSkillsTxtRecordEntry.data(), GetSkillsTxtRecordEntry.size(),
@@ -1623,7 +1666,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.aura-reactivation",
     .name        = "Aura Reactivation",
-    .version     = "1.0.4",
+    .version     = "1.0.5",
     .author      = "CelestialRayOne",
     .description = "Every item_aura on an item stays active, and carried item auras return after a resurrect.",
     .flags       = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,

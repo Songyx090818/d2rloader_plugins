@@ -44,6 +44,33 @@
 //  path only, this plugin restores the bit to whatever it was before the
 //  call. Real casts never reach that code.
 //
+//  THE AURA REFRESH THREW AWAY THE PENDING METEOR ROUND
+//
+//  Stock 124 ends by deleting every pending ACTIVESTATE event (type 5) of the
+//  skill and scheduling a new one at frame + Param4 (delete call 0x5760FA,
+//  set call 0x576124, Param4 read from record +0x1C4 at 0x5760DB). Right for
+//  a cast. As an aura, 124 runs again on every aura refresh (every perdelay
+//  frames, floored at 5, on an aligned frame grid: 0x434CC0, 0x437230), so a
+//  meteor round only survives if it falls due before the next refresh.
+//
+//  Events due on the same frame run in the order they were scheduled:
+//  0x48B5C0 hands 0x48C4D0 the bucket's oldest node (0x48C130 slot) and it
+//  walks toward newer ones. With one item and perdelay == Param4 the meteor
+//  round is scheduled inside the item tick, before that tick re-arms itself,
+//  so it runs first and survives. With two items on the same skill, the
+//  first item's re-arm is scheduled before the round (the second item's
+//  refresh deleted and rescheduled it), runs first and deletes it again.
+//  Every round is lost. perdelay < Param4 loses every round with any number
+//  of items, and perdelay a multiple of Param4 loses the round that lands on
+//  a refresh frame.
+//
+//  On the borrowed path only, the plugin hides the pending type 5 event from
+//  124's delete (type byte set to 0xFD for the length of the call), then
+//  removes the round 124 scheduled with the engine's own delete and gives
+//  the kept round that round's skill level and cast id. The kept round keeps
+//  its frame and its place in that frame's queue, so meteors fall every
+//  Param4 frames whatever perdelay is and however many items grant the aura.
+//
 //  Ported from the ESR 2.4 byte patch (hook 363780 -> 191-byte cave at
 //  386C60). No cave is needed here; the loader owns the trampoline, which
 //  also frees 386C60 and removes the srvdofunc-73 dispatch landmine that
@@ -66,7 +93,7 @@
 namespace CelestialRayOne::ArmageddonAura {
 namespace {
 
-constexpr char PluginVersion[] = "1.0.0";
+constexpr char PluginVersion[] = "1.1.0";
 
 // ---------------------------------------------------------------------------
 //  Native struct layout (all offsets proven from the 3.3 image, see below)
@@ -84,6 +111,41 @@ constexpr std::size_t SkillListUsedIndex = 0x18 / sizeof(void*);
 // the setter at 0x34E790:  mov eax,[rcx+0x124] / or eax,0x40  (or and 0xBF).
 constexpr std::size_t   UnitActionFlagsOffset = 0x124;
 constexpr std::uint32_t SkillActionTakenBit   = 0x40;
+
+// Unit -> first event of the unit. Proven by UNITS_GetEventList (0x48FE50),
+// whose body ends in  mov rax,[rcx+0x148].
+constexpr std::size_t UnitEventListOffset = 0x148;
+
+// Event node layout. Proven by EVENT_SetEvent's store block (0x48BF55):
+//   mov [rax+4],ebp (frame) / mov [rax+18h],ecx (customId) /
+//   mov [rax+1Ch],ecx (customParam) / mov [rax+20h],ecx (third argument)
+// and by EVENT_Delete's node walk (0x48B8F0):
+//   mov rbp,[rbx+38h] (next event of this unit) / cmp [rbx+8],r15 (unit) /
+//   movzx eax,byte [rbx] (type) / cmp [rbx+18h],r14d (customId, 0 = any)
+constexpr std::size_t EventTypeOffset        = 0x00;
+constexpr std::size_t EventFlagsOffset       = 0x02;
+constexpr std::size_t EventCustomIdOffset    = 0x18;
+constexpr std::size_t EventCustomParamOffset = 0x1C;
+constexpr std::size_t EventCastIdOffset      = 0x20;
+constexpr std::size_t EventUnitNextOffset    = 0x38;
+
+// Flags word: bit 0 is set while the event's callback runs (0x48C526), bit 3
+// is set by EVENT_Delete on a running event, which is freed after it returns.
+constexpr std::uint16_t EventRunningFlag        = 0x0001;
+constexpr std::uint16_t EventDeleteDeferredFlag = 0x0008;
+
+// Type 5 = ACTIVESTATE. Its handler (0x435520) runs the aurastate's states.txt
+// srvactivefunc (146 for Armageddon) with customId as the skill id,
+// customParam as the skill level and the third argument as the cast id.
+// 124 and 146 both use the skill id as customId.
+constexpr std::uint8_t ActiveStateEventType = 5;
+
+// Event types are 0..14 (EVENT_SetEvent asserts < 15), so no real event uses
+// this. It is also not the 0xFE the aura-reactivation plugin hides its own
+// events with, so neither plugin can ever restore the other's events.
+constexpr std::uint8_t HiddenEventType = 0xFD;
+
+constexpr std::size_t MaximumUnitEvents = 65536;
 
 // ---------------------------------------------------------------------------
 //  Native RVAs (D2R 3.3, D2RLoader process image, base 0x140000000)
@@ -108,6 +170,25 @@ constexpr std::uint64_t SetSkillActionTakenRva = 0x34E790;
 // load-time proof that we hooked the function skills.txt actually dispatches.
 constexpr std::uint64_t SrvDoTableRva    = 0x238EA00;
 constexpr std::size_t   SrvDo124TableIdx = 124;
+
+// The tail of 124: read Param4, delete (5, skillId), schedule (5, frame +
+// Param4, skillId, level, cast id). The meteor timer fix relies on exactly
+// this sequence, so it is fingerprinted rather than assumed.
+constexpr std::uint64_t SrvDo124TimerTailRva = 0x5760DB;
+
+// EVENT_Delete(game, unit, eventType, customId). Called through its entry.
+// The entry itself is not fingerprinted because the aura-reactivation plugin
+// inline-hooks it (its hook passes every type 5 delete to the stock code);
+// the node walk below it is fingerprinted instead.
+constexpr std::uint64_t EventDeleteRva     = 0x48B890;
+constexpr std::uint64_t EventDeleteWalkRva = 0x48B8F0;
+
+// UNITS_GetEventList(unit) -> [unit+0x148]. Only fingerprinted; the plugin
+// reads the field directly.
+constexpr std::uint64_t GetUnitEventListRva = 0x48FE50;
+
+// EVENT_SetEvent's node store block, proving the node field offsets.
+constexpr std::uint64_t SetEventStoreRva = 0x48BF55;
 
 // ---------------------------------------------------------------------------
 //  Entry byte signatures, read straight out of the 3.3 image
@@ -146,6 +227,51 @@ constexpr auto SetSkillActionTakenExpected = std::to_array<std::uint8_t>({
     0xC0, 0x74, 0x27, 0xCC, 0x48, 0x83, 0xC4, 0x28,
 });
 
+// mov r12d,[rax+1C4h] / mov ebx,[rbp+170h] / mov r9d,r14d / mov r8d,5 /
+// mov rdx,rsi / mov rcx,rbp / add ebx,r12d / call EVENT_Delete /
+// mov rcx,rsi / call UNITS_GetCastId / mov [rsp+30h],eax / mov r9d,ebx /
+// mov [rsp+28h],r13d / mov r8d,5 / mov rdx,rsi / mov [rsp+20h],r14d /
+// mov rcx,rbp / call EVENT_SetEvent
+constexpr auto SrvDo124TimerTailExpected = std::to_array<std::uint8_t>({
+    0x44, 0x8B, 0xA0, 0xC4, 0x01, 0x00, 0x00, 0x8B,
+    0x9D, 0x70, 0x01, 0x00, 0x00, 0x45, 0x8B, 0xCE,
+    0x41, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x48, 0x8B,
+    0xD6, 0x48, 0x8B, 0xCD, 0x41, 0x03, 0xDC, 0xE8,
+    0x91, 0x57, 0xF1, 0xFF, 0x48, 0x8B, 0xCE, 0xE8,
+    0xB9, 0x55, 0xDD, 0xFF, 0x89, 0x44, 0x24, 0x30,
+    0x44, 0x8B, 0xCB, 0x44, 0x89, 0x6C, 0x24, 0x28,
+    0x41, 0xB8, 0x05, 0x00, 0x00, 0x00, 0x48, 0x8B,
+    0xD6, 0x44, 0x89, 0x74, 0x24, 0x20, 0x48, 0x8B,
+    0xCD, 0xE8, 0xF7, 0x55, 0xF1, 0xFF,
+});
+
+constexpr auto EventDeleteWalkExpected = std::to_array<std::uint8_t>({
+    0x48, 0x8B, 0x6B, 0x38, 0x4C, 0x39, 0x7B, 0x08,
+    0x74, 0x0F, 0x48, 0x8D, 0x4C, 0x24, 0x60, 0xE8,
+    0x2C, 0xF3, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x01,
+    0xCC, 0x0F, 0xB6, 0x03, 0x41, 0x3B, 0xC4, 0x0F,
+    0x85, 0x44, 0x01, 0x00, 0x00, 0x45, 0x85, 0xF6,
+    0x74, 0x0A, 0x44, 0x39, 0x73, 0x18, 0x0F, 0x85,
+    0x35, 0x01, 0x00, 0x00,
+});
+
+constexpr auto GetUnitEventListExpected = std::to_array<std::uint8_t>({
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x85, 0xC9, 0x75,
+    0x1A, 0x88, 0x4C, 0x24, 0x30, 0x48, 0x8D, 0x4C,
+    0x24, 0x30, 0xE8, 0xB9, 0xDD, 0xFF, 0xFF, 0x84,
+    0xC0, 0x74, 0x01, 0xCC, 0x33, 0xC0, 0x48, 0x83,
+    0xC4, 0x28, 0xC3, 0x48, 0x8B, 0x81, 0x48, 0x01,
+    0x00, 0x00, 0x48, 0x83, 0xC4, 0x28, 0xC3,
+});
+
+constexpr auto SetEventStoreExpected = std::to_array<std::uint8_t>({
+    0x8B, 0x4C, 0x24, 0x78, 0x44, 0x8B, 0xC5, 0x48,
+    0x8B, 0xD8, 0x89, 0x68, 0x04, 0x89, 0x48, 0x18,
+    0x8B, 0x8C, 0x24, 0x80, 0x00, 0x00, 0x00, 0x89,
+    0x48, 0x1C, 0x8B, 0x8C, 0x24, 0x88, 0x00, 0x00,
+    0x00, 0x89, 0x48, 0x20,
+});
+
 // ---------------------------------------------------------------------------
 //  Native signatures
 // ---------------------------------------------------------------------------
@@ -156,6 +282,7 @@ using GetSkillListFn         = void*(__fastcall*)(void*) noexcept;
 using GetSkillIdFn           = std::int32_t(__fastcall*)(void*) noexcept;
 using GetHighestLevelSkillFn = void*(__fastcall*)(void*, std::int32_t, bool) noexcept;
 using SetSkillActionTakenFn  = void(__fastcall*)(void*, std::int32_t) noexcept;
+using EventDeleteFn          = void(__fastcall*)(void*, void*, std::int32_t, std::int32_t) noexcept;
 
 // ---------------------------------------------------------------------------
 //  Default configuration. This text is what EnsureConfig writes to
@@ -237,6 +364,16 @@ constexpr char DefaultConfigToml[] = R"TOML(
 #  because the player genuinely acted on that frame, it stays set. Real casts
 #  never reach this code and keep the flag exactly as the game intended.
 #
+#  IT ALSO KEEPS THE METEORS FALLING
+#
+#  The start handler was written for a cast: every time it runs it throws
+#  away the pending meteor round and schedules a new one Param4 frames later.
+#  As an aura it runs again on every refresh, and depending on perdelay,
+#  Param4 and how many items grant the aura, that loses some or all of the
+#  meteor rounds. Two items granting the same aura with perdelay equal to
+#  Param4 is the classic case: one item works, two items produce no meteors.
+#  The [aura_refresh] section below explains it and turns the fix on or off.
+#
 #  WHAT YOU NEED IN YOUR TXT FILES
 #
 #    * skills.txt: srvdofunc = 124 on the skill, and aura = 1.
@@ -250,6 +387,16 @@ constexpr char DefaultConfigToml[] = R"TOML(
 #    * states.txt: leave the aurastate's srvactivefunc alone. That is what
 #      drives the per-tick Armageddon behaviour, and it only ever runs
 #      because this plugin got the state created in the first place.
+#
+#    * The level the aura runs at is the AURA level: the total item_aura for
+#      this skill across everything the unit wears. Two items with a level 1
+#      aura run it at level 2. That level is lvl in the skill's own calcs
+#      (auralencalc, aurarangecalc), it is the level of every meteor, and it
+#      is the lvl a meteor's hit function gets for the target state's
+#      aurastatcalc. The oskill only has to exist; its level is never read.
+#    * Param4 is the number of frames between meteor rounds. perdelay is how
+#      often the aura refreshes itself (never less than 5 frames). With
+#      keep_meteor_timer on, the two no longer interfere.
 #
 #  NOTE FOR 3.3: the srvdofunc 124 handler is shared by Armageddon AND
 #  Hurricane. With an empty skill list below, both are covered.
@@ -285,9 +432,58 @@ ids = []
 restore_action_flag = true
 
 
+[aura_refresh]
+# Keep the pending meteor round when the aura refreshes itself.
+#
+# THE PROBLEM
+#
+#   Two timers drive an Armageddon aura:
+#
+#     * The aura timer. Every perdelay frames (never less than 5) the aura
+#       refreshes itself and runs the Armageddon start handler again. Every
+#       item that grants the aura has its own aura timer, and all of them
+#       fire on the same frame.
+#     * The meteor timer. Every Param4 frames the aura state's active
+#       handler drops meteors and schedules the next round.
+#
+#   The start handler throws away the pending meteor round and schedules a
+#   new one Param4 frames later, every time it runs. So a round only
+#   survives if it falls due before the next refresh:
+#
+#     * perdelay shorter than Param4: no meteors at all, with any number of
+#       items.
+#     * perdelay a multiple of Param4: the round that falls on a refresh
+#       frame is lost, every time.
+#     * perdelay equal to Param4 and two or more items granting the aura: no
+#       meteors at all. Things due on the same frame run in the order they
+#       were scheduled. With one item, the meteor round was scheduled before
+#       that item's timer, so it runs first and survives. With two items,
+#       the first item's timer was scheduled before the round (the second
+#       item's refresh had just rescheduled it), so it runs first and throws
+#       the round away, and the second item's refresh puts it back in the
+#       same losing position. That repeats forever.
+#
+# WHAT CHANGES
+#
+#   When the aura refreshes and a meteor round is already pending, that
+#   round is kept exactly where it is. Everything else the refresh did
+#   before still happens: the aura state and its duration are renewed, the
+#   random seed is refreshed, and the pending round is given the current
+#   skill level, so equipping or removing an item still changes the level
+#   of the next meteors. Meteors fall every Param4 frames, whatever perdelay
+#   is and however many items grant the aura.
+#
+#   A real cast of the skill is not touched: it still restarts the meteor
+#   timer, which is what the game intends for a cast.
+#
+# Set to false to get the stock timer behaviour back.
+keep_meteor_timer = true
+
+
 [diagnostics]
 # Writes a short burst of lines to the plugin log covering the first few
-# jumpstarts, then goes quiet so it cannot spam a per-frame path.
+# jumpstarts and kept meteor rounds, then goes quiet so it cannot spam a
+# per-frame path.
 #
 # Running counters are always available from the in-game console command
 # "armageddon-aura", whether this is on or off.
@@ -303,6 +499,7 @@ constexpr std::size_t MaxHandledSkills = 64;
 struct Config {
     bool                      enabled{true};
     bool                      restoreActionFlag{true};
+    bool                      keepMeteorTimer{true};
     bool                      diagnostics{false};
     std::vector<std::int32_t> skillIds{};
 };
@@ -403,6 +600,11 @@ bool ParseConfig(std::string_view text, Config& result, std::string& error, std:
                 error = "sequence.restore_action_flag must be true or false";
                 return false;
             }
+        } else if (qualified == "aura_refresh.keep_meteor_timer") {
+            if (!ParseBool(value, parsed.keepMeteorTimer)) {
+                error = "aura_refresh.keep_meteor_timer must be true or false";
+                return false;
+            }
         } else if (qualified == "diagnostics.enabled") {
             if (!ParseBool(value, parsed.diagnostics)) {
                 error = "diagnostics.enabled must be true or false";
@@ -433,6 +635,7 @@ GetSkillListFn         GetSkillList{};
 GetSkillIdFn           GetSkillId{};
 GetHighestLevelSkillFn GetHighestLevelSkill{};
 SetSkillActionTakenFn  SetSkillActionTaken{};
+EventDeleteFn          EventDelete{};
 ServerSkillFn          OriginalSrvDo124{};
 
 // Copied out of Settings.skillIds at load so the hot path never touches a
@@ -444,6 +647,7 @@ std::atomic<std::uint64_t> RealCastCalls{};
 std::atomic<std::uint64_t> Jumpstarts{};
 std::atomic<std::uint64_t> SkillNotGranted{};
 std::atomic<std::uint64_t> SequenceFlagRestores{};
+std::atomic<std::uint64_t> MeteorTimersKept{};
 std::atomic<std::uint32_t> DiagnosticsBudget{};
 
 void LogInfo(const char* message) noexcept {
@@ -491,6 +695,108 @@ void ReportJumpstart(std::int32_t skillId, std::int32_t skillLevel) noexcept {
     LogInfo(message);
 }
 
+void ReportTimerKept(std::int32_t skillId, std::int32_t skillLevel) noexcept {
+    if (!Settings.diagnostics) return;
+    if (DiagnosticsBudget.load(std::memory_order_relaxed) == 0) return;
+    if (DiagnosticsBudget.fetch_sub(1, std::memory_order_relaxed) == 0) return;
+
+    char message[192]{};
+    std::snprintf(
+        message,
+        sizeof(message),
+        "ArmageddonAura: aura refresh of skill %d at level %d kept the pending meteor round.",
+        skillId,
+        skillLevel);
+    LogInfo(message);
+}
+
+// ---------------------------------------------------------------------------
+//  Meteor timer kept across aura refreshes
+// ---------------------------------------------------------------------------
+
+std::uint8_t* FirstUnitEvent(const void* unit) noexcept {
+    std::uint8_t* event = nullptr;
+    std::memcpy(&event, static_cast<const std::uint8_t*>(unit) + UnitEventListOffset, sizeof(event));
+    return event;
+}
+
+std::uint8_t* NextUnitEvent(const std::uint8_t* event) noexcept {
+    std::uint8_t* next = nullptr;
+    std::memcpy(&next, event + EventUnitNextOffset, sizeof(next));
+    return next;
+}
+
+std::uint32_t ReadEventU32(const std::uint8_t* event, std::size_t offset) noexcept {
+    std::uint32_t value = 0;
+    std::memcpy(&value, event + offset, sizeof(value));
+    return value;
+}
+
+std::uint16_t ReadEventFlags(const std::uint8_t* event) noexcept {
+    std::uint16_t value = 0;
+    std::memcpy(&value, event + EventFlagsOffset, sizeof(value));
+    return value;
+}
+
+bool IsSkillEvent(const std::uint8_t* event, std::uint8_t type, std::int32_t skillId) noexcept {
+    return event[EventTypeOffset] == type
+        && ReadEventU32(event, EventCustomIdOffset) == static_cast<std::uint32_t>(skillId);
+}
+
+// Hides every pending meteor round of this skill from the delete at the end
+// of 124. Running and already deleted events are left alone. Returns how many
+// were hidden; 0 means there is nothing to keep and 124 bootstraps normally.
+std::size_t HidePendingMeteorRounds(void* unit, std::int32_t skillId) noexcept {
+    std::size_t   hidden = 0;
+    std::uint8_t* event  = FirstUnitEvent(unit);
+    for (std::size_t walked = 0; event != nullptr && walked < MaximumUnitEvents; ++walked) {
+        if (IsSkillEvent(event, ActiveStateEventType, skillId)
+            && (ReadEventFlags(event) & (EventRunningFlag | EventDeleteDeferredFlag)) == 0) {
+            event[EventTypeOffset] = HiddenEventType;
+            ++hidden;
+        }
+        event = NextUnitEvent(event);
+    }
+    return hidden;
+}
+
+// After 124: the round it just scheduled is the only visible one, so the
+// engine's own delete removes exactly that one (and unlinks it from its frame
+// bucket). The hidden rounds get its level and cast id and are shown again.
+void KeepPendingMeteorRounds(void* game, void* unit, std::int32_t skillId) noexcept {
+    bool          scheduled = false;
+    std::uint32_t level     = 0;
+    std::uint32_t castId    = 0;
+
+    std::uint8_t* event = FirstUnitEvent(unit);
+    for (std::size_t walked = 0; event != nullptr && walked < MaximumUnitEvents; ++walked) {
+        if (IsSkillEvent(event, ActiveStateEventType, skillId)
+            && (ReadEventFlags(event) & EventDeleteDeferredFlag) == 0) {
+            scheduled = true;
+            level     = ReadEventU32(event, EventCustomParamOffset);
+            castId    = ReadEventU32(event, EventCastIdOffset);
+            break;
+        }
+        event = NextUnitEvent(event);
+    }
+
+    if (scheduled) {
+        EventDelete(game, unit, ActiveStateEventType, skillId);
+    }
+
+    event = FirstUnitEvent(unit);
+    for (std::size_t walked = 0; event != nullptr && walked < MaximumUnitEvents; ++walked) {
+        if (IsSkillEvent(event, HiddenEventType, skillId)) {
+            if (scheduled) {
+                std::memcpy(event + EventCustomParamOffset, &level, sizeof(level));
+                std::memcpy(event + EventCastIdOffset, &castId, sizeof(castId));
+            }
+            event[EventTypeOffset] = ActiveStateEventType;
+        }
+        event = NextUnitEvent(event);
+    }
+}
+
 std::int32_t __fastcall HookSrvDo124(
         void*        game,
         void*        unit,
@@ -531,9 +837,20 @@ std::int32_t __fastcall HookSrvDo124(
 
     const bool actionFlagWasSet = HasSkillActionFlag(unit);
 
+    // An aura refresh must not restart the meteor timer. Skill id 0 is never
+    // hidden: the engine's delete treats customId 0 as "every event".
+    const std::size_t hidden =
+        (Settings.keepMeteorTimer && skillId > 0) ? HidePendingMeteorRounds(unit, skillId) : 0;
+
     skillList[SkillListUsedIndex] = node;
     const std::int32_t result     = original(game, unit, skillId, skillLevel);
     skillList[SkillListUsedIndex] = used;
+
+    if (hidden != 0) {
+        KeepPendingMeteorRounds(game, unit, skillId);
+        MeteorTimersKept.fetch_add(1, std::memory_order_relaxed);
+        ReportTimerKept(skillId, skillLevel);
+    }
 
     // Stock 124 sets the sequence-suppress bit once it is past its gate. Put
     // it back the way we found it so an aura tick cannot stall a leap or a
@@ -575,6 +892,33 @@ bool ValidateNativeImage() noexcept {
          static_cast<std::uint32_t>(SetSkillActionTakenExpected.size()),
          "UNITS_SetSkillActionTaken"},
     };
+
+    const NativeSite timerSites[] = {
+        {SrvDo124TimerTailRva, SrvDo124TimerTailExpected.data(),
+         static_cast<std::uint32_t>(SrvDo124TimerTailExpected.size()), "srvdofunc 124 meteor timer tail"},
+        {EventDeleteWalkRva, EventDeleteWalkExpected.data(),
+         static_cast<std::uint32_t>(EventDeleteWalkExpected.size()), "EVENT_Delete node walk"},
+        {GetUnitEventListRva, GetUnitEventListExpected.data(),
+         static_cast<std::uint32_t>(GetUnitEventListExpected.size()), "UNITS_GetEventList"},
+        {SetEventStoreRva, SetEventStoreExpected.data(),
+         static_cast<std::uint32_t>(SetEventStoreExpected.size()), "EVENT_SetEvent node stores"},
+    };
+
+    for (const auto& site : timerSites) {
+        if (!Settings.keepMeteorTimer) break;
+        if (!Context->CheckExpectedBytes(site.rva, site.expected, site.expectedSize)) {
+            char message[256]{};
+            std::snprintf(
+                message,
+                sizeof(message),
+                "ArmageddonAura: native fingerprint mismatch at 0x%llX (%s), needed by "
+                "aura_refresh.keep_meteor_timer. Refusing to load.",
+                static_cast<unsigned long long>(site.rva),
+                site.name);
+            LogError(message);
+            return false;
+        }
+    }
 
     for (const auto& site : sites) {
         if (!Context->CheckExpectedBytes(site.rva, site.expected, site.expectedSize)) {
@@ -619,6 +963,7 @@ void ResolveNativeFunctions() noexcept {
         reinterpret_cast<GetHighestLevelSkillFn>(Base + GetHighestLevelSkillRva);
     SetSkillActionTaken =
         reinterpret_cast<SetSkillActionTakenFn>(Base + SetSkillActionTakenRva);
+    EventDelete = reinterpret_cast<EventDeleteFn>(Base + EventDeleteRva);
 }
 
 bool LoadConfig() noexcept {
@@ -726,12 +1071,13 @@ auto StatusCommand(
         }
     }
 
-    char message[640]{};
+    char message[768]{};
     std::snprintf(
         message,
         sizeof(message),
         "Armageddon as Aura %s: %s; scope=%s; jumpstarts=%llu; real casts passed through=%llu; "
-        "skill not granted=%llu; sequence flag restores=%llu; restore_action_flag=%s; config=%s; build=%s.",
+        "skill not granted=%llu; sequence flag restores=%llu; meteor rounds kept=%llu; "
+        "restore_action_flag=%s; keep_meteor_timer=%s; config=%s; build=%s.",
         PluginVersion,
         Operational.load(std::memory_order_acquire) ? "active" : "inactive",
         scope,
@@ -739,7 +1085,9 @@ auto StatusCommand(
         static_cast<unsigned long long>(RealCastCalls.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(SkillNotGranted.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(SequenceFlagRestores.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(MeteorTimersKept.load(std::memory_order_relaxed)),
         Settings.restoreActionFlag ? "true" : "false",
+        Settings.keepMeteorTimer ? "true" : "false",
         ConfigSource,
         RuntimeBuild);
 
@@ -751,6 +1099,7 @@ void ResetState() noexcept {
     Operational.store(false, std::memory_order_release);
     Settings.enabled           = true;
     Settings.restoreActionFlag = true;
+    Settings.keepMeteorTimer   = true;
     Settings.diagnostics       = false;
     Settings.skillIds.clear();
     std::snprintf(ConfigSource, sizeof(ConfigSource), "%s", "built-in defaults");
@@ -761,6 +1110,7 @@ void ResetState() noexcept {
     Jumpstarts.store(0, std::memory_order_relaxed);
     SkillNotGranted.store(0, std::memory_order_relaxed);
     SequenceFlagRestores.store(0, std::memory_order_relaxed);
+    MeteorTimersKept.store(0, std::memory_order_relaxed);
     DiagnosticsBudget.store(8, std::memory_order_relaxed);
 }
 
@@ -774,7 +1124,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.armageddon-aura",
     .name        = "Armageddon as Aura",
-    .version     = "1.0.0",
+    .version     = "1.1.0",
     .author      = "CelestialRayOne",
     .description = "Lets srvdofunc 124 skills bootstrap and persist as auras.",
     .flags       = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
@@ -802,7 +1152,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     if (!LoadConfig()) return false;
 
     if (!Settings.enabled) {
-        LogInfo("Armageddon as Aura 1.0.0 loaded disabled by config; the game runs stock.");
+        LogInfo("Armageddon as Aura 1.1.0 loaded disabled by config; the game runs stock.");
         return true;
     }
 
@@ -835,7 +1185,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         std::snprintf(
             message,
             sizeof(message),
-            "Armageddon as Aura 1.0.0 by CelestialRayOne active; scope=%s; config=%s; build=%s.",
+            "Armageddon as Aura 1.1.0 by CelestialRayOne active; scope=%s; config=%s; build=%s.",
             HandledSkillCount == 0 ? "every srvdofunc 124 skill" : "explicit skill id list",
             ConfigSource,
             RuntimeBuild);

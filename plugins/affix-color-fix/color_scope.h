@@ -24,6 +24,12 @@
 //   the block's own color code and every start marker is deleted, so no
 //   marker ever leaves the plugin's hooks.
 //
+// Long stats
+//   The game lets one stat fill the renderer's 256-byte line buffer, so a
+//   long stat (a four-line description, say) can leave no room there for the
+//   markers. Such a stat is wrapped later, in its block, where there is room
+//   (step 1b below).
+//
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -40,6 +46,8 @@ inline constexpr unsigned char LegacyByte1 = 0xBF;
 inline constexpr unsigned char LegacyByte2 = 0x63;
 inline constexpr unsigned char EndTag      = 0x01;
 inline constexpr unsigned char StartTag    = 0x02;
+inline constexpr std::size_t   MaxStatBytes = 256;  // the renderer's line buffer
+inline constexpr std::size_t   NotFound     = static_cast<std::size_t>(-1);
 
 inline constexpr char EndMarker[MarkerSize]{
     static_cast<char>(EscapeByte0), static_cast<char>(EscapeByte1),
@@ -128,14 +136,149 @@ inline auto WrapStat(char* line, std::size_t capacity, std::size_t reserve) noex
 }
 
 // ---------------------------------------------------------------------------
+// Step 1b, per stat too long for step 1
+// ---------------------------------------------------------------------------
+// WrapStat answers NoRoom when the stat and its two markers do not fit in the
+// line buffer. The stat is then left byte for byte as the writer made it and a
+// copy is kept. When the block function that rendered it returns, the copy is
+// found in the text that function added, in the order the writers produced
+// the stats, and the two markers are inserted around it there. From then on
+// it is handled like every other wrapped stat.
+
+struct PendingStat {
+    std::size_t length;
+    char        text[MaxStatBytes];
+};
+
+struct Span {
+    std::size_t begin = NotFound;
+    std::size_t end   = NotFound;
+};
+
+// The first copy of stat[0..statLength) in text[from..length).
+inline auto FindStat(const char* text, std::size_t length, std::size_t from, const char* stat,
+        std::size_t statLength) noexcept -> Span {
+    if (statLength == 0 || from > length || length - from < statLength) return {};
+    for (std::size_t at = from; at + statLength <= length; ++at) {
+        if (text[at] == stat[0] && std::memcmp(text + at, stat, statLength) == 0) {
+            return {at, at + statLength};
+        }
+    }
+    return {};
+}
+
+// With a prefix (the rune and gem lines), the properties block function cuts
+// its rendered text at the last line break before the final byte and appends:
+// the text before the break, the game's newline string, the prefix, the rest
+// without its final line break, a comma, the newline. A stat that contains
+// that break reaches the block as stat[0..cut) + newline + prefix +
+// stat[cut + 1..tailEnd). tailEnd is the stat's length, or one less when the
+// stat's own final line break was the byte the cut removed.
+struct Splice {
+    const char* newline       = nullptr;
+    std::size_t newlineLength = 0;
+    const char* prefix        = nullptr;
+    std::size_t prefixLength  = 0;
+};
+
+// End of stat[0..cut) + newline + prefix + stat[cut + 1..tailEnd) at text[at],
+// or NotFound.
+inline auto MatchSplit(const char* text, std::size_t length, std::size_t at, const char* stat,
+        std::size_t cut, std::size_t tailEnd, const Splice& splice) noexcept -> std::size_t {
+    const std::size_t tail = tailEnd - (cut + 1);
+    const std::size_t need = cut + splice.newlineLength + splice.prefixLength + tail;
+    if (at > length || length - at < need) return NotFound;
+    const char* p = text + at;
+    if (std::memcmp(p, stat, cut) != 0) return NotFound;
+    p += cut;
+    if (std::memcmp(p, splice.newline, splice.newlineLength) != 0) return NotFound;
+    p += splice.newlineLength;
+    if (std::memcmp(p, splice.prefix, splice.prefixLength) != 0) return NotFound;
+    p += splice.prefixLength;
+    if (std::memcmp(p, stat + cut + 1, tail) != 0) return NotFound;
+    return at + need;
+}
+
+// The first copy of the stat cut as described above, at any of its line breaks.
+inline auto FindSplitStat(const char* text, std::size_t length, std::size_t from, const char* stat,
+        std::size_t statLength, const Splice& splice) noexcept -> Span {
+    if (statLength == 0 || from > length || splice.newline == nullptr || splice.prefix == nullptr) {
+        return {};
+    }
+    const bool endsWithBreak = stat[statLength - 1] == '\n';
+    for (std::size_t at = from; at < length; ++at) {
+        for (std::size_t cut = statLength; cut-- > 0;) {
+            if (stat[cut] != '\n') continue;
+            std::size_t end = MatchSplit(text, length, at, stat, cut, statLength, splice);
+            if (end == NotFound && endsWithBreak && cut + 1 < statLength) {
+                end = MatchSplit(text, length, at, stat, cut, statLength - 1, splice);
+            }
+            if (end != NotFound) return {at, end};
+        }
+    }
+    return {};
+}
+
+// Inserts the start marker at span.begin and the end marker at span.end, or
+// nothing at all when the two do not both fit.
+inline auto WrapSpan(char* text, std::size_t& length, std::size_t capacity, const Span& span) noexcept
+        -> bool {
+    if (span.begin > span.end || span.end > length) return false;
+    if (length + 2 * MarkerSize + 1 > capacity) return false;
+    InsertAt(text, length, capacity, span.end, EndMarker, MarkerSize);
+    InsertAt(text, length, capacity, span.begin, StartMarker, MarkerSize);
+    return true;
+}
+
+struct PendingResult {
+    std::uint32_t wrapped  = 0;
+    std::uint32_t noRoom   = 0;  // found, but the block had no room for the markers
+    std::uint32_t notFound = 0;  // not in the text the block function added
+};
+
+// Wraps each kept stat found in text[start..]. Each search starts after the
+// previous stat found, so two identical stats are matched in their own order.
+// splice is given only for a block function that had a prefix.
+inline auto WrapPendingStats(char* text, std::size_t capacity, std::size_t start,
+        const PendingStat* stats, std::size_t count, const Splice* splice) noexcept -> PendingResult {
+    PendingResult result{};
+    std::size_t length = BoundedLength(text, capacity);
+    if (length >= capacity || start > length) {
+        result.notFound = static_cast<std::uint32_t>(count);
+        return result;
+    }
+    std::size_t cursor = start;
+    for (std::size_t i = 0; i < count; ++i) {
+        const PendingStat& stat = stats[i];
+        Span span = FindStat(text, length, cursor, stat.text, stat.length);
+        if (span.begin == NotFound && splice != nullptr) {
+            span = FindSplitStat(text, length, cursor, stat.text, stat.length, *splice);
+        }
+        if (span.begin == NotFound) {
+            ++result.notFound;
+            continue;
+        }
+        if (!WrapSpan(text, length, capacity, span)) {
+            ++result.noRoom;
+            cursor = span.end;
+            continue;
+        }
+        ++result.wrapped;
+        cursor = span.end + 2 * MarkerSize;
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Step 2, per block builder: text that did not come from the stat writers
 // ---------------------------------------------------------------------------
 // The damage-range lines (stats 17 to 59) are written by the game's composer
 // straight into the block, and so are lines other plugins compose there (the
 // bleed line). Those lines are single lines. Every such line, or part of a
 // line before a wrapped stat, that contains a color code gets an end marker
-// where it ends. Wrapped stats are skipped. Running this twice over the same
-// text adds nothing the second time.
+// where it ends. Wrapped stats are skipped; long stats were wrapped by step 1b
+// before this runs. Running this twice over the same text adds nothing the
+// second time.
 
 struct CloseResult {
     std::uint32_t closed = 0;

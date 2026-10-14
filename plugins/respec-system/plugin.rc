@@ -12,11 +12,11 @@ BEGIN
     BLOCK "040904B0"
     BEGIN
       VALUE "CompanyName", "CelestialRayOne"
-      VALUE "FileDescription", "Keeps configurable monster types out of evil urn spawns."
+      VALUE "FileDescription", "Respec Counter: a saved respec counter for the Alt + click respec shortcut, shown in the stat button tooltip."
       VALUE "FileVersion", "1.0.0"
-      VALUE "InternalName", "celestialrayone.evil-urn-blocklist"
-      VALUE "OriginalFilename", "d2rl-celestialrayone-evil-urn-blocklist.dll"
-      VALUE "ProductName", "Evil Urn Blocklist"
+      VALUE "InternalName", "celestialrayone.respec-counter"
+      VALUE "OriginalFilename", "d2rl-celestialrayone-respec-counter.dll"
+      VALUE "ProductName", "Respec Counter"
       VALUE "ProductVersion", "1.0.0"
     END
   END

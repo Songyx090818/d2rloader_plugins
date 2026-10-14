@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "title": "Title",
+  "author": "Author",
+  "version": "0.0.1",
+  "description": "Description",
+  "filterLevels": [
+    {"id": 1, "name": "Leveling"},
+    {"id": 2, "name": "Strict - Nightmare"},
+    {"id": 3, "name": "Very-Strict - Hell"}
+  ]
+  // Fill your styles and rules, consult the guide
+}

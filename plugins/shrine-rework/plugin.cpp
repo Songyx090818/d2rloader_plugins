@@ -1,6 +1,6 @@
 // Shrine Rework
 //
-// One plugin, two parts with their own switches in the config:
+// One plugin, three parts with their own switches in the config:
 //   Removal  takes a configurable list of shrine types (shrines.txt Code) out
 //            of the game. Shrine objects draw from the same pools minus the
 //            removed shrines, so the remaining shrines keep their relative
@@ -10,6 +10,9 @@
 //            Resists: maximum resistance on top. Skill: +all skills by
 //            difficulty. Mana Recharge: percent of max life and mana per
 //            second.
+//   Sharing  a clicked shrine also reaches every other player and every
+//            hireling and summon within a configurable radius of it, 40
+//            yards by default.
 //
 // D2R 3.3 on D2RLoader 1.3.1. Everything below was read out of the live
 // D2RLoader.exe image and disassembled before being relied on. Every game
@@ -200,6 +203,85 @@
 //   stat_write_watch rewrites the 0x2F3030 thunk, and the first version of
 //   this plugin refused to load its effects because of it. Each part checks
 //   only what it uses, so one mismatch leaves the other parts running.
+//
+// ===========================================================================
+// Part 3: Sharing
+// ===========================================================================
+//
+// ---------------------------------------------------------------------------
+// Where a shrine is used: objects.txt OperateFn 2 = 0x58F2A0 (hooked)
+// ---------------------------------------------------------------------------
+//   Both object dispatchers (0x593630 for a click or Telekinesis, 0x592C40)
+//   build the same operate record and pass it in rcx:
+//     +00 Game*  +08 the shrine  +10 the player  +18 object control
+//     +20 objects.txt row (int32)
+//   0x58F2A0 reads it as:
+//     58F2BC  call 34AB60             ; shrine mode, not 0: return 0 (used)
+//     58F3AD  call 34B520             ; rsi = the shrine's shrines.txt record
+//     58F432  movzx eax, byte [rsi]   ; Code
+//     58F435  cmp al, 18h / jae 58F461
+//     58F43C  lea r9, [1D3F1D0] / mov r9, [r9+rax*8] (rax = Code*2)
+//     58F447  test r9, r9 / je 58F461
+//     58F44F  r8 = shrines.txt record, rdx = operate record,
+//             ecx = byte [Game+106h]
+//     58F45C  call r9                 ; the effect, on +10 only
+//     58F461  no handler: life += max life - life, mana += max mana - mana
+//             (2F5020, 2F4D20, 2F34F0, then 2F5020, 2F4E20, 2F34F0)
+//     58F540  mov eax, 1
+//   The hook runs the original and, when it returned 1, calls the same chart
+//   handler once more for every other unit in range, with a copy of the
+//   record whose +10 is that unit. Codes without a handler share through the
+//   Refilling handler 0x590DB0, which makes the same six calls on the same
+//   stats (proven at compile time below). Because the calls go through the
+//   chart, the Effects hooks on 0x591E20 / 0x591F00 / 0x591F70 apply to
+//   everyone exactly as they do to the clicker.
+//   The hook displaces 58F2A0..58F2A5 (push rdi / sub rsp,70h); the next
+//   instruction is the RIP-relative security cookie load.
+//
+// ---------------------------------------------------------------------------
+// Who is in range
+// ---------------------------------------------------------------------------
+//   Players: 0x490D00 (game, callback, arg) walks the 128 player buckets at
+//   Game+2230h (next at unit+158h) and calls callback(game, player, arg) for
+//   every player without state 7 (playerbody) or 186 (shared stash proxy).
+//   Hirelings and summons: 0x4FF990 (game, player, callback, arg, all) walks
+//   the pet lists of a player (qword +98h of what 0x34B240 returns for it,
+//   pettype 1 and up) through 0x5014C0, which resolves each pet with
+//   SUNIT_GetServerUnit 0x48FE80 (game, 1, guid) and calls
+//   callback(game, player, pet, arg). all = 0 skips list nodes with flag 1,
+//   as the healing well does when it heals pets (call at 0x594B37).
+//   A unit is in range when it is alive (0x34C2C0), in the shrine's act
+//   (room 0x34B440, level 0x2EFC10, act 0x326710) and within the radius.
+//   Positions are read the way the Fire shrine reads them (59127C..5912F5):
+//   unit+38h is the path; objects, items and tiles (unit types 2, 4, 5) keep
+//   x and y at path+10h / +14h, players and monsters go through PATH_GetX
+//   0x341A20 / PATH_GetY 0x341A30 (words at path+2 / +6). The radius test
+//   has the game's own shape, dx*dx + dy*dy against radius*radius in game
+//   units, as the area scan 0x4398B0 applies it through 0x3412C0.
+//
+// ---------------------------------------------------------------------------
+// Yards
+// ---------------------------------------------------------------------------
+//   A yard is 1.5 game units (subtiles). skilldesc.txt prints radii in yards
+//   as game units * 2 / 3: Inner Sight's "Radius: %d yards" line (descline
+//   36, StrSkill18) is rng*2 over 3, rng being its aurarangecalc. The test
+//   4 * (dx*dx + dy*dy) <= 9 * yards * yards is exactly that, unrounded.
+//
+// ---------------------------------------------------------------------------
+// Who gets which shrine
+// ---------------------------------------------------------------------------
+//   Everyone (players, hirelings, summons): Codes 1, 2, 3, 6 to 13, 15 and
+//   the Codes without a handler. Their handlers only touch the unit at +10:
+//   its stats, a timed state through ApplyWideTimedStatEffect, or the skill
+//   refresh 0x438970, which checks the unit type (438983) before its
+//   player-only pet step.
+//   Players only: 4 and 5 trade the unit's own life and mana, 14 is stamina,
+//   16 (Enirhs) rewrites the PlayerData name, 18 (Gem) reads the backpack
+//   and drops a gem next to the unit.
+//   The clicker only: 17 Portal, 19 Fire, 20 Monster, 21 Exploding and
+//   22 Poison act on the area around the shrine, not on the unit at +10.
+//   The 24 handler slots of the chart are checked against these functions
+//   at load; a different chart leaves this part out.
 //
 // ===========================================================================
 // Shared
@@ -610,6 +692,306 @@ static_assert(ResistLoopLengths[0xe] == 0xE8 && BranchTarget(ResistLoopLengths, 
 static_assert(ResistLoopLengths[0x29] == 0xE8 && BranchTarget(ResistLoopLengths, ResistLoopLengthsRva, 0x29) == CheckStateRva);
 static_assert(AbsorbEventSite[0x15] == 0xE8 && BranchTarget(AbsorbEventSite, AbsorbEventSiteRva, 0x15) == UnitEventRva);
 
+
+// ---------------------------------------------------------------------------
+// Sharing anchors
+// ---------------------------------------------------------------------------
+
+constexpr std::uint64_t ShrineOperateRva      = 0x58F2A0;   // objects.txt OperateFn 2, hooked
+constexpr std::uint64_t ObjectShrineRecordRva = 0x34B520;   // (object) -> shrines.txt record
+constexpr std::uint64_t FireHandlerRva        = 0x591220;   // Code 19
+constexpr std::uint64_t FirePositionRva       = 0x59127C;   // its unit position reads
+constexpr std::uint64_t PathGetXRva           = 0x341A20;
+constexpr std::uint64_t PathGetYRva           = 0x341A30;
+constexpr std::uint64_t UnitIsDeadRva         = 0x34C2C0;   // SUNIT_IsDead
+constexpr std::uint64_t UnitRoomRva           = 0x34B440;   // UNITS_GetRoom
+constexpr std::uint64_t ActOfLevelRva         = 0x326710;   // (data context, level id) -> act
+constexpr std::uint64_t LivingPlayersRva      = 0x490D00;   // (game, callback, arg)
+constexpr std::uint64_t PetIterateRva         = 0x4FF990;   // (game, player, callback, arg, all)
+constexpr std::uint64_t PetWalkRva            = 0x5014C0;   // one pet list, calls the callback
+constexpr std::uint64_t GetServerUnitRva      = 0x48FE80;   // SUNIT_GetServerUnit (game, type, guid)
+constexpr std::uint64_t StatReadRva           = 0x2F5020;   // the stat read of both refills
+constexpr std::uint64_t StatAddRva            = 0x2F34F0;   // the stat add of both refills
+
+constexpr std::size_t  ChartSlots     = 24;
+constexpr std::size_t  ChartStride    = 16;
+constexpr std::size_t  UnitTypeOffset = 0x00;   // int32
+constexpr std::size_t  UnitPathOffset = 0x38;   // the unit's path
+constexpr std::size_t  StaticPathX    = 0x10;   // int32, objects, items and tiles
+constexpr std::size_t  StaticPathY    = 0x14;
+constexpr std::int32_t UnitTypeObject = 2;
+constexpr std::int32_t UnitTypeItem   = 4;
+constexpr std::int32_t UnitTypeTile   = 5;
+
+// 0X58F2A0..0X58F558
+constexpr std::uint8_t ShrineOperateBody[]{
+    0x40, 0x57, 0x48, 0x83, 0xEC, 0x70, 0x48, 0x8B, 0x05, 0x1B, 0xC0, 0x43,
+    0x02, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x44, 0x24, 0x60, 0x48, 0x8B, 0xF9,
+    0x48, 0x8B, 0x49, 0x08, 0xE8, 0x9F, 0xB8, 0xDB, 0xFF, 0x85, 0xC0, 0x74,
+    0x15, 0x33, 0xC0, 0x48, 0x8B, 0x4C, 0x24, 0x60, 0x48, 0x33, 0xCC, 0xE8,
+    0x7C, 0x1E, 0xD4, 0x00, 0x48, 0x83, 0xC4, 0x70, 0x5F, 0xC3, 0x48, 0x8B,
+    0x4F, 0x08, 0x48, 0x89, 0xAC, 0x24, 0x90, 0x00, 0x00, 0x00, 0x48, 0x89,
+    0xB4, 0x24, 0x98, 0x00, 0x00, 0x00, 0xE8, 0xFD, 0xB9, 0xDB, 0xFF, 0x83,
+    0xF8, 0xFF, 0x74, 0x14, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xC6, 0x44, 0x24,
+    0x40, 0x00, 0xE8, 0x79, 0x38, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x01, 0xCC,
+    0x48, 0x8B, 0x4F, 0x10, 0x48, 0x8D, 0x15, 0xB9, 0x02, 0x7B, 0x01, 0x41,
+    0xB8, 0x6D, 0x09, 0x00, 0x00, 0xE8, 0x0E, 0xB0, 0xDB, 0xFF, 0x48, 0x8B,
+    0x4F, 0x08, 0x8B, 0xD0, 0xE8, 0x43, 0xF6, 0xDB, 0xFF, 0x48, 0x8B, 0x4F,
+    0x08, 0xBA, 0x01, 0x00, 0x00, 0x00, 0xE8, 0xB5, 0xF2, 0xDB, 0xFF, 0x48,
+    0x8B, 0x07, 0x8B, 0x57, 0x20, 0x0F, 0xB6, 0x88, 0x06, 0x01, 0x00, 0x00,
+    0xE8, 0xB3, 0x09, 0xE0, 0xFF, 0x33, 0xED, 0x40, 0x38, 0xA8, 0xC9, 0x00,
+    0x00, 0x00, 0x75, 0x3B, 0x40, 0x38, 0xA8, 0x00, 0x01, 0x00, 0x00, 0x74,
+    0x32, 0x8B, 0x90, 0x9C, 0x00, 0x00, 0x00, 0x44, 0x8D, 0x45, 0x01, 0x48,
+    0x8B, 0x0F, 0xC1, 0xEA, 0x08, 0x89, 0x6C, 0x24, 0x30, 0x89, 0x6C, 0x24,
+    0x28, 0x44, 0x8B, 0x89, 0x70, 0x01, 0x00, 0x00, 0x41, 0xFF, 0xC1, 0x89,
+    0x6C, 0x24, 0x20, 0x44, 0x03, 0xCA, 0x48, 0x8B, 0x57, 0x08, 0xE8, 0x8D,
+    0xC3, 0xEF, 0xFF, 0x48, 0x8B, 0x4F, 0x08, 0xE8, 0x94, 0xA4, 0xDB, 0xFF,
+    0x48, 0x85, 0xC0, 0x74, 0x08, 0x48, 0x8B, 0xC8, 0xE8, 0x57, 0xC7, 0xE3,
+    0xFF, 0x48, 0x8B, 0x4F, 0x08, 0xE8, 0x6E, 0xC1, 0xDB, 0xFF, 0xBA, 0x14,
+    0x00, 0x00, 0x00, 0x48, 0x8D, 0x4C, 0x24, 0x48, 0x48, 0x8B, 0xF0, 0x44,
+    0x0F, 0xB7, 0x40, 0x14, 0xE8, 0x17, 0x36, 0xCA, 0x00, 0x48, 0x83, 0xF8,
+    0x14, 0x48, 0x8B, 0xCD, 0x48, 0x0F, 0x42, 0xC8, 0x40, 0x88, 0x6C, 0x0C,
+    0x48, 0x48, 0x8B, 0x0F, 0x8B, 0x91, 0x70, 0x01, 0x00, 0x00, 0x48, 0x8D,
+    0x4C, 0x24, 0x48, 0xE8, 0x24, 0xC6, 0xE3, 0xFF, 0x48, 0x8B, 0x4F, 0x08,
+    0x48, 0x8B, 0xD0, 0xE8, 0xE8, 0xE9, 0xDB, 0xFF, 0x48, 0x8B, 0x4F, 0x08,
+    0xBA, 0x01, 0x00, 0x00, 0x00, 0xE8, 0x6A, 0xE9, 0xDB, 0xFF, 0x48, 0x8B,
+    0x0F, 0x41, 0xB8, 0x06, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x57, 0x08, 0x89,
+    0x6C, 0x24, 0x30, 0x89, 0x6C, 0x24, 0x28, 0x44, 0x8B, 0x89, 0x70, 0x01,
+    0x00, 0x00, 0x41, 0x81, 0xC1, 0x2C, 0x01, 0x00, 0x00, 0x89, 0x6C, 0x24,
+    0x20, 0xE8, 0xEE, 0xC2, 0xEF, 0xFF, 0x0F, 0xB6, 0x06, 0x3C, 0x18, 0x73,
+    0x28, 0x48, 0x03, 0xC0, 0x4C, 0x8D, 0x0D, 0x8D, 0xFD, 0x7A, 0x01, 0x4D,
+    0x8B, 0x0C, 0xC1, 0x4D, 0x85, 0xC9, 0x74, 0x15, 0x48, 0x8B, 0x07, 0x4C,
+    0x8B, 0xC6, 0x48, 0x8B, 0xD7, 0x0F, 0xB6, 0x88, 0x06, 0x01, 0x00, 0x00,
+    0x41, 0xFF, 0xD1, 0xEB, 0x74, 0x48, 0x8B, 0x4F, 0x10, 0x45, 0x33, 0xC0,
+    0x48, 0x89, 0x9C, 0x24, 0x88, 0x00, 0x00, 0x00, 0x41, 0x8D, 0x50, 0x06,
+    0xE8, 0xA7, 0x5B, 0xD6, 0xFF, 0x48, 0x8B, 0x4F, 0x10, 0x8B, 0xD8, 0xE8,
+    0x9C, 0x58, 0xD6, 0xFF, 0x2B, 0xC3, 0x74, 0x13, 0x48, 0x8B, 0x4F, 0x10,
+    0x45, 0x33, 0xC9, 0x44, 0x8B, 0xC0, 0x41, 0x8D, 0x51, 0x06, 0xE8, 0x55,
+    0x40, 0xD6, 0xFF, 0x48, 0x8B, 0x4F, 0x10, 0x45, 0x33, 0xC0, 0x41, 0x8D,
+    0x50, 0x08, 0xE8, 0x75, 0x5B, 0xD6, 0xFF, 0x48, 0x8B, 0x4F, 0x10, 0x8B,
+    0xD8, 0xE8, 0x6A, 0x59, 0xD6, 0xFF, 0x2B, 0xC3, 0x48, 0x8B, 0x9C, 0x24,
+    0x88, 0x00, 0x00, 0x00, 0x74, 0x13, 0x48, 0x8B, 0x4F, 0x10, 0x45, 0x33,
+    0xC9, 0x44, 0x8B, 0xC0, 0x41, 0x8D, 0x51, 0x08, 0xE8, 0x1B, 0x40, 0xD6,
+    0xFF, 0x0F, 0xB6, 0x46, 0x10, 0x48, 0x8B, 0xB4, 0x24, 0x98, 0x00, 0x00,
+    0x00, 0x84, 0xC0, 0x74, 0x31, 0x48, 0x8B, 0x0F, 0x41, 0xB8, 0x05, 0x00,
+    0x00, 0x00, 0x69, 0xD0, 0xB0, 0x04, 0x00, 0x00, 0x89, 0x6C, 0x24, 0x30,
+    0x89, 0x6C, 0x24, 0x28, 0x44, 0x8B, 0x89, 0x70, 0x01, 0x00, 0x00, 0x41,
+    0xFF, 0xC1, 0x89, 0x6C, 0x24, 0x20, 0x44, 0x03, 0xCA, 0x48, 0x8B, 0x57,
+    0x08, 0xE8, 0x0A, 0xC2, 0xEF, 0xFF, 0x48, 0x8B, 0x4F, 0x08, 0xE8, 0x41,
+    0xB6, 0xDB, 0xFF, 0x48, 0x8B, 0xAC, 0x24, 0x90, 0x00, 0x00, 0x00, 0x83,
+    0xF8, 0x01, 0x74, 0x14, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xC6, 0x44, 0x24,
+    0x40, 0x00, 0xE8, 0xC5, 0x31, 0x00, 0x00, 0x84, 0xC0, 0x74, 0x01, 0xCC,
+    0xB8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x4C, 0x24, 0x60, 0x48, 0x33,
+    0xCC, 0xE8, 0xFE, 0x1B, 0xD4, 0x00, 0x48, 0x83, 0xC4, 0x70, 0x5F, 0xC3,
+};
+
+// 0X59127C..0X5912F5
+constexpr std::uint8_t FirePositionBlock[]{
+    0x8B, 0x0B, 0x45, 0x33, 0xED, 0x83, 0xE9, 0x02, 0x74, 0x21, 0x83, 0xE9,
+    0x02, 0x74, 0x1C, 0x83, 0xF9, 0x01, 0x74, 0x17, 0x48, 0x8B, 0x4B, 0x38,
+    0x48, 0x85, 0xC9, 0x74, 0x09, 0xE8, 0x82, 0x07, 0xDB, 0xFF, 0x8B, 0xF8,
+    0xEB, 0x0C, 0x41, 0x8B, 0xFD, 0xEB, 0x07, 0x48, 0x8B, 0x43, 0x38, 0x8B,
+    0x78, 0x10, 0x48, 0x8B, 0x5E, 0x08, 0x48, 0x85, 0xDB, 0x75, 0x0F, 0x48,
+    0x8D, 0x4C, 0x24, 0x20, 0xE8, 0x8F, 0x56, 0xB0, 0xFF, 0x84, 0xC0, 0x74,
+    0x01, 0xCC, 0x8B, 0x0B, 0x83, 0xE9, 0x02, 0x74, 0x21, 0x83, 0xE9, 0x02,
+    0x74, 0x1C, 0x83, 0xF9, 0x01, 0x74, 0x17, 0x48, 0x8B, 0x4B, 0x38, 0x48,
+    0x85, 0xC9, 0x74, 0x09, 0xE8, 0x4B, 0x07, 0xDB, 0xFF, 0x8B, 0xC8, 0xEB,
+    0x0C, 0x41, 0x8B, 0xCD, 0xEB, 0x07, 0x48, 0x8B, 0x43, 0x38, 0x8B, 0x48,
+    0x14,
+};
+
+// 0X34C2C0..0X34C332
+constexpr std::uint8_t UnitIsDeadBody[]{
+    0x48, 0x83, 0xEC, 0x28, 0x48, 0x85, 0xC9, 0x75, 0x1D, 0x88, 0x4C, 0x24,
+    0x30, 0x48, 0x8D, 0x4C, 0x24, 0x30, 0xE8, 0x59, 0x94, 0xFF, 0xFF, 0x84,
+    0xC0, 0x74, 0x4D, 0xCC, 0xB8, 0x01, 0x00, 0x00, 0x00, 0x48, 0x83, 0xC4,
+    0x28, 0xC3, 0xF7, 0x81, 0x24, 0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
+    0x75, 0x36, 0x8B, 0x11, 0x85, 0xD2, 0x74, 0x24, 0x83, 0xFA, 0x01, 0x74,
+    0x13, 0xF7, 0x81, 0x28, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x75,
+    0x1F, 0x33, 0xC0, 0x48, 0x83, 0xC4, 0x28, 0xC3, 0x8B, 0x41, 0x0C, 0x85,
+    0xC0, 0x74, 0x11, 0x83, 0xF8, 0x0C, 0xEB, 0x0A, 0x8B, 0x41, 0x0C, 0x85,
+    0xC0, 0x74, 0x05, 0x83, 0xF8, 0x11, 0x75, 0xE1, 0xB8, 0x01, 0x00, 0x00,
+    0x00, 0x48, 0x83, 0xC4, 0x28, 0xC3,
+};
+
+// 0X34B440..0X34B49A
+constexpr std::uint8_t UnitRoomBody[]{
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9,
+    0x75, 0x13, 0x88, 0x4C, 0x24, 0x30, 0x48, 0x8D, 0x4C, 0x24, 0x30, 0xE8,
+    0x54, 0xA7, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x8B, 0x0B, 0x83,
+    0xE9, 0x02, 0x74, 0x25, 0x83, 0xE9, 0x02, 0x74, 0x20, 0x83, 0xF9, 0x01,
+    0x74, 0x1B, 0x48, 0x8B, 0x4B, 0x38, 0x48, 0x85, 0xC9, 0x74, 0x0A, 0x48,
+    0x83, 0xC4, 0x20, 0x5B, 0xE9, 0xAB, 0x67, 0xFF, 0xFF, 0x33, 0xC0, 0x48,
+    0x83, 0xC4, 0x20, 0x5B, 0xC3, 0x48, 0x8B, 0x43, 0x38, 0x48, 0x8B, 0x00,
+    0x48, 0x83, 0xC4, 0x20, 0x5B, 0xC3,
+};
+
+// 0X326710..0X3267A7
+constexpr std::uint8_t ActOfLevelBody[]{
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48,
+    0x83, 0xEC, 0x30, 0x8B, 0xF2, 0x0F, 0xB6, 0xD9, 0xE8, 0xB7, 0x9F, 0xFD,
+    0xFF, 0x0F, 0xB6, 0xCB, 0x48, 0x8B, 0xF8, 0xE8, 0x5C, 0xA3, 0xFD, 0xFF,
+    0x8B, 0x98, 0x08, 0x01, 0x00, 0x00, 0x83, 0xEB, 0x01, 0x78, 0x43, 0x90,
+    0x8B, 0xCB, 0x48, 0x89, 0x4C, 0x24, 0x50, 0x48, 0x3B, 0x4F, 0x08, 0x72,
+    0x1E, 0x48, 0x8D, 0x44, 0x24, 0x50, 0x48, 0x89, 0x7C, 0x24, 0x28, 0x48,
+    0x8D, 0x4C, 0x24, 0x20, 0x48, 0x89, 0x44, 0x24, 0x20, 0xE8, 0xFA, 0x88,
+    0xFC, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x48, 0x69, 0x4C, 0x24, 0x50,
+    0x8C, 0x00, 0x00, 0x00, 0x48, 0x8B, 0x07, 0x3B, 0x74, 0x01, 0x04, 0x7D,
+    0x17, 0x83, 0xEB, 0x01, 0x79, 0xBE, 0x32, 0xC0, 0x48, 0x8B, 0x5C, 0x24,
+    0x40, 0x48, 0x8B, 0x74, 0x24, 0x48, 0x48, 0x83, 0xC4, 0x30, 0x5F, 0xC3,
+    0x48, 0x8B, 0x74, 0x24, 0x48, 0x0F, 0xB6, 0xC3, 0x48, 0x8B, 0x5C, 0x24,
+    0x40, 0x48, 0x83, 0xC4, 0x30, 0x5F, 0xC3,
+};
+
+// 0X490D00..0X490DBB
+constexpr std::uint8_t LivingPlayersBody[]{
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89,
+    0x74, 0x24, 0x20, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83, 0xEC, 0x20,
+    0x4C, 0x8D, 0xB1, 0x30, 0x22, 0x00, 0x00, 0x49, 0x8B, 0xE8, 0x48, 0x8B,
+    0xF2, 0x48, 0x8B, 0xF9, 0x48, 0x85, 0xC9, 0x74, 0x05, 0x48, 0x85, 0xD2,
+    0x75, 0x14, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0xC6, 0x44, 0x24, 0x40, 0x00,
+    0xE8, 0x4F, 0xC8, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x41, 0xBF,
+    0x80, 0x00, 0x00, 0x00, 0x0F, 0x1F, 0x40, 0x00, 0x49, 0x8B, 0x1E, 0x48,
+    0x85, 0xDB, 0x74, 0x59, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0xBA, 0x07, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCB, 0xE8, 0x43, 0x44, 0xEA,
+    0xFF, 0x85, 0xC0, 0x75, 0x34, 0xBA, 0xBA, 0x00, 0x00, 0x00, 0x48, 0x8B,
+    0xCB, 0xE8, 0x32, 0x44, 0xEA, 0xFF, 0x85, 0xC0, 0x75, 0x0B, 0x4C, 0x8B,
+    0xC5, 0x48, 0x8B, 0xD3, 0x48, 0x8B, 0xCF, 0xFF, 0xD6, 0x48, 0x85, 0xDB,
+    0x75, 0x13, 0x48, 0x8D, 0x4C, 0x24, 0x40, 0x88, 0x5C, 0x24, 0x40, 0xE8,
+    0xD0, 0xC9, 0xFF, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC, 0x48, 0x8B, 0x9B,
+    0x58, 0x01, 0x00, 0x00, 0x48, 0x85, 0xDB, 0x75, 0xAF, 0x49, 0x83, 0xC6,
+    0x08, 0x49, 0x83, 0xEF, 0x01, 0x75, 0x95,
+};
+
+// 0X4FF990..0X4FFA6D
+constexpr std::uint8_t PetIterateBody[]{
+    0x40, 0x55, 0x56, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x48, 0x83, 0xEC,
+    0x40, 0x48, 0x8B, 0xF1, 0x4D, 0x8B, 0xE1, 0x48, 0x8B, 0xCA, 0x4D, 0x8B,
+    0xE8, 0x48, 0x8B, 0xEA, 0xE8, 0x8F, 0xB8, 0xE4, 0xFF, 0x4C, 0x8B, 0xB0,
+    0x98, 0x00, 0x00, 0x00, 0x4D, 0x85, 0xF6, 0x0F, 0x84, 0x9F, 0x00, 0x00,
+    0x00, 0x48, 0x89, 0x5C, 0x24, 0x70, 0xBB, 0x01, 0x00, 0x00, 0x00, 0x48,
+    0x89, 0x7C, 0x24, 0x78, 0x4C, 0x89, 0xBC, 0x24, 0x80, 0x00, 0x00, 0x00,
+    0x44, 0x0F, 0xB6, 0xBC, 0x24, 0x90, 0x00, 0x00, 0x00, 0x0F, 0xB6, 0x8E,
+    0x06, 0x01, 0x00, 0x00, 0xE8, 0xA3, 0x10, 0xE0, 0xFF, 0x48, 0x8B, 0xB8,
+    0xE0, 0x12, 0x00, 0x00, 0x48, 0x63, 0xC7, 0x48, 0x3B, 0xC7, 0x75, 0x04,
+    0x85, 0xFF, 0x79, 0x14, 0x48, 0x8D, 0x4C, 0x24, 0x30, 0xC6, 0x44, 0x24,
+    0x30, 0x00, 0xE8, 0x51, 0x6F, 0xB8, 0xFF, 0x84, 0xC0, 0x74, 0x01, 0xCC,
+    0x3B, 0xDF, 0x7D, 0x36, 0x0F, 0xB6, 0x8E, 0x06, 0x01, 0x00, 0x00, 0x44,
+    0x8B, 0xC3, 0x49, 0x8B, 0xD6, 0xE8, 0xC6, 0x19, 0x00, 0x00, 0x48, 0x85,
+    0xC0, 0x74, 0x1B, 0x44, 0x88, 0x7C, 0x24, 0x28, 0x4D, 0x8B, 0xCC, 0x4D,
+    0x8B, 0xC5, 0x48, 0x89, 0x44, 0x24, 0x20, 0x48, 0x8B, 0xD5, 0x48, 0x8B,
+    0xCE, 0xE8, 0x76, 0x1A, 0x00, 0x00, 0xFF, 0xC3, 0xEB, 0x93, 0x48, 0x8B,
+    0x7C, 0x24, 0x78, 0x48, 0x8B, 0x5C, 0x24, 0x70, 0x4C, 0x8B, 0xBC, 0x24,
+    0x80, 0x00, 0x00, 0x00, 0x48, 0x83, 0xC4, 0x40, 0x41, 0x5E, 0x41, 0x5D,
+    0x41, 0x5C, 0x5E, 0x5D, 0xC3,
+};
+
+// 0X5014C0..0X501540
+constexpr std::uint8_t PetWalkBody[]{
+    0x48, 0x89, 0x6C, 0x24, 0x18, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x83,
+    0xEC, 0x20, 0x48, 0x8B, 0x44, 0x24, 0x60, 0x49, 0x8B, 0xE9, 0x4D, 0x8B,
+    0xF0, 0x4C, 0x8B, 0xFA, 0x48, 0x8B, 0xF9, 0x48, 0x8B, 0x00, 0x48, 0x85,
+    0xC0, 0x74, 0x54, 0x48, 0x89, 0x5C, 0x24, 0x40, 0x48, 0x89, 0x74, 0x24,
+    0x48, 0x0F, 0xB6, 0x74, 0x24, 0x68, 0x48, 0x8B, 0x58, 0x18, 0x40, 0x84,
+    0xF6, 0x75, 0x05, 0xF6, 0x00, 0x01, 0x75, 0x25, 0x44, 0x8B, 0x40, 0x04,
+    0xBA, 0x01, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCF, 0xE8, 0x6B, 0xE9, 0xF8,
+    0xFF, 0x48, 0x85, 0xC0, 0x74, 0x0F, 0x4C, 0x8B, 0xCD, 0x4C, 0x8B, 0xC0,
+    0x49, 0x8B, 0xD7, 0x48, 0x8B, 0xCF, 0x41, 0xFF, 0xD6, 0x48, 0x8B, 0xC3,
+    0x48, 0x85, 0xDB, 0x75, 0xC5, 0x48, 0x8B, 0x74, 0x24, 0x48, 0x48, 0x8B,
+    0x5C, 0x24, 0x40, 0x48, 0x8B, 0x6C, 0x24, 0x50,
+};
+
+// The hooked window: push rdi / sub rsp,70h. Byte 6 starts the RIP-relative
+// cookie load, which cannot be moved.
+constexpr std::uint32_t ShrineOperateHookSize = 6;
+
+// The handler each chart slot holds, slot = shrines.txt Code (0 = none).
+constexpr std::array<std::uint64_t, ChartSlots> ChartHandlers{
+    0,        0x590DB0, 0x590D10, 0x590D60, 0x590E30, 0x590EC0, 0x591E20, 0x591F70,
+    0x591E20, 0x591E20, 0x591E20, 0x591E20, 0x591F00, 0x591E20, 0x5920D0, 0x591E20,
+    0x590F40, 0x590F80, 0x591060, 0x591220, 0x591600, 0x591700, 0x591A90, 0,
+};
+
+static_assert(sizeof(ShrineOperateBody) == 0x2B8 && sizeof(FirePositionBlock) == 0x79
+              && sizeof(UnitIsDeadBody) == 0x72 && sizeof(UnitRoomBody) == 0x5A && sizeof(ActOfLevelBody) == 0x97
+              && sizeof(LivingPlayersBody) == 0xBB && sizeof(PetIterateBody) == 0xDD && sizeof(PetWalkBody) == 0x80);
+static_assert(ChartHandlers[1] == RefillHandlerRva && ChartHandlers[6] == BoostHandlerRva
+              && ChartHandlers[7] == CombatHandlerRva && ChartHandlers[12] == SkillHandlerRva
+              && ChartHandlers[19] == FireHandlerRva);
+
+// 58F2A0: push rdi / sub rsp,70h / mov rax, [rip+cookie].
+static_assert(ShrineOperateBody[0] == 0x40 && ShrineOperateBody[1] == 0x57 && ShrineOperateBody[2] == 0x48
+              && ShrineOperateBody[3] == 0x83 && ShrineOperateBody[4] == 0xEC && ShrineOperateBody[5] == 0x70
+              && ShrineOperateBody[6] == 0x48 && ShrineOperateBody[7] == 0x8B && ShrineOperateBody[8] == 0x05);
+// 58F3AD call 34B520, 58F435 cmp al,18h, 58F43C lea r9,[1D3F1D0], 58F455 the
+// data context at Game+106h, 58F45C call r9, 58F540 mov eax,1.
+static_assert(ShrineOperateBody[0x10D] == 0xE8
+              && BranchTarget(ShrineOperateBody, ShrineOperateRva, 0x10D) == ObjectShrineRecordRva);
+static_assert(ShrineOperateBody[0x195] == 0x3C && ShrineOperateBody[0x196] == ChartSlots);
+static_assert(ShrineOperateBody[0x19C] == 0x4C && ShrineOperateBody[0x19D] == 0x8D
+              && LeaTarget(ShrineOperateBody, ShrineOperateRva, 0x19C) == ShrineChartRva);
+static_assert(ShrineOperateBody[0x1B5] == 0x0F && ShrineOperateBody[0x1B6] == 0xB6
+              && ShrineOperateBody[0x1B8] == (GameDataContext & 0xFF) && ShrineOperateBody[0x1B9] == (GameDataContext >> 8));
+static_assert(ShrineOperateBody[0x1BC] == 0x41 && ShrineOperateBody[0x1BD] == 0xFF && ShrineOperateBody[0x1BE] == 0xD1);
+static_assert(ShrineOperateBody[0x2A0] == 0xB8 && ShrineOperateBody[0x2A1] == 0x01);
+
+// 58F461..58F4D4 (no handler) and the Refilling handler 0x590DB0 make the
+// same six calls, with the same stat ids in the same lea edx,[r8/r9+stat].
+constexpr std::size_t OperateRefillCall[6]{ 0x1D4, 0x1DF, 0x1F6, 0x206, 0x211, 0x230 };
+constexpr std::size_t HandlerRefillCall[6]{ 0x18, 0x23, 0x3A, 0x4A, 0x55, 0x6C };
+constexpr std::size_t OperateRefillStat[4]{ 0x1D0, 0x1F2, 0x202, 0x22C };
+constexpr std::size_t HandlerRefillStat[4]{ 0x14, 0x36, 0x46, 0x68 };
+
+constexpr auto SameRefill() noexcept -> bool {
+    for (std::size_t index = 0; index < 6; ++index) {
+        if (ShrineOperateBody[OperateRefillCall[index]] != 0xE8 || RefillHandlerBody[HandlerRefillCall[index]] != 0xE8) {
+            return false;
+        }
+        if (BranchTarget(ShrineOperateBody, ShrineOperateRva, OperateRefillCall[index])
+            != BranchTarget(RefillHandlerBody, RefillHandlerRva, HandlerRefillCall[index])) {
+            return false;
+        }
+    }
+    for (std::size_t index = 0; index < 4; ++index) {
+        for (std::size_t at = 0; at < 4; ++at) {
+            if (ShrineOperateBody[OperateRefillStat[index] + at] != RefillHandlerBody[HandlerRefillStat[index] + at]) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+static_assert(SameRefill());
+static_assert(BranchTarget(RefillHandlerBody, RefillHandlerRva, 0x18) == StatReadRva
+              && BranchTarget(RefillHandlerBody, RefillHandlerRva, 0x3A) == StatAddRva);
+
+// 59127C..5912F5: unit+38h is the path; types 2, 4 and 5 read x and y at
+// path+10h / +14h, the others through PATH_GetX / PATH_GetY.
+static_assert(FirePositionBlock[0x1D] == 0xE8 && BranchTarget(FirePositionBlock, FirePositionRva, 0x1D) == PathGetXRva);
+static_assert(FirePositionBlock[0x64] == 0xE8 && BranchTarget(FirePositionBlock, FirePositionRva, 0x64) == PathGetYRva);
+static_assert(FirePositionBlock[0x17] == UnitPathOffset && FirePositionBlock[0x2E] == UnitPathOffset
+              && FirePositionBlock[0x31] == StaticPathX && FirePositionBlock[0x78] == StaticPathY);
+static_assert(FirePositionBlock[0x07] == UnitTypeObject && FirePositionBlock[0x0C] == UnitTypeItem - UnitTypeObject
+              && FirePositionBlock[0x11] == UnitTypeTile - UnitTypeItem);
+
+// 490D18 lea r14,[rcx+2230h]; 490D60/490D71 states 7 and 186 through
+// STATES_CheckState; 490D8B call rsi with (game, player, arg).
+static_assert(LivingPlayersBody[0x18] == 0x4C && LivingPlayersBody[0x1B] == 0x30 && LivingPlayersBody[0x1C] == 0x22);
+static_assert(LivingPlayersBody[0x68] == 0xE8 && BranchTarget(LivingPlayersBody, LivingPlayersRva, 0x68) == CheckStateRva
+              && LivingPlayersBody[0x61] == 7);
+static_assert(LivingPlayersBody[0x79] == 0xE8 && BranchTarget(LivingPlayersBody, LivingPlayersRva, 0x79) == CheckStateRva
+              && LivingPlayersBody[0x72] == 0xBA);
+static_assert(LivingPlayersBody[0x8B] == 0xFF && LivingPlayersBody[0x8C] == 0xD6);
+
+// 4FF9B1 pet lists at +98h, 4FF9D8 'all' is the fifth argument, 4FFA45
+// call 5014C0; 501508 type 1 to 48FE80, 501526 call r14 with
+// (game, player, pet, arg).
+static_assert(PetIterateBody[0x24] == 0x98 && PetIterateBody[0x4D] == 0x90);
+static_assert(PetIterateBody[0xB5] == 0xE8 && BranchTarget(PetIterateBody, PetIterateRva, 0xB5) == PetWalkRva);
+static_assert(PetWalkBody[0x50] == 0xE8 && BranchTarget(PetWalkBody, PetWalkRva, 0x50) == GetServerUnitRva
+              && PetWalkBody[0x49] == 1);
+static_assert(PetWalkBody[0x66] == 0x41 && PetWalkBody[0x67] == 0xFF && PetWalkBody[0x68] == 0xD6);
+
 // SELECTION-LOGIC-BEGIN
 // Pure selection logic. It holds no game state: everything comes in through
 // NativeCalls, so the offline check can run it against the original machine
@@ -992,6 +1374,7 @@ inline auto RegenPerFrame(std::int32_t maximum, std::int32_t percentPerSecond) n
 
 constexpr char         RemovalSection[]   = "removal";
 constexpr char         EffectsSection[]   = "effects";
+constexpr char         SharingSection[]   = "sharing";
 constexpr std::size_t  InitialConfigBytes = 16'384;
 constexpr std::size_t  MaximumConfigBytes = 1'048'576;
 constexpr std::size_t  RejectedSampleSize = 5;
@@ -999,14 +1382,17 @@ constexpr std::int32_t MaximumCode        = 255;
 constexpr std::int32_t MaximumClass       = 7;
 constexpr std::size_t  MaximumStatList    = 16;
 constexpr std::int32_t MaximumStatId      = 0xFFFF;
+constexpr std::int32_t MinimumRadius      = 1;
+constexpr std::int32_t MaximumRadius      = 1000;
 
 constexpr char DefaultConfigToml[] =
     "# Shrine Rework\n"
     "#\n"
-    "# Two parts, each with its own switch:\n"
+    "# Three parts, each with its own switch:\n"
     "#   [removal]  takes shrine types out of the game\n"
     "#   [effects]  changes what the Armor, Combat, Resist, Skill and Mana\n"
     "#              Recharge shrines give\n"
+    "#   [sharing]  gives a clicked shrine's effect to everyone around it\n"
     "#\n"
     "# Durations are not changed here: every shrine lasts its shrines.txt\n"
     "# Duration in frames (25 frames = 1 second, 1500 = 1 minute).\n"
@@ -1014,8 +1400,8 @@ constexpr char DefaultConfigToml[] =
     "# Server side only. In single player the game hosts its own server, so it\n"
     "# applies there too.\n"
     "#\n"
-    "# Console command: shrines (status, removed Codes, what was assigned, and the\n"
-    "# shrine effect counters)\n"
+    "# Console command: shrines (status, removed Codes, what was assigned, the\n"
+    "# shrine effect counters and who sharing reached)\n"
     "\n"
     "# ---------------------------------------------------------------------------\n"
     "# Removal\n"
@@ -1129,7 +1515,46 @@ constexpr char DefaultConfigToml[] =
     "# shrine state (135). The maximums are taken when the shrine is clicked.\n"
     "# Replaces the game's mana regeneration bonus, so its shrines.txt Arg0 is not\n"
     "# used. 0 turns this off.\n"
-    "mana_recharge_regen_percent = 2\n";
+    "mana_recharge_regen_percent = 2\n"
+    "\n"
+    "# ---------------------------------------------------------------------------\n"
+    "# Sharing\n"
+    "# ---------------------------------------------------------------------------\n"
+    "# When a shrine is clicked, everyone within the radius below gets its effect\n"
+    "# too: every other player, in your party or not, and every hireling and\n"
+    "# summon of any player. The one who clicks gets it exactly as before. The\n"
+    "# radius is measured from the shrine. Dead units, player corpses and units in\n"
+    "# another act are left out.\n"
+    "#\n"
+    "# Who gets which shrine (shrines.txt Code):\n"
+    "#   everyone in range       1 Refilling, 2 Health, 3 Mana, 6 Armor, 7 Combat,\n"
+    "#                           8 to 11 Resist Fire, Cold, Lightning and Poison,\n"
+    "#                           12 Skill, 13 Mana Recharge, 15 Experience, and a\n"
+    "#                           Code with no effect of its own (the game refills\n"
+    "#                           life and mana for it)\n"
+    "#   other players only      4 Health Exchange, 5 Mana Exchange, 14 Stamina,\n"
+    "#                           16 Enirhs, 18 Gem. They work on a player's own\n"
+    "#                           stamina, name or inventory: on a summon, Enirhs\n"
+    "#                           would crash the game and Gem would drop a gem\n"
+    "#                           next to it.\n"
+    "#   only the one clicking   17 Portal, 19 Fire, 20 Monster, 21 Exploding,\n"
+    "#                           22 Poison. They act on the area around the\n"
+    "#                           shrine, so sharing them would open several\n"
+    "#                           portals, release several novas or upgrade\n"
+    "#                           several monsters.\n"
+    "#\n"
+    "# Everyone gets the effect as [effects] above sets it.\n"
+    "\n"
+    "[sharing]\n"
+    "\n"
+    "# Switch for this part. false installs none of it.\n"
+    "enabled = true\n"
+    "\n"
+    "# The radius in yards, from 1 to 1000. A yard is 1.5 game units (subtiles),\n"
+    "# the same yard skill descriptions use: Inner Sight's \"Radius: %d yards\" line\n"
+    "# in skilldesc.txt is its aura range in game units times 2, divided by 3.\n"
+    "# 40 yards = 60 game units.\n"
+    "radius_yards = 40\n";
 
 struct Settings {
     // [removal]
@@ -1144,6 +1569,9 @@ struct Settings {
     std::int32_t                resistMaxBonus = 10;
     std::array<std::int32_t, 3> skillBonus     = { 2, 4, 6 };
     std::int32_t                regenPercent   = 2;
+    // [sharing]
+    bool         sharingEnabled = true;
+    std::int32_t radiusYards    = 40;
 };
 
 struct ListReport {
@@ -1176,6 +1604,7 @@ std::int32_t                RemovedCount{};
 bool                        ConfigFileWasRead{};
 bool                        RemovalConfigUsable{true};
 bool                        EffectsConfigUsable{true};
+bool                        SharingConfigUsable{true};
 std::atomic<bool>           RuleActive{false};
 std::atomic<HookState>      RemovalState{HookState::NotAttempted};
 char                        EffectsInactive[200]{};
@@ -1380,11 +1809,13 @@ enum class Part : std::uint8_t {
     None,
     Removal,
     Effects,
+    Sharing,
 };
 
 auto SectionPart(std::string_view section) noexcept -> Part {
     if (section == RemovalSection) return Part::Removal;
     if (section == EffectsSection) return Part::Effects;
+    if (section == SharingSection) return Part::Sharing;
     return Part::None;
 }
 
@@ -1434,6 +1865,19 @@ void ApplyEffectsScalar(std::string_view key, std::string_view value) noexcept {
             WarnKey("[effects] mana_recharge_regen_percent", "must be a whole number from 0 to 100");
         } else {
             Config.regenPercent = static_cast<std::int32_t>(number);
+        }
+    }
+}
+
+void ApplySharingScalar(std::string_view key, std::string_view value) noexcept {
+    std::int64_t number = 0;
+    if (key == "enabled") {
+        if (!ParseBool(value, Config.sharingEnabled)) WarnKey("[sharing] enabled", "must be true or false");
+    } else if (key == "radius_yards") {
+        if (!ParseInt(value, number) || number < MinimumRadius || number > MaximumRadius) {
+            WarnKey("[sharing] radius_yards", "must be a whole number from 1 to 1000");
+        } else {
+            Config.radiusYards = static_cast<std::int32_t>(number);
         }
     }
 }
@@ -1495,6 +1939,8 @@ void ListNeverClosed(Part part, std::string_view key, ListReport& report) noexce
         ClearRemoved();
     } else if (part == Part::Effects) {
         EffectsConfigUsable = false;
+    } else if (part == Part::Sharing) {
+        SharingConfigUsable = false;
     }
 }
 
@@ -1562,8 +2008,10 @@ void ParseConfig(std::string_view text, ListReport& report) noexcept {
             report.malformed = true;
         } else if (part == Part::Removal) {
             ApplyRemovalScalar(name, value);
-        } else {
+        } else if (part == Part::Effects) {
             ApplyEffectsScalar(name, value);
+        } else {
+            ApplySharingScalar(name, value);
         }
     }
 
@@ -1622,6 +2070,10 @@ void ReadConfiguration() noexcept {
     if (!EffectsConfigUsable) {
         Context->LogError("ShrineRework: a list in [effects] is missing its closing ']'. The effects part is not "
                           "installed.");
+    }
+    if (!SharingConfigUsable) {
+        Context->LogError("ShrineRework: a value in [sharing] opens a list that is never closed. The sharing part is "
+                          "not installed.");
     }
 }
 
@@ -1901,6 +2353,271 @@ auto __fastcall HookedUnitEvent(void* game, std::uint32_t eventId, void* unit, v
         ReducedHits.fetch_add(1, std::memory_order_relaxed);
     }
     return UnitEvent(game, eventId, unit, other, damage);
+}
+
+// ---------------------------------------------------------------------------
+// The sharing hook
+// ---------------------------------------------------------------------------
+
+enum class Reach : std::uint8_t {
+    ClickerOnly,   // acts on the area around the shrine
+    Players,       // acts on a player's own stamina, name or inventory
+    Everyone,      // players, hirelings and summons
+};
+
+// Indexed by shrines.txt Code. Codes 24 and up take the operate function's
+// own refill (58F437), which reaches everyone too.
+constexpr std::array<Reach, ChartSlots> CodeReach{
+    Reach::Everyone,      //  0  no handler: the refill
+    Reach::Everyone,      //  1  Refilling
+    Reach::Everyone,      //  2  Health
+    Reach::Everyone,      //  3  Mana
+    Reach::Players,       //  4  Health Exchange
+    Reach::Players,       //  5  Mana Exchange
+    Reach::Everyone,      //  6  Armor
+    Reach::Everyone,      //  7  Combat
+    Reach::Everyone,      //  8  Resist Fire
+    Reach::Everyone,      //  9  Resist Cold
+    Reach::Everyone,      // 10  Resist Lightning
+    Reach::Everyone,      // 11  Resist Poison
+    Reach::Everyone,      // 12  Skill
+    Reach::Everyone,      // 13  Mana Recharge
+    Reach::Players,       // 14  Stamina
+    Reach::Everyone,      // 15  Experience
+    Reach::Players,       // 16  Enirhs
+    Reach::ClickerOnly,   // 17  Portal
+    Reach::Players,       // 18  Gem
+    Reach::ClickerOnly,   // 19  Fire
+    Reach::ClickerOnly,   // 20  Monster
+    Reach::ClickerOnly,   // 21  Exploding
+    Reach::ClickerOnly,   // 22  Poison
+    Reach::Everyone,      // 23  no handler: the refill
+};
+
+constexpr auto ReachOf(std::uint8_t code) noexcept -> Reach {
+    return code < ChartSlots ? CodeReach[code] : Reach::Everyone;
+}
+
+// SHARING-LOGIC-BEGIN
+// A yard is 1.5 game units, so a unit is in range when its distance in game
+// units is at most yards * 3 / 2: 4 * (dx*dx + dy*dy) <= 9 * yards * yards,
+// with no rounding. Coordinates are words, so nothing here can overflow.
+constexpr auto WithinYards(std::int64_t dx, std::int64_t dy, std::int64_t yards) noexcept -> bool {
+    return 4 * (dx * dx + dy * dy) <= 9 * yards * yards;
+}
+// SHARING-LOGIC-END
+
+using ShrineOperateFn      = std::int64_t(__fastcall*)(std::uint8_t* operate) noexcept;
+using ObjectShrineRecordFn = const std::uint8_t*(__fastcall*)(void* object) noexcept;
+using UnitIsDeadFn         = std::int32_t(__fastcall*)(void* unit) noexcept;
+using UnitRoomFn           = void*(__fastcall*)(void* unit) noexcept;
+using PathCoordinateFn     = std::int32_t(__fastcall*)(void* path) noexcept;
+using ActOfLevelFn         = std::uint8_t(__fastcall*)(std::uint8_t dataContext, std::uint32_t levelId) noexcept;
+using PlayerCallbackFn     = void(__fastcall*)(void* game, void* player, void* arg) noexcept;
+using LivingPlayersFn      = void(__fastcall*)(void* game, PlayerCallbackFn callback, void* arg) noexcept;
+using PetCallbackFn        = void(__fastcall*)(void* game, void* owner, void* pet, void* arg) noexcept;
+using PetIterateFn         = void(__fastcall*)(void* game, void* player, PetCallbackFn callback, void* arg,
+                                               std::uint8_t all) noexcept;
+
+constexpr std::size_t OperateRecordBytes  = 0x24;   // game, shrine, player, object control, int32 row
+constexpr std::size_t OperateRecordCopy   = 0x28;
+constexpr std::size_t MaximumScanPlayers  = 64;     // a D2R game holds 8
+constexpr std::size_t MaximumShareTargets = 512;
+
+ShrineOperateFn      OriginalShrineOperate{};
+ObjectShrineRecordFn ObjectShrineRecord{};
+UnitIsDeadFn         UnitIsDead{};
+UnitRoomFn           UnitRoom{};
+PathCoordinateFn     PathGetX{};
+PathCoordinateFn     PathGetY{};
+ActOfLevelFn         ActOfLevel{};
+LivingPlayersFn      LivingPlayers{};
+PetIterateFn         PetIterate{};
+ShrineHandlerFn      RefillHandler{};
+
+std::atomic<bool>          SharingActive{false};
+char                       SharingInactive[200]{};
+std::atomic<std::uint64_t> SharedUses{};
+std::atomic<std::uint64_t> ClickerOnlyUses{};
+std::atomic<std::uint64_t> ReachedPlayers{};
+std::atomic<std::uint64_t> ReachedPets{};
+std::atomic<std::uint64_t> CappedScans{};
+std::atomic<std::uint32_t> LastShareCode{};
+std::atomic<std::uint32_t> LastSharePlayers{};
+std::atomic<std::uint32_t> LastSharePets{};
+std::atomic<bool>          LastShareClickerOnly{false};
+std::atomic<bool>          AnyShare{false};
+
+void SetSharingInactive(const char* reason) noexcept {
+    std::snprintf(SharingInactive, sizeof(SharingInactive), "%s", reason);
+}
+
+struct ShareScan {
+    void*                                  clicker     = nullptr;
+    std::int32_t                           centerX     = 0;
+    std::int32_t                           centerY     = 0;
+    std::int32_t                           yards       = 0;
+    std::uint8_t                           dataContext = 0;
+    std::uint8_t                           act         = 0;
+    bool                                   capped      = false;
+    std::uint32_t                          playerCount = 0;   // every living player, for the pet walk
+    std::uint32_t                          targetCount = 0;
+    std::array<void*, MaximumScanPlayers>  players{};
+    std::array<void*, MaximumShareTargets> targets{};
+};
+
+// 59127C..5912F5, as the Fire shrine reads a position.
+auto UnitPosition(void* unit, std::int32_t& x, std::int32_t& y) noexcept -> bool {
+    const auto* fields = static_cast<const std::uint8_t*>(unit);
+    auto*       path   = static_cast<std::uint8_t*>(ReadPointer(fields, UnitPathOffset));
+    if (path == nullptr) return false;
+    const std::int32_t type = ReadI32(fields + UnitTypeOffset);
+    if (type == UnitTypeObject || type == UnitTypeItem || type == UnitTypeTile) {
+        x = ReadI32(path + StaticPathX);
+        y = ReadI32(path + StaticPathY);
+    } else {
+        x = PathGetX(path);
+        y = PathGetY(path);
+    }
+    return true;
+}
+
+auto UnitAct(void* unit, std::uint8_t dataContext, std::uint8_t& act) noexcept -> bool {
+    void* room = UnitRoom(unit);
+    if (room == nullptr) return false;
+    act = ActOfLevel(dataContext, LevelIdFromRoom(room));
+    return true;
+}
+
+auto InRange(const ShareScan& scan, void* unit) noexcept -> bool {
+    if (unit == nullptr || unit == scan.clicker || UnitIsDead(unit) != 0) return false;
+    std::int32_t x = 0;
+    std::int32_t y = 0;
+    if (!UnitPosition(unit, x, y)
+        || !WithinYards(static_cast<std::int64_t>(x) - scan.centerX, static_cast<std::int64_t>(y) - scan.centerY,
+                        scan.yards)) {
+        return false;
+    }
+    std::uint8_t act = 0;
+    return UnitAct(unit, scan.dataContext, act) && act == scan.act;
+}
+
+void AddTarget(ShareScan& scan, void* unit) noexcept {
+    for (std::uint32_t index = 0; index < scan.targetCount; ++index) {
+        if (scan.targets[index] == unit) return;
+    }
+    if (scan.targetCount >= scan.targets.size()) {
+        scan.capped = true;
+        return;
+    }
+    scan.targets[scan.targetCount++] = unit;
+}
+
+// 0x490D00 calls this with (game, player, arg).
+void __fastcall CollectPlayer(void* /*game*/, void* player, void* arg) noexcept {
+    auto& scan = *static_cast<ShareScan*>(arg);
+    if (scan.playerCount >= scan.players.size()) {
+        scan.capped = true;
+        return;
+    }
+    scan.players[scan.playerCount++] = player;
+}
+
+// 0x5014C0 calls this with (game, player, pet, arg).
+void __fastcall CollectPet(void* /*game*/, void* /*owner*/, void* pet, void* arg) noexcept {
+    auto& scan = *static_cast<ShareScan*>(arg);
+    if (InRange(scan, pet)) AddTarget(scan, pet);
+}
+
+// 58F435..58F461: the chart slot of the Code, or the refill when it has none.
+auto ShareHandler(std::uint8_t code) noexcept -> ShrineHandlerFn {
+    if (code < ChartSlots) {
+        ShrineHandlerFn handler{};
+        std::memcpy(&handler, reinterpret_cast<const void*>(Base + ShrineChartRva + ChartStride * code),
+                    sizeof(handler));
+        if (handler != nullptr) return handler;
+    }
+    return RefillHandler;
+}
+
+void NoteCapped(std::uint8_t code) noexcept {
+    const std::uint64_t count = CappedScans.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count <= ProblemLogLimit) {
+        D2RL::LogWarnF(Context,
+                       "ShrineRework: a shrine (Code %u) found more than %u players or %u units in range; the rest "
+                       "did not get it.%s",
+                       static_cast<unsigned>(code), static_cast<unsigned>(MaximumScanPlayers),
+                       static_cast<unsigned>(MaximumShareTargets),
+                       count == ProblemLogLimit ? " Further cases are only counted." : "");
+    }
+}
+
+void ShareShrine(const std::uint8_t* operate) noexcept {
+    void* game   = ReadPointer(operate, OperateGame);
+    void* shrine = ReadPointer(operate, OperateObject);
+    if (game == nullptr || shrine == nullptr) return;
+    const std::uint8_t* record = ObjectShrineRecord(shrine);
+    if (record == nullptr) return;
+
+    const std::uint8_t code  = record[RecordCode];
+    const Reach        reach = ReachOf(code);
+    LastShareCode.store(code, std::memory_order_relaxed);
+    if (reach == Reach::ClickerOnly) {
+        ClickerOnlyUses.fetch_add(1, std::memory_order_relaxed);
+        LastShareClickerOnly.store(true, std::memory_order_relaxed);
+        LastSharePlayers.store(0, std::memory_order_relaxed);
+        LastSharePets.store(0, std::memory_order_relaxed);
+        AnyShare.store(true, std::memory_order_release);
+        return;
+    }
+
+    ShareScan scan{};
+    scan.clicker     = ReadPointer(operate, OperatePlayer);
+    scan.yards       = Config.radiusYards;
+    scan.dataContext = *(static_cast<const std::uint8_t*>(game) + GameDataContext);
+    if (!UnitPosition(shrine, scan.centerX, scan.centerY) || !UnitAct(shrine, scan.dataContext, scan.act)) return;
+
+    LivingPlayers(game, &CollectPlayer, &scan);
+    for (std::uint32_t index = 0; index < scan.playerCount; ++index) {
+        if (InRange(scan, scan.players[index])) AddTarget(scan, scan.players[index]);
+    }
+    const std::uint32_t players = scan.targetCount;
+    if (reach == Reach::Everyone) {
+        // Every player's pets, the clicker's included, wherever the player is.
+        for (std::uint32_t index = 0; index < scan.playerCount; ++index) {
+            PetIterate(game, scan.players[index], &CollectPet, &scan, 0);
+        }
+    }
+    const std::uint32_t pets = scan.targetCount - players;
+
+    // 58F44C..58F45C once per unit, on a copy of the record with that unit at +10.
+    const ShrineHandlerFn handler = ShareHandler(code);
+    std::uint8_t          copy[OperateRecordCopy]{};
+    for (std::uint32_t index = 0; index < scan.targetCount; ++index) {
+        std::memcpy(copy, operate, OperateRecordBytes);
+        void* target = scan.targets[index];
+        std::memcpy(copy + OperatePlayer, &target, sizeof(target));
+        handler(scan.dataContext, copy, record);
+    }
+
+    SharedUses.fetch_add(1, std::memory_order_relaxed);
+    ReachedPlayers.fetch_add(players, std::memory_order_relaxed);
+    ReachedPets.fetch_add(pets, std::memory_order_relaxed);
+    LastShareClickerOnly.store(false, std::memory_order_relaxed);
+    LastSharePlayers.store(players, std::memory_order_relaxed);
+    LastSharePets.store(pets, std::memory_order_relaxed);
+    AnyShare.store(true, std::memory_order_release);
+    if (scan.capped) NoteCapped(code);
+}
+
+auto __fastcall HookShrineOperate(std::uint8_t* operate) noexcept -> std::int64_t {
+    const std::int64_t used = OriginalShrineOperate(operate);
+    // 58F540: 1 once the shrine has been used now, 0 when it already was.
+    if (static_cast<std::uint32_t>(used) == 1 && operate != nullptr && RuleActive.load(std::memory_order_acquire)
+        && SharingActive.load(std::memory_order_acquire)) {
+        ShareShrine(operate);
+    }
+    return used;
 }
 
 // ---------------------------------------------------------------------------
@@ -2206,10 +2923,89 @@ void InstallEffects() noexcept {
                    Config.regenPercent);
 }
 
+auto VerifyChartHandlers() noexcept -> bool {
+    for (std::size_t code = 0; code < ChartSlots; ++code) {
+        const std::uint64_t expected = ChartHandlers[code] == 0 ? 0 : static_cast<std::uint64_t>(Base) + ChartHandlers[code];
+        if (!Context->CheckExpectedBytes(ShrineChartRva + ChartStride * code, &expected, sizeof(expected))) {
+            D2RL::LogErrorF(Context,
+                            "ShrineRework: shrine chart slot %u at 0x%llX does not hold the verified handler, or "
+                            "another plugin changed it.",
+                            static_cast<unsigned>(code),
+                            static_cast<unsigned long long>(ShrineChartRva + ChartStride * code));
+            return false;
+        }
+    }
+    return true;
+}
+
+auto VerifySharingContract() noexcept -> bool {
+    return Verify(ShrineOperateRva, ShrineOperateBody, sizeof(ShrineOperateBody), "The shrine operate function (OperateFn 2)")
+        && Verify(RefillHandlerRva, RefillHandlerBody, sizeof(RefillHandlerBody), "The Refilling shrine handler")
+        && VerifyChartHandlers()
+        && Verify(FirePositionRva, FirePositionBlock, sizeof(FirePositionBlock), "The Fire shrine's position reads")
+        && Verify(UnitIsDeadRva, UnitIsDeadBody, sizeof(UnitIsDeadBody), "The death check")
+        && Verify(UnitRoomRva, UnitRoomBody, sizeof(UnitRoomBody), "The unit room getter")
+        && Verify(LevelIdFromRoomRva, LevelIdFromRoomBody, sizeof(LevelIdFromRoomBody), "The room level id getter")
+        && Verify(ActOfLevelRva, ActOfLevelBody, sizeof(ActOfLevelBody), "The act resolver")
+        && Verify(LivingPlayersRva, LivingPlayersBody, sizeof(LivingPlayersBody), "The living player walk")
+        && Verify(PetIterateRva, PetIterateBody, sizeof(PetIterateBody), "The pet walk")
+        && Verify(PetWalkRva, PetWalkBody, sizeof(PetWalkBody), "The pet list walk");
+}
+
+// yards * 1.5, as text.
+void FormatGameUnits(char* out, std::size_t size, std::int32_t yards) noexcept {
+    const std::int32_t tenths = yards * 15;
+    if (tenths % 10 == 0) {
+        std::snprintf(out, size, "%d", tenths / 10);
+    } else {
+        std::snprintf(out, size, "%d.%d", tenths / 10, tenths % 10);
+    }
+}
+
+void InstallSharing() noexcept {
+    if (!Config.sharingEnabled) {
+        SetSharingInactive("off in the config file");
+        Context->LogInfo("ShrineRework: sharing not installed, turned off in the config file.");
+        return;
+    }
+    if (!SharingConfigUsable) {
+        SetSharingInactive("the [sharing] config could not be read, see the log");
+        return;
+    }
+    if (!VerifySharingContract()) {
+        SetSharingInactive("this game build does not match, see the log");
+        return;
+    }
+
+    ObjectShrineRecord = At<ObjectShrineRecordFn>(ObjectShrineRecordRva);
+    UnitIsDead         = At<UnitIsDeadFn>(UnitIsDeadRva);
+    UnitRoom           = At<UnitRoomFn>(UnitRoomRva);
+    PathGetX           = At<PathCoordinateFn>(PathGetXRva);
+    PathGetY           = At<PathCoordinateFn>(PathGetYRva);
+    LevelIdFromRoom    = At<LevelIdFromRoomFn>(LevelIdFromRoomRva);
+    ActOfLevel         = At<ActOfLevelFn>(ActOfLevelRva);
+    LivingPlayers      = At<LivingPlayersFn>(LivingPlayersRva);
+    PetIterate         = At<PetIterateFn>(PetIterateRva);
+    RefillHandler      = At<ShrineHandlerFn>(RefillHandlerRva);
+
+    if (!Hook(ShrineOperateRva, ShrineOperateBody, ShrineOperateHookSize, reinterpret_cast<void*>(&HookShrineOperate),
+              reinterpret_cast<void**>(&OriginalShrineOperate), "the shrine operate function")) {
+        SetSharingInactive("the loader refused the hook on the shrine operate function, see the log");
+        return;
+    }
+    SharingActive.store(true, std::memory_order_release);
+
+    char units[24]{};
+    FormatGameUnits(units, sizeof(units), Config.radiusYards);
+    D2RL::LogInfoF(Context, "ShrineRework: sharing installed, radius %d yards (%s game units) around the shrine.",
+                   Config.radiusYards, units);
+}
+
 void Install() noexcept {
     RuleActive.store(true, std::memory_order_release);
     InstallRemoval();
     InstallEffects();
+    InstallSharing();
 }
 
 // ---------------------------------------------------------------------------
@@ -2231,6 +3027,50 @@ auto StateText(HookState state) noexcept -> const char* {
 
 auto OnOff(const std::atomic<bool>& flag) noexcept -> const char* {
     return flag.load(std::memory_order_relaxed) ? "on" : "off";
+}
+
+void WriteSharingStatus(const D2RL::PluginContext* plugin) noexcept {
+    char line[512]{};
+    if (!SharingActive.load(std::memory_order_acquire)) {
+        std::snprintf(line, sizeof(line), "Sharing: inactive, %s",
+                      SharingInactive[0] != '\0' ? SharingInactive : "never attempted");
+        plugin->WriteConsoleMessage(line);
+        return;
+    }
+    char units[24]{};
+    FormatGameUnits(units, sizeof(units), Config.radiusYards);
+    const std::uint64_t clickerOnly = ClickerOnlyUses.load(std::memory_order_relaxed);
+    std::snprintf(line, sizeof(line),
+                  "Sharing on: %d yards (%s game units) | shrines used %llu, %llu of them clicker only | reached %llu "
+                  "player%s, %llu hireling%s/summon%s",
+                  Config.radiusYards, units,
+                  static_cast<unsigned long long>(SharedUses.load(std::memory_order_relaxed) + clickerOnly),
+                  static_cast<unsigned long long>(clickerOnly),
+                  static_cast<unsigned long long>(ReachedPlayers.load(std::memory_order_relaxed)),
+                  ReachedPlayers.load(std::memory_order_relaxed) == 1 ? "" : "s",
+                  static_cast<unsigned long long>(ReachedPets.load(std::memory_order_relaxed)),
+                  ReachedPets.load(std::memory_order_relaxed) == 1 ? "" : "s",
+                  ReachedPets.load(std::memory_order_relaxed) == 1 ? "" : "s");
+    plugin->WriteConsoleMessage(line);
+    if (AnyShare.load(std::memory_order_acquire)) {
+        const std::uint32_t players = LastSharePlayers.load(std::memory_order_relaxed);
+        const std::uint32_t pets    = LastSharePets.load(std::memory_order_relaxed);
+        if (LastShareClickerOnly.load(std::memory_order_relaxed)) {
+            std::snprintf(line, sizeof(line), "last: Code %u, clicker only",
+                          LastShareCode.load(std::memory_order_relaxed));
+        } else {
+            std::snprintf(line, sizeof(line), "last: Code %u reached %u player%s and %u hireling%s/summon%s",
+                          LastShareCode.load(std::memory_order_relaxed), players, players == 1 ? "" : "s", pets,
+                          pets == 1 ? "" : "s", pets == 1 ? "" : "s");
+        }
+        plugin->WriteConsoleMessage(line);
+    }
+    const std::uint64_t capped = CappedScans.load(std::memory_order_relaxed);
+    if (capped != 0) {
+        std::snprintf(line, sizeof(line), "uses with more units in range than the %u cap: %llu",
+                      static_cast<unsigned>(MaximumShareTargets), static_cast<unsigned long long>(capped));
+        plugin->WriteConsoleMessage(line);
+    }
 }
 
 auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* command, void*) noexcept
@@ -2291,6 +3131,7 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
     if (EffectsInactive[0] != '\0') {
         std::snprintf(line, sizeof(line), "Effects: inactive, %s", EffectsInactive);
         plugin->WriteConsoleMessage(line);
+        WriteSharingStatus(plugin);
         return D2RL::ConsoleCommandResult::Handled;
     }
     std::snprintf(line, sizeof(line), "Armor %s: %d%% less damage | taken %llu | hits reduced %llu",
@@ -2315,6 +3156,7 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
                   static_cast<unsigned long long>(ManaClicks.load(std::memory_order_relaxed)),
                   LastLifePerFrame.load(std::memory_order_relaxed), LastManaPerFrame.load(std::memory_order_relaxed));
     plugin->WriteConsoleMessage(line);
+    WriteSharingStatus(plugin);
     return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -2323,11 +3165,11 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.shrine-rework",
     .name        = "Shrine Rework",
-    .version     = "1.0.1",
+    .version     = "1.1.0",
     .author      = "CelestialRayOne",
-    .description = "Takes chosen shrine types out of the game and reworks the Armor, Combat, Resist, Skill and Mana "
-                   "Recharge shrines.",
-    // Server: shrine selection, shrine effects and damage are resolved on the server.
+    .description = "Takes chosen shrine types out of the game, reworks the Armor, Combat, Resist, Skill and Mana "
+                   "Recharge shrines, and gives a clicked shrine's effect to everyone around it.",
+    // Server: shrine selection, shrine effects, sharing and damage are resolved on the server.
     .flags       = D2RL::PluginFlags::Server | D2RL::PluginFlags::NativeHooks,
 };
 
@@ -2349,8 +3191,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     // unload the DLL and take the command with it, leaving no in-game way to
     // see why a part is off.
     if (!Context->RegisterConsoleCommand("shrines", &StatusCommand,
-                                         "Reports Shrine Rework status: removed shrines, assignments and shrine "
-                                         "effects.")) {
+                                         "Reports Shrine Rework status: removed shrines, assignments, shrine "
+                                         "effects and sharing.")) {
         Context->LogWarn("ShrineRework: the status console command was refused.");
     }
 

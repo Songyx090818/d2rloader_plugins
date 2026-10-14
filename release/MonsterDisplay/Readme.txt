@@ -1,0 +1,1 @@
+﻿Put monsterdisplayframes folder inside panel folder (data\hd\global\ui\PANEL\MonsterDisplayFrames\)

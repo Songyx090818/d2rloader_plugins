@@ -10,6 +10,9 @@
 //    2. SINGLE EMANATION. The same aura on both buttons emanates once.
 //    3. MOVE ONLY CLICKS. A left click on a monster with an aura on the left
 //       button moves toward it instead of doing nothing.
+//    4. LIVE LEVEL. Every tick the left aura takes its level from the skill on
+//       the left button, as the right button's aura does, so an aura that
+//       grants skill levels to itself compounds and gear changes reach it.
 //
 //  Every address below was read out of the dumped D2RLoader 1.3.0 image, re-checked
 //  against the 1.3.1 image (only the SetUnitCastId thunk calls moved), and
@@ -43,12 +46,25 @@
 //            never stacks timers.
 //
 //  0x437460  the type 8 event(game, unit, customId, customParam, castId)
-//      id -1  reads the RIGHT button only (0x437499), performs at 0x43757E.
+//      id -1  reads the RIGHT button only (0x437499), computes its level
+//             every tick at 0x4374CE (0x33D1E0, ReadWideSkillLevel(unit,
+//             node, 1, 0), every bonus included), performs at 0x43757E.
 //      id > 0 revalidates: state live, state stat list, unit still has the
-//             skill, stat 350 == skill. Performs at 0x4377BC
+//             skill, stat 350 == skill. Its level is NOT computed: 0x4376B5
+//             reads stat 351 (modifierlist_level) from the aura state's stat
+//             list (0x2F5DF0, ReadWideListStat(context, list, 351, 0)) into
+//             r12d, the only level this branch uses. Performs at 0x4377BC
 //             (ServerDoSkill: rcx=rsi game, rdx=rdi unit, r8d=ebp skill,
 //             r9d=r12d level, then 1, 0, 0; eax unused afterwards), re-arms at
-//             0x4377E7. Any failure calls 0x432450.
+//             0x4377E7 (in town, for skills without InTown, only re-arms at
+//             0x43773C), both with r12d. Any failure calls 0x432450.
+//
+//  Stock creates id > 0 timers only for a skill a unit casts through its
+//  skill mode (0x436B10: level computed once, perform, arm with the skill id),
+//  so that timer keeps the cast level. Every application of an aura stamps
+//  350 = skill, 351 = level, 202 = cast id onto the state list it lands on
+//  (0x561D16, 0x561D38, 0x561D5A in the srvdofunc 65 callback 0x5616F0), so
+//  351 holds the level of whichever application of that aura state came last.
 //
 //  0x432450  failure({game, unit}, skill, record): deletes (8, skill). It
 //            removes the state only for skills with byte[rec+29h] &
@@ -87,6 +103,14 @@
 //  0x4377BC  call relay (single_emanation). A remembered left timer whose skill
 //            is also on the right button, with the right timer running, skips
 //            the perform and keeps re-arming.
+//  0x4376B5  call relay (live_level). Stub: r8 = rdi (unit), r9d = ebp (skill),
+//            both set at 0x437486 / 0x437483 and untouched up to the call. The
+//            stock read still runs. While the 0x437460 hook runs a remembered
+//            left timer of that unit and skill (exact cast id), the returned
+//            level is ReadWideSkillLevel(unit, left button node, 1, 0) instead,
+//            exactly what the id -1 branch does for the right button. It feeds
+//            the perform and both re-arms through r12d. A level of 0 or less
+//            keeps the stored one. Every other timer gets the stored level.
 //
 // -----------------------------------------------------------------------------
 //  MOVE ONLY CLICKS (client)
@@ -134,7 +158,7 @@
 namespace CelestialRayOne::LeftClickAuras {
 namespace {
 
-constexpr char PluginVersion[] = "1.0.0";
+constexpr char PluginVersion[] = "1.1.0";
 
 // ---------------------------------------------------------------------------
 //  Default configuration. EnsureConfig writes this text on first load, and it
@@ -234,9 +258,43 @@ single_emanation = true
 #   call at 0x102753 in the client's world click handler (0x102490)
 move_only_clicks = true
 
-# Writes a line to the plugin log for the first 64 aura starts, stops and
-# skipped emanations. Keep false for normal play. The console command
-# "leftclickauras" always shows what is installed and the counters.
+# -----------------------------------------------------------------------------
+# live_level
+#
+# The problem
+#   The left aura runs on the game's timer for cast skills, which keeps casting
+#   at the level the aura had when it started (stat 351, modifierlist_level,
+#   on the aura's state). The right button's timer re-reads its skill level
+#   every tick instead. So on the left:
+#     - an aura that grants skill levels to itself never compounds (Divinity
+#       gives its +all skills once and never counts them toward itself),
+#     - gear or points added after the aura started never raise it, and gear
+#       removed afterwards never lowers it,
+#     - another application of the same aura onto you (an item with that aura,
+#       another unit's aura that reaches you) stores its own level, and the
+#       left aura takes that level on its next tick.
+#
+# What changes
+#   Every tick the left aura takes its level from the skill on the left
+#   button, with every bonus, the same way the right button's aura does. An
+#   aura that grants skill levels to itself compounds until it settles, as it
+#   does on the right button: Divinity gives back 1 level for every 6 of its
+#   own and settles within a few ticks. An aura that gives itself 1 level or
+#   more per level of its own would keep climbing, on either button. If the
+#   skill reports no level, the stored level is kept. Timers the game starts
+#   itself (monsters, cast skills) keep the stored level.
+#
+# Where
+#   call at 0x4376B5 in the aura timer (0x437460), where the timer reads the
+#   stored level
+#
+# Needs left_slot_auras.
+live_level = true
+
+# Writes a line to the plugin log for the first 64 aura starts, stops, skipped
+# emanations and left aura level changes. Keep false for normal play. The
+# console command "leftclickauras" always shows what is installed and the
+# counters.
 diagnostics = false
 )TOML";
 
@@ -253,6 +311,7 @@ constexpr std::size_t   SkillRecordAuraStateOffset   = 0xA0;   // int16, 0x438BE
 constexpr std::size_t   ClickCommandFlagsOffset      = 0x00;
 constexpr std::uint32_t ClickCommandLeftButton       = 0x01;
 constexpr std::int32_t  UnitTypePlayer               = 0;
+constexpr std::int32_t  ModifierListLevelStat        = 351;    // mov r8d,15Fh at 0x4376AC
 constexpr std::uint8_t  PeriodicSkillEventType       = 8;
 constexpr std::uint32_t RightTimerCustomId           = 0xFFFFFFFFU;
 constexpr std::size_t   UnitEventListOffset          = 0x148;  // 0x48FE50
@@ -274,6 +333,10 @@ constexpr std::uint64_t RightAuraStateOffCallRva     = 0x438C33;
 constexpr std::uint64_t PeriodicSkillEventRva        = 0x437460;
 constexpr std::uint64_t LeftTimerPerformWindowRva    = 0x437761;
 constexpr std::uint64_t LeftTimerPerformCallRva      = 0x4377BC;
+constexpr std::uint64_t LeftTimerLevelWindowRva      = 0x437627;
+constexpr std::uint64_t LeftTimerLevelCallRva        = 0x4376B5;
+constexpr std::uint64_t ReadListStatRva              = 0x2F5DF0;  // loader thunk to ReadWideListStat
+constexpr std::uint64_t ReadSkillLevelRva            = 0x33D1E0;  // loader thunk to ReadWideSkillLevel
 constexpr std::uint64_t RevalidationFailureRva       = 0x432450;
 constexpr std::uint64_t AuraStartRva                 = 0x43B680;
 constexpr std::uint64_t AuraStartArmWindowRva        = 0x43B8C2;
@@ -413,6 +476,26 @@ constexpr auto LeftTimerPerformWindow = std::to_array<std::uint8_t>({
     0x4C, 0x24, 0x40,
 });
 
+// 0x437627..0x4376C5, the id > 0 branch from its entry (0x437490 jne, the only
+// way in) to the level read (0x4376B5 -> 0x2F5DF0 with 351, 0) and its store
+// into r12d. Nothing in it writes rdi or rbp, and no branch lands inside it.
+constexpr auto LeftTimerLevelWindow = std::to_array<std::uint8_t>({
+    0x85, 0xED, 0x0F, 0x8E, 0xD8, 0x01, 0x00, 0x00, 0x0F, 0xB6, 0x89, 0x06,
+    0x01, 0x00, 0x00, 0x8B, 0xD5, 0xE8, 0x53, 0x01, 0xC6, 0xFF, 0x48, 0x8B,
+    0xD8, 0x48, 0x85, 0xC0, 0x0F, 0x84, 0xAF, 0x01, 0x00, 0x00, 0x66, 0x83,
+    0xB8, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x8C, 0xA1, 0x01, 0x00, 0x00,
+    0x0F, 0xB6, 0x8E, 0x06, 0x01, 0x00, 0x00, 0x44, 0x0F, 0xBF, 0xB0, 0xA0,
+    0x00, 0x00, 0x00, 0xE8, 0x35, 0xCB, 0xDD, 0xFF, 0x44, 0x3B, 0xF0, 0x0F,
+    0x8D, 0x84, 0x01, 0x00, 0x00, 0x41, 0x8B, 0xD6, 0x48, 0x8B, 0xCF, 0xE8,
+    0x31, 0xDB, 0xEF, 0xFF, 0x85, 0xC0, 0x0F, 0x84, 0x71, 0x01, 0x00, 0x00,
+    0x0F, 0xBF, 0x93, 0xA0, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xCF, 0xE8, 0xAA,
+    0xE2, 0xEB, 0xFF, 0x4C, 0x8B, 0xF0, 0x48, 0x85, 0xC0, 0x0F, 0x84, 0x56,
+    0x01, 0x00, 0x00, 0x0F, 0xB6, 0x8E, 0x06, 0x01, 0x00, 0x00, 0x45, 0x33,
+    0xC9, 0x41, 0xB8, 0x5F, 0x01, 0x00, 0x00, 0x48, 0x8B, 0xD0, 0xE8, 0x36,
+    0xE7, 0xEB, 0xFF, 0x45, 0x33, 0xC0, 0x8B, 0xD5, 0x48, 0x8B, 0xCF, 0x44,
+    0x8B, 0xE0,
+});
+
 // 0x432450..0x432480, the failure path entry and its cleanup mask test.
 constexpr auto RevalidationFailureEntry = std::to_array<std::uint8_t>({
     0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x57, 0x48,
@@ -539,13 +622,18 @@ constexpr auto GetLeftSkillEntry = std::to_array<std::uint8_t>({
     0x75, 0x13,
 });
 
-// The six call sites, stock bytes.
+// FF 25: jmp qword [rip+disp32], the loader's thunk into D2RCore. The
+// displacement depends on the loader build, so only the opcode is checked.
+constexpr auto LoaderThunkJump = std::to_array<std::uint8_t>({0xFF, 0x25});
+
+// The seven call sites, stock bytes.
 constexpr auto LeftSelectCall        = std::to_array<std::uint8_t>({0xE8, 0x7C, 0x61, 0xF0, 0xFF});
 constexpr auto RightAuraStatListCall = std::to_array<std::uint8_t>({0xE8, 0x39, 0xCD, 0xEB, 0xFF});
 constexpr auto RightAuraStateOffCall = std::to_array<std::uint8_t>({0xE8, 0x88, 0xC8, 0xEF, 0xFF});
 constexpr auto LeftTimerPerformCall  = std::to_array<std::uint8_t>({0xE8, 0xEF, 0x34, 0x00, 0x00});
 constexpr auto AuraStartArmCall      = std::to_array<std::uint8_t>({0xE8, 0xAE, 0xF9, 0xFF, 0xFF});
 constexpr auto ClickGateCall         = std::to_array<std::uint8_t>({0xE8, 0x18, 0xD0, 0x23, 0x00});
+constexpr auto LeftTimerLevelCall    = std::to_array<std::uint8_t>({0xE8, 0x36, 0xE7, 0xEB, 0xFF});
 
 // Inline hook entries: whole instructions, none of them relative.
 constexpr std::uint32_t PeriodicSkillEventHookBytes  = 22;  // two home saves, five pushes, sub rsp,50h
@@ -556,23 +644,27 @@ constexpr std::uint32_t RevalidationFailureHookBytes = 15;  // two home saves, p
 //  nothing inside D2R's own code is used as a cave.
 //
 //      +0x000  UNWIND_INFO, no frame (every stub leaves rsp untouched)
-//      +0x010  RUNTIME_FUNCTION table, 6 entries
+//      +0x010  RUNTIME_FUNCTION table, 7 entries
 //      +0x100  mov rax,<bridge> / jmp rax      left select
 //      +0x120  mov rax,<bridge> / jmp rax      right aura stat list
 //      +0x140  mov rax,<bridge> / jmp rax      right aura state off
 //      +0x160  mov rax,<bridge> / jmp rax      left timer perform
 //      +0x180  mov rax,<bridge> / jmp rax      AuraStart arm
 //      +0x1A0  lea r8,[r14-28h] / mov rax,<bridge> / jmp rax   click gate
+//      +0x1C0  mov r8,rdi / mov r9d,ebp / mov rax,<bridge> / jmp rax
+//                                                               left timer level
 //
 //  A stub is reached by the retargeted call, so the return address is on the
 //  stack and the stock arguments are in place: the bridge is entered as if
 //  the game had called it. rax and r8 are volatile and not arguments of the
-//  replaced callees.
+//  replaced callees. At 0x4376B5 r8d and r9d hold the constants 351 and 0,
+//  which the bridge passes to the stock read itself, so the stub can reuse
+//  both registers.
 // ---------------------------------------------------------------------------
 constexpr std::size_t RelayPageBytes           = 0x1000;
 constexpr std::size_t RelayUnwindOffset        = 0x000;
 constexpr std::size_t RelayFunctionTableOffset = 0x010;
-constexpr std::size_t RelayStubCount           = 6;
+constexpr std::size_t RelayStubCount           = 7;
 enum RelayStub : std::size_t {
     StubLeftSelect        = 0,
     StubRightAuraStatList = 1,
@@ -580,9 +672,10 @@ enum RelayStub : std::size_t {
     StubLeftTimerPerform  = 3,
     StubAuraStartArm      = 4,
     StubClickGate         = 5,
+    StubLeftTimerLevel    = 6,
 };
-constexpr std::array<std::size_t, RelayStubCount> RelayStubOffsets{0x100, 0x120, 0x140, 0x160, 0x180, 0x1A0};
-constexpr std::array<std::size_t, RelayStubCount> RelayStubSizes{12, 12, 12, 12, 12, 16};
+constexpr std::array<std::size_t, RelayStubCount> RelayStubOffsets{0x100, 0x120, 0x140, 0x160, 0x180, 0x1A0, 0x1C0};
+constexpr std::array<std::size_t, RelayStubCount> RelayStubSizes{12, 12, 12, 12, 12, 16, 18};
 
 // ---------------------------------------------------------------------------
 //  Native signatures
@@ -605,6 +698,8 @@ using GetStateStatListFn    = void*(__fastcall*)(void* unit, std::int32_t state)
 using UnlinkStatListFn      = void(__fastcall*)(void* unit, void* statList) noexcept;
 using FreeStatListFn        = void(__fastcall*)(std::uint32_t dataContext, void* statList) noexcept;
 using GetUnitTypeFn         = std::int32_t(__fastcall*)(void* unit) noexcept;
+using ReadListStatFn        = std::int32_t(__fastcall*)(std::uint32_t dataContext, void* statList, std::int32_t stat, std::int32_t layer) noexcept;
+using ReadSkillLevelFn      = std::int32_t(__fastcall*)(void* unit, void* skillNode, std::int32_t withBonuses, std::int32_t reserved) noexcept;
 
 // ---------------------------------------------------------------------------
 //  State
@@ -614,6 +709,7 @@ struct Settings {
     bool leftSlotAuras{true};
     bool singleEmanation{true};
     bool moveOnlyClicks{true};
+    bool liveLevel{true};
     bool diagnostics{false};
 };
 
@@ -625,6 +721,7 @@ struct InstallState {
     bool rightRemovalRelays{false};
     bool performRelay{false};
     bool clickRelay{false};
+    bool levelRelay{false};
 };
 
 const D2RL::PluginContext* Context{};
@@ -635,6 +732,7 @@ char                       ConfigSource[48]{"built-in defaults"};
 std::atomic<bool>          ServerActive{false};
 std::atomic<bool>          PerformRelayActive{false};
 std::atomic<bool>          ClientActive{false};
+std::atomic<bool>          LiveLevelActive{false};
 
 SetLeftActiveSkillFn  SetLeftActiveSkill{};
 PeriodicSkillEventFn  OriginalPeriodicSkillEvent{};
@@ -655,6 +753,8 @@ GetStateStatListFn    GetStateStatList{};
 UnlinkStatListFn      UnlinkStatList{};
 FreeStatListFn        FreeStatList{};
 GetUnitTypeFn         GetUnitType{};
+ReadListStatFn        ReadListStat{};
+ReadSkillLevelFn      ReadSkillLevel{};
 
 std::uint8_t* RelayPage{};
 bool          RelayUnwindRegistered{};
@@ -673,6 +773,7 @@ std::array<CallSitePatch, RelayStubCount> CallSites{{
     {LeftTimerPerformCallRva, LeftTimerPerformCall.data(), StubLeftTimerPerform, {}, false},
     {AuraStartArmCallRva, AuraStartArmCall.data(), StubAuraStartArm, {}, false},
     {ClickGateCallRva, ClickGateCall.data(), StubClickGate, {}, false},
+    {LeftTimerLevelCallRva, LeftTimerLevelCall.data(), StubLeftTimerLevel, {}, false},
 }};
 
 std::atomic<std::uint64_t> LeftStarts{};
@@ -684,6 +785,8 @@ std::atomic<std::uint64_t> LeftStopsFailed{};
 std::atomic<std::uint64_t> SharedStatesKept{};
 std::atomic<std::uint64_t> EmanationsSkipped{};
 std::atomic<std::uint64_t> MoveOnlyClicks{};
+std::atomic<std::uint64_t> LiveLevelTicks{};
+std::atomic<std::uint64_t> LiveLevelChanges{};
 std::atomic<std::uint32_t> DiagnosticsBudget{};
 
 template <typename T>
@@ -817,6 +920,8 @@ void ParseConfig(std::string_view text) noexcept {
             target = &Config.singleEmanation;
         } else if (key == "move_only_clicks") {
             target = &Config.moveOnlyClicks;
+        } else if (key == "live_level") {
+            target = &Config.liveLevel;
         } else if (key == "diagnostics") {
             target = &Config.diagnostics;
         } else {
@@ -939,6 +1044,15 @@ auto ValidateServer() noexcept -> bool {
         && CheckCallable(GetLeftSkillRva, GetLeftSkillEntry.data(), GetLeftSkillEntry.size(), "left skill getter");
 }
 
+auto ValidateLiveLevel() noexcept -> bool {
+    return CheckExact(LeftTimerLevelWindowRva, LeftTimerLevelWindow.data(), LeftTimerLevelWindow.size(),
+                      "aura timer level read")
+        && CheckCallable(ReadListStatRva, LoaderThunkJump.data(), LoaderThunkJump.size(),
+                         "ReadWideListStat (loader thunk)")
+        && CheckCallable(ReadSkillLevelRva, LoaderThunkJump.data(), LoaderThunkJump.size(),
+                         "ReadWideSkillLevel (loader thunk)");
+}
+
 auto ValidateClient() noexcept -> bool {
     return CheckExact(ClickHandlerRva, ClickHandlerEntry.data(), ClickHandlerEntry.size(), "world click handler")
         && CheckExact(ClickGateWindowRva, ClickGateWindow.data(), ClickGateWindow.size(), "world click skill gate")
@@ -1014,6 +1128,14 @@ thread_local PendingLeftStart* PendingStart = nullptr;
 
 // Set while the timer hook hands a left timer that left the button to 0x432450.
 thread_local bool StoppingOffButton = false;
+
+// The remembered left timer the 0x437460 hook is running on this thread, if
+// any. Its level read at 0x4376B5 happens inside that call.
+struct RunningLeftTimer {
+    void*        unit;
+    std::int32_t skillId;
+};
+thread_local const RunningLeftTimer* RunningTimer = nullptr;
 
 // ---------------------------------------------------------------------------
 //  Game data helpers
@@ -1238,9 +1360,14 @@ void __fastcall BridgeRightAuraStateOff(void* unit, std::int32_t state, std::int
 // 0x437460
 void __fastcall HookPeriodicSkillEvent(void* game, void* unit, std::int32_t customId, std::int32_t customParam,
                                        std::int32_t castId) noexcept {
-    if (ServerActive.load(std::memory_order_relaxed) && customId > 0 && game != nullptr && unit != nullptr
-        && GetUnitType(unit) == UnitTypePlayer && IsLeftTimer(game, unit, customId, &castId)
-        && NodeSkillId(GetLeftSkill(unit)) != customId) {
+    const bool leftTimer = ServerActive.load(std::memory_order_relaxed) && customId > 0 && game != nullptr
+                        && unit != nullptr && GetUnitType(unit) == UnitTypePlayer
+                        && IsLeftTimer(game, unit, customId, &castId);
+    if (!leftTimer) {
+        OriginalPeriodicSkillEvent(game, unit, customId, customParam, castId);
+        return;
+    }
+    if (NodeSkillId(GetLeftSkill(unit)) != customId) {
         LeftStopsOffButton.fetch_add(1, std::memory_order_relaxed);
         if (TakeDiagnosticsLine()) {
             LogInfo("LeftClickAuras: stopped skill %d on unit %u, it is no longer on the left button.", customId,
@@ -1253,7 +1380,13 @@ void __fastcall HookPeriodicSkillEvent(void* game, void* unit, std::int32_t cust
         StoppingOffButton = false;
         return;
     }
+
+    // live_level: the level read at 0x4376B5 inside this call is this timer's.
+    const RunningLeftTimer running{unit, customId};
+    const auto* previous = RunningTimer;
+    RunningTimer = &running;
     OriginalPeriodicSkillEvent(game, unit, customId, customParam, castId);
+    RunningTimer = previous;
 }
 
 // 0x432450
@@ -1300,6 +1433,38 @@ std::int32_t __fastcall BridgeLeftTimerPerform(void* game, void* unit, std::int3
     return ServerDoSkill(game, unit, skillId, level, consume, itemCast, itemEffect);
 }
 
+// 0x4376B5, a skill timer reads the level it casts and re-arms with (stat 351
+// of its aura state's stat list). The stub adds r8 = unit (rdi) and r9d =
+// skill (ebp); the stock read gets its own constants back.
+std::int32_t __fastcall BridgeLeftTimerLevel(std::uint32_t dataContext, void* statList, void* unit,
+                                             std::int32_t skillId) noexcept {
+    const auto stored = ReadListStat(dataContext, statList, ModifierListLevelStat, 0);
+
+    const auto* running = RunningTimer;
+    if (!LiveLevelActive.load(std::memory_order_relaxed) || running == nullptr || unit == nullptr
+        || running->unit != unit || running->skillId != skillId) {
+        return stored;
+    }
+    void* node = GetLeftSkill(unit);
+    if (node == nullptr || NodeSkillId(node) != skillId) {
+        return stored;
+    }
+    const auto live = ReadSkillLevel(unit, node, 1, 0);
+    if (live <= 0) {
+        return stored;
+    }
+
+    LiveLevelTicks.fetch_add(1, std::memory_order_relaxed);
+    if (live != stored) {
+        LiveLevelChanges.fetch_add(1, std::memory_order_relaxed);
+        if (TakeDiagnosticsLine()) {
+            LogInfo("LeftClickAuras: skill %d on unit %u runs at level %d, the stored level was %d.", skillId,
+                    UnitIdOf(unit), live, stored);
+        }
+    }
+    return live;
+}
+
 // 0x102753, client world click: may this click enter the skill branch.
 std::uint64_t __fastcall BridgeClickGate(void* player, void* node, const std::uint8_t* command) noexcept {
     if (ClientActive.load(std::memory_order_relaxed) && player != nullptr && node != nullptr && command != nullptr
@@ -1335,6 +1500,8 @@ void ResolveNativeFunctions() noexcept {
     UnlinkStatList     = At<UnlinkStatListFn>(UnlinkStatListRva);
     FreeStatList       = At<FreeStatListFn>(FreeStatListRva);
     GetUnitType        = At<GetUnitTypeFn>(GetUnitTypeRva);
+    ReadListStat       = At<ReadListStatFn>(ReadListStatRva);
+    ReadSkillLevel     = At<ReadSkillLevelFn>(ReadSkillLevelRva);
 }
 
 auto AllocateRelayPage() noexcept -> std::uint8_t* {
@@ -1385,6 +1552,7 @@ void EmitRelay(std::uint8_t* page) noexcept {
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&BridgeLeftTimerPerform)),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&BridgeAuraStartArm)),
         static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&BridgeClickGate)),
+        static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&BridgeLeftTimerLevel)),
     };
 
     for (std::size_t index = 0; index < RelayStubCount; ++index) {
@@ -1394,6 +1562,10 @@ void EmitRelay(std::uint8_t* page) noexcept {
             const std::uint8_t commandLoad[]{0x4D, 0x8D, 0x46, 0xD8};  // lea r8,[r14-28h]
             std::memcpy(stub, commandLoad, sizeof(commandLoad));
             at = sizeof(commandLoad);
+        } else if (index == StubLeftTimerLevel) {
+            const std::uint8_t unitAndSkill[]{0x49, 0x89, 0xF8, 0x41, 0x89, 0xE9};  // mov r8,rdi / mov r9d,ebp
+            std::memcpy(stub, unitAndSkill, sizeof(unitAndSkill));
+            at = sizeof(unitAndSkill);
         }
         stub[at]     = 0x48;  // mov rax,imm64
         stub[at + 1] = 0xB8;
@@ -1539,6 +1711,19 @@ void InstallServer() noexcept {
             LogError("LeftClickAuras: single_emanation is off, its call site could not be changed.");
         }
     }
+
+    if (Config.liveLevel) {
+        if (!ValidateLiveLevel()) {
+            LogError("LeftClickAuras: live_level is off, the game image does not match.");
+        } else {
+            Installed.levelRelay = PatchCallSite(CallSites[StubLeftTimerLevel]);
+            if (Installed.levelRelay) {
+                LiveLevelActive.store(true, std::memory_order_relaxed);
+            } else {
+                LogError("LeftClickAuras: live_level is off, its call site could not be changed.");
+            }
+        }
+    }
 }
 
 void InstallClient() noexcept {
@@ -1574,12 +1759,14 @@ auto StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* comman
     char line[512]{};
     std::snprintf(line, sizeof(line),
                   "Left Click Auras %s (%s): left slot auras %s [left select %s, start %s, right removal %s, "
-                  "timer %s, timer failure %s]; single emanation %s; move only clicks %s; diagnostics %s.",
+                  "timer %s, timer failure %s]; single emanation %s; move only clicks %s; live level %s; "
+                  "diagnostics %s.",
                   PluginVersion, ConfigSource, OnOff(ServerActive.load(std::memory_order_relaxed)),
                   OnOff(Installed.selectRelay), OnOff(Installed.startRelay), OnOff(Installed.rightRemovalRelays),
                   OnOff(Installed.timerHook), OnOff(Installed.failureHook),
                   OnOff(PerformRelayActive.load(std::memory_order_relaxed)),
-                  OnOff(ClientActive.load(std::memory_order_relaxed)), OnOff(Config.diagnostics));
+                  OnOff(ClientActive.load(std::memory_order_relaxed)),
+                  OnOff(LiveLevelActive.load(std::memory_order_relaxed)), OnOff(Config.diagnostics));
     command->plugin->WriteConsoleMessage(line);
 
     std::snprintf(line, sizeof(line),
@@ -1598,6 +1785,13 @@ auto StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* comman
                   static_cast<unsigned long long>(EmanationsSkipped.load(std::memory_order_relaxed)),
                   static_cast<unsigned long long>(MoveOnlyClicks.load(std::memory_order_relaxed)));
     command->plugin->WriteConsoleMessage(line);
+
+    std::snprintf(line, sizeof(line),
+                  "Live level: left aura ticks at the live level %llu, ticks where it differed from the stored "
+                  "level %llu.",
+                  static_cast<unsigned long long>(LiveLevelTicks.load(std::memory_order_relaxed)),
+                  static_cast<unsigned long long>(LiveLevelChanges.load(std::memory_order_relaxed)));
+    command->plugin->WriteConsoleMessage(line);
     return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -1607,11 +1801,12 @@ void ResetState() noexcept {
     ServerActive.store(false, std::memory_order_relaxed);
     PerformRelayActive.store(false, std::memory_order_relaxed);
     ClientActive.store(false, std::memory_order_relaxed);
+    LiveLevelActive.store(false, std::memory_order_relaxed);
     OriginalPeriodicSkillEvent  = nullptr;
     OriginalRevalidationFailure = nullptr;
     for (auto* counter : {&LeftStarts, &LeftStartsRefused, &LeftKeptRunning, &LeftStopsReselect,
                           &LeftStopsOffButton, &LeftStopsFailed, &SharedStatesKept, &EmanationsSkipped,
-                          &MoveOnlyClicks}) {
+                          &MoveOnlyClicks, &LiveLevelTicks, &LiveLevelChanges}) {
         counter->store(0, std::memory_order_relaxed);
     }
     DiagnosticsBudget.store(64, std::memory_order_relaxed);
@@ -1631,7 +1826,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.left-click-auras",
     .name        = "Left Click Auras",
-    .version     = "1.0.1",
+    .version     = "1.1.0",
     .author      = "CelestialRayOne",
     .description = "Auras on the left mouse button run alongside the right button's aura.",
     .flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
@@ -1672,10 +1867,11 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     }
 
     LogInfo("Left Click Auras %s by CelestialRayOne: left slot auras %s, single emanation %s, move only clicks %s, "
-            "build %s.",
+            "live level %s, build %s.",
             PluginVersion, OnOff(ServerActive.load(std::memory_order_relaxed)),
             OnOff(PerformRelayActive.load(std::memory_order_relaxed)),
             OnOff(ClientActive.load(std::memory_order_relaxed)),
+            OnOff(LiveLevelActive.load(std::memory_order_relaxed)),
             context->buildName != nullptr ? context->buildName : "unknown");
     return true;
 }
@@ -1688,6 +1884,7 @@ D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     ServerActive.store(false, std::memory_order_relaxed);
     PerformRelayActive.store(false, std::memory_order_relaxed);
     ClientActive.store(false, std::memory_order_relaxed);
+    LiveLevelActive.store(false, std::memory_order_relaxed);
 
     bool allRestored = true;
     for (auto& site : CallSites) {

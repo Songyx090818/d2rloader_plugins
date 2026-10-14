@@ -70,10 +70,31 @@
 //   Composer lines and lines composed by other plugins on the composer (the
 //   bleed line) go straight into the block and never pass the writers.
 //
+//   A long stat can fill that 256-byte line buffer: the game lets the text use
+//   255 bytes, so a long stat (ESR's four-line descriptions, around 250 bytes)
+//   leaves no room in it for the two markers.
+//
 //   D2RLoader's Ctrl stat-ranges view calls the main builder (D2RCore slot
 //   704430), so its tooltip gets the fix. For its roll data it renders raw
 //   property text through 2DC4B0 directly (D2RCore 379EE0); those renders are
 //   outside the functions above and stay byte-identical.
+//
+// ---------------------------------------------------------------------------
+// Where a stat's text lands
+// ---------------------------------------------------------------------------
+//   2D98D0 and 2DA310 hand their own block to the renderer (2D9A3D, 2DA42C,
+//   2DA4D8). 2DA0E0 renders into a 1024-byte local (2DA160 lea rdx,[rsp+70h],
+//   2DA18B call) and appends that local to its block afterwards:
+//     2DA190  test r13,r13 / je 2DA2F2      ; no prefix: strlcat(block, local)
+//   The main builder (2BE16C) and the set builder (2BFD50) pass no prefix.
+//   With a prefix (only the rune and gem lines, through 2DA510 and 2DC3D0) it
+//   cuts the local text at its last line break before the final byte (scan at
+//   2DA1D0) and appends: the text before the break, the "newline" string (key
+//   at 1CC2F80, length 7, resolved through 3E2B736 at 2DA214), the prefix, the
+//   rest without its final line break, "KeyComma", the newline. A long stat
+//   that contains that break reaches the block as head + newline + prefix +
+//   tail, and is found in that form. The newline string is resolved exactly
+//   as 2DA0E0 resolves it. The whole tail 2DA190..2DA2C3 is verified at load.
 //
 // ---------------------------------------------------------------------------
 // What this plugin does
@@ -83,9 +104,14 @@
 //   2. 2D6520 / 2D6330 are wrapped: inside a stat block, a stat whose text has
 //      a color code becomes start marker + text + end marker. The whole stat
 //      is wrapped, so a stat spanning several lines keeps its own color flow.
-//   3. When a block function returns, the text it added is scanned: a line
-//      not written by the stat writers that contains a color code gets an end
-//      marker where it ends. When the OUTERMOST block function returns, every
+//      A stat too long for the markers to fit in the 256-byte line buffer
+//      (over 231 bytes: the markers take 8 and 16 stay free for the newline)
+//      is left byte for byte as the game wrote it, and a copy is kept for the
+//      block function rendering it.
+//   3. When a block function returns, the long stats it rendered are found in
+//      the text it added, in order, and wrapped there, where the block has
+//      room. Then that text is scanned: a line not written by the stat
+//      writers that contains a color code gets an end marker where it ends. When the OUTERMOST block function returns, every
 //      end marker becomes the block's color code, obtained by asking the
 //      game's colorizer CD6E0 to color a one-character probe with that color,
 //      and the start markers are deleted. A marker is exactly as long as a
@@ -94,7 +120,8 @@
 //   other text in the game, are left byte for byte as before.
 //
 //   CD6E0 is only CALLED, never patched, and it is verified by windows in its
-//   body, not at its entry. The monster display calls it and checks its entry
+//   body, not at its entry. The string resolver 3E2B736 is only called too,
+//   with the same key 2DA0E0 hands it. The monster display calls it and checks its entry
 //   bytes at load; patching it (version 1.0.0 did) made that check fail
 //   whenever this plugin loaded first.
 //
@@ -247,6 +274,38 @@ constexpr std::uint8_t GemLinesCapacity[]{
     0x44, 0x8B, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00,
 };
 
+// --- 2DA0E0 after the renderer returns. Verified, never patched.
+constexpr std::uint64_t PropertiesSpliceRva = 0x2DA190;
+// test r13,r13 / je (no prefix) ... the cut at the last line break (2DA1D0),
+// lea rax,"newline" / mov qword [rsp+58h],7 / call 3E2B736 (2DA1FA), the
+// "KeyComma" key, and the appends: before the cut, newline, prefix, rest,
+// KeyComma, newline.
+constexpr std::uint8_t PropertiesSplice[]{
+    0x4D, 0x85, 0xED, 0x0F, 0x84, 0x59, 0x01, 0x00, 0x00, 0x48, 0x8D, 0x44, 0x24, 0x70, 0x48, 0xC7,
+    0xC7, 0xFF, 0xFF, 0xFF, 0xFF, 0x48, 0xFF, 0xC7, 0x38, 0x1C, 0x38, 0x75, 0xF8, 0x48, 0x85, 0xFF,
+    0x0F, 0x84, 0x3C, 0x01, 0x00, 0x00, 0x48, 0x83, 0xFF, 0x02, 0x4C, 0x89, 0xA4, 0x24, 0xD8, 0x04,
+    0x00, 0x00, 0x48, 0x8D, 0x47, 0xFE, 0x48, 0x0F, 0x43, 0xD8, 0x48, 0x85, 0xDB, 0x74, 0x13, 0x90,
+    0x80, 0x7C, 0x1C, 0x70, 0x0A, 0x74, 0x23, 0x48, 0x83, 0xEB, 0x01, 0x75, 0xF3, 0x48, 0x85, 0xDB,
+    0x75, 0x18, 0x4D, 0x8B, 0xC5, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE, 0xE8, 0xB0, 0xD4, 0xF4, 0x00,
+    0x4C, 0x8D, 0x44, 0x24, 0x70, 0xE9, 0xBE, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05, 0x7F, 0x8D, 0x9E,
+    0x01, 0x48, 0xC7, 0x44, 0x24, 0x58, 0x07, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x4C, 0x24, 0x50, 0x48,
+    0x89, 0x44, 0x24, 0x50, 0xE8, 0x1D, 0x15, 0xB5, 0x03, 0x4C, 0x8B, 0xF8, 0x48, 0xC7, 0x44, 0x24,
+    0x68, 0x08, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x05, 0x64, 0x8A, 0x9E, 0x01, 0x48, 0x8D, 0x4C, 0x24,
+    0x60, 0x48, 0x89, 0x44, 0x24, 0x60, 0xE8, 0xFB, 0x14, 0xB5, 0x03, 0x4C, 0x8B, 0xE0, 0x48, 0x81,
+    0xFB, 0x00, 0x04, 0x00, 0x00, 0x0F, 0x83, 0xBD, 0x00, 0x00, 0x00, 0x4C, 0x8D, 0x44, 0x24, 0x70,
+    0xC6, 0x44, 0x1C, 0x70, 0x00, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE, 0xE8, 0x40, 0xD4, 0xF4, 0x00,
+    0x4D, 0x8B, 0xC7, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE, 0xE8, 0x32, 0xD4, 0xF4, 0x00, 0x4D, 0x8B,
+    0xC5, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE, 0xE8, 0x24, 0xD4, 0xF4, 0x00, 0x80, 0x7C, 0x3C, 0x6F,
+    0x0A, 0x75, 0x11, 0x48, 0xFF, 0xCF, 0x48, 0x81, 0xFF, 0x00, 0x04, 0x00, 0x00, 0x73, 0x79, 0xC6,
+    0x44, 0x3C, 0x70, 0x00, 0x4C, 0x8D, 0x44, 0x24, 0x71, 0x48, 0x8B, 0xD5, 0x4C, 0x03, 0xC3, 0x48,
+    0x8B, 0xCE, 0xE8, 0xF9, 0xD3, 0xF4, 0x00, 0x4D, 0x8B, 0xC4, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE,
+    0xE8, 0xEB, 0xD3, 0xF4, 0x00, 0x4D, 0x8B, 0xC7, 0x48, 0x8B, 0xD5, 0x48, 0x8B, 0xCE, 0xE8, 0xDD,
+    0xD3, 0xF4, 0x00,
+};
+constexpr std::uint64_t NewlineKeyRva    = 0x1CC2F80;  // the lea at 2DA1FA
+constexpr std::uint64_t NewlineKeyLength = 7;          // mov qword [rsp+58h],7 at 2DA201
+constexpr std::uint64_t ResolveKeyRva    = 0x3E2B736;  // the call at 2DA214
+
 // --- Builders: which buffer each block function fills and which color the
 // builder then gives that buffer.
 constexpr std::uint64_t MainPropertiesCallRva = 0x2BE14B;
@@ -319,6 +378,9 @@ constexpr std::size_t   MaxBlockCode     = 16;
 constexpr std::uint32_t MaxScopeCapacity = 0x10000;
 constexpr char          ProbeCharacter   = 'x';
 constexpr std::size_t   MaxConfigBytes   = 16 * 1024;
+// Long stats kept per block function. A long stat is over 231 bytes, so a
+// 1024-byte block holds at most four of them.
+constexpr std::size_t   MaxLongStats     = 16;
 
 // ---------------------------------------------------------------------------
 // Game function types. Every argument is passed as a full 64-bit value so the
@@ -338,6 +400,13 @@ using SetBlockFn = std::uint64_t(__fastcall*)(void* player, void* item, char* ou
 using SocketLinesFn = std::uint64_t(__fastcall*)(void* item, std::uint64_t argument2,
     std::uint64_t argument3, char* out, std::uint64_t capacity, const char* prefix) noexcept;
 
+// The key 2DA0E0 hands the string resolver (2DA1FA..2DA214): text, length.
+struct KeyView {
+    const char*   text;
+    std::uint64_t length;
+};
+using ResolveKeyFn = const char*(__fastcall*)(const KeyView* key) noexcept;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -346,6 +415,7 @@ const D2RL::PluginContext* Context = nullptr;
 std::uintptr_t             Base    = 0;
 
 ColorizeFn        Colorize                = nullptr;
+ResolveKeyFn      ResolveKey              = nullptr;
 WriteSingleFn     OriginalWriteSingle     = nullptr;
 WriteRangeFn      OriginalWriteRange      = nullptr;
 PropertiesBlockFn OriginalPropertiesBlock = nullptr;
@@ -372,6 +442,8 @@ std::atomic<std::uint64_t> LinesClosed{0};
 std::atomic<std::uint64_t> BlocksResolved{0};
 std::atomic<std::uint64_t> ColorsRestored{0};
 std::atomic<std::uint64_t> NoRoomSkips{0};
+std::atomic<std::uint64_t> LongStats{0};
+std::atomic<std::uint64_t> LongNotFound{0};
 std::atomic<std::uint64_t> UnknownCodeBlocks{0};
 
 struct Configuration {
@@ -405,6 +477,9 @@ constexpr char DefaultConfigToml[] =
     "#   color is put back. Each stat's color codes now only affect that stat's own\n"
     "#   text, whatever color its block has.\n"
     "#   - A stat whose text spans several lines keeps its color across its own lines.\n"
+    "#   - That includes long ones. The game's stat line holds 255 bytes of text\n"
+    "#     and a stat over 231 bytes leaves no room there for the plugin's two\n"
+    "#     marks, so such a stat is marked in its block once the block is done.\n"
     "#   - Stats without color codes are left exactly as the game writes them.\n"
     "#   - A string no longer needs a closing color code at its end; a leftover\n"
     "#     one is harmless.\n"
@@ -514,12 +589,17 @@ void ResolveBlock(char* text, std::size_t capacity, std::size_t start, char colo
     if (result.dropped != 0) NoRoomSkips.fetch_add(result.dropped, std::memory_order_relaxed);
 }
 
-// One running block function. On the way out it closes every colored line the
-// function added that the stat writers did not produce; the outermost one
-// then resolves every marker in the text it added.
+class BlockScope;
+thread_local BlockScope* InnermostScope = nullptr;
+
+// One running block function. On the way out it wraps the long stats it
+// rendered, then closes every colored line the function added that the stat
+// writers did not produce; the outermost one then resolves every marker in
+// the text it added.
 class BlockScope {
 public:
-    BlockScope(char* out, std::uint64_t capacity, char color) noexcept : out_(out), color_(color) {
+    BlockScope(char* out, std::uint64_t capacity, char color, const char* prefix = nullptr) noexcept
+            : out_(out), color_(color), prefix_(prefix), outer_(InnermostScope) {
         const auto bytes = static_cast<std::uint32_t>(capacity);
         if (out != nullptr && bytes != 0 && bytes <= MaxScopeCapacity) {
             const std::size_t length = Text::BoundedLength(out, bytes);
@@ -531,9 +611,11 @@ public:
         if (capacity_ == 0) ++UnusableBlocks;
         if (BlockDepth == 0) MarkersWritten = false;
         ++BlockDepth;
+        InnermostScope = this;
     }
 
     ~BlockScope() noexcept {
+        InnermostScope = outer_;
         const bool allowed = MarkersAllowed();
         --BlockDepth;
         if (capacity_ == 0) {
@@ -541,6 +623,8 @@ public:
             return;
         }
         if (!allowed) return;
+
+        WrapLongStats();
 
         const Text::CloseResult closed = Text::CloseLines(out_, capacity_, start_);
         if (closed.closed != 0) {
@@ -554,14 +638,60 @@ public:
         MarkersWritten = false;
     }
 
+    // Keeps a copy of a stat with no room for its markers in the line buffer.
+    // It is wrapped in this function's block when the function returns.
+    void KeepLongStat(const char* line, std::size_t length) noexcept {
+        if (longCount_ == MaxLongStats || length == 0 || length > Text::MaxStatBytes) {
+            NoRoomSkips.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Text::PendingStat& stat = long_[longCount_++];
+        std::memcpy(stat.text, line, length);
+        stat.length = length;
+        LongStats.fetch_add(1, std::memory_order_relaxed);
+    }
+
     BlockScope(const BlockScope&) = delete;
     auto operator=(const BlockScope&) -> BlockScope& = delete;
 
 private:
-    char*       out_      = nullptr;
-    std::size_t capacity_ = 0;
-    std::size_t start_    = 0;
-    char        color_    = 0;
+    void WrapLongStats() noexcept {
+        if (longCount_ == 0) return;
+        // With a prefix, 2DA0E0 cut its text at the last line break and put
+        // the newline string and the prefix there; resolve that newline string
+        // the way 2DA0E0 does so a long stat holding the cut is found too.
+        Text::Splice        splice{};
+        const Text::Splice* cut = nullptr;
+        if (prefix_ != nullptr && ResolveKey != nullptr) {
+            const KeyView key{reinterpret_cast<const char*>(Base + NewlineKeyRva), NewlineKeyLength};
+            const char*   newline = ResolveKey(&key);
+            if (newline != nullptr) {
+                splice.newline       = newline;
+                splice.newlineLength = std::strlen(newline);
+                splice.prefix        = prefix_;
+                splice.prefixLength  = std::strlen(prefix_);
+                cut                  = &splice;
+            }
+        }
+        const Text::PendingResult result =
+            Text::WrapPendingStats(out_, capacity_, start_, long_, longCount_, cut);
+        if (result.wrapped != 0) {
+            MarkersWritten = true;
+            StatsScoped.fetch_add(result.wrapped, std::memory_order_relaxed);
+        }
+        if (result.noRoom != 0) NoRoomSkips.fetch_add(result.noRoom, std::memory_order_relaxed);
+        if (result.notFound != 0) LongNotFound.fetch_add(result.notFound, std::memory_order_relaxed);
+        longCount_ = 0;
+    }
+
+    char*             out_       = nullptr;
+    std::size_t       capacity_  = 0;
+    std::size_t       start_     = 0;
+    char              color_     = 0;
+    const char*       prefix_    = nullptr;
+    BlockScope*       outer_     = nullptr;
+    std::size_t       longCount_ = 0;
+    Text::PendingStat long_[MaxLongStats];
 };
 
 // ---------------------------------------------------------------------------
@@ -576,7 +706,10 @@ void ScopeStatLine(char* line) noexcept {
         StatsScoped.fetch_add(1, std::memory_order_relaxed);
         break;
     case Text::WrapResult::NoRoom:
-        NoRoomSkips.fetch_add(1, std::memory_order_relaxed);
+        // No room for the markers here: wrapped in its block instead.
+        if (InnermostScope != nullptr) {
+            InnermostScope->KeepLongStat(line, Text::BoundedLength(line, LineCapacity));
+        }
         break;
     case Text::WrapResult::Untouched:
         break;
@@ -607,7 +740,7 @@ auto __fastcall HookPropertiesBlock(void* item, char* out, std::uint64_t capacit
         std::uint64_t newlineMode, const char* prefix, void* argument6, void* argument7) noexcept
         -> std::uint64_t {
     if (OriginalPropertiesBlock == nullptr) return 0;
-    BlockScope scope(out, capacity, PropertiesColor);
+    BlockScope scope(out, capacity, PropertiesColor, prefix);
     return OriginalPropertiesBlock(item, out, capacity, newlineMode, prefix, argument6, argument7);
 }
 
@@ -666,6 +799,7 @@ auto VerifyCoreContract() noexcept -> bool {
         && TCS_VERIFY(WriteRangeLineArgRva, WriteRangeLineArg, "the ranged stat writer line argument")
         && TCS_VERIFY(PropertiesBlockRva, PropertiesBlockPrologue, "the properties block function")
         && TCS_VERIFY(PropertiesBlockArgsRva, PropertiesBlockArgs, "the properties block arguments")
+        && TCS_VERIFY(PropertiesSpliceRva, PropertiesSplice, "the properties block's prefix splice")
         && TCS_VERIFY(FullSetBlockRva, FullSetBlockPrologue, "the full set bonus function")
         && TCS_VERIFY(FullSetBlockArgsRva, FullSetBlockArgs, "the full set bonus arguments")
         && TCS_VERIFY(RuneLinesRva, RuneLinesPrologue, "the rune lines function")
@@ -868,17 +1002,19 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
         -> D2RL::ConsoleCommandResult {
     if (command == nullptr || command->plugin == nullptr) return D2RL::ConsoleCommandResult::Failed;
 
-    char message[512];
+    char message[640];
     std::snprintf(message, sizeof(message),
-        "Tooltip Color Scope 1.1.0: blocks %s, partial set bonuses %s | stats scoped %llu, lines "
-        "closed %llu, blocks resolved %llu, colors restored %llu, skipped for room %llu, unknown "
-        "block code %llu",
+        "Tooltip Color Scope 1.2.0: blocks %s, partial set bonuses %s | stats scoped %llu, long "
+        "stats %llu, lines closed %llu, blocks resolved %llu, colors restored %llu, skipped for "
+        "room %llu, long stats not found %llu, unknown block code %llu",
         StateName(CoreState), StateName(PartialSetState),
         static_cast<unsigned long long>(StatsScoped.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(LongStats.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(LinesClosed.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(BlocksResolved.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(ColorsRestored.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(NoRoomSkips.load(std::memory_order_relaxed)),
+        static_cast<unsigned long long>(LongNotFound.load(std::memory_order_relaxed)),
         static_cast<unsigned long long>(UnknownCodeBlocks.load(std::memory_order_relaxed)));
     command->plugin->WriteConsoleMessage(message);
     return D2RL::ConsoleCommandResult::Handled;
@@ -896,7 +1032,7 @@ constexpr D2RL::PluginInfo Info{
     .abiVersion  = D2RL_PLUGIN_ABI_VERSION,
     .id          = "celestialrayone.tooltip-color-scope",
     .name        = "Tooltip Color Scope",
-    .version     = "1.1.0",
+    .version     = "1.2.0",
     .author      = "CelestialRayOne",
     .description =
         "A color code inside one item stat's text no longer recolors the other stat lines of "
@@ -916,6 +1052,7 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     Base    = context->exeBase;
     if (Base == 0) return false;
     Colorize = reinterpret_cast<ColorizeFn>(Base + ColorizeRva);
+    ResolveKey = reinterpret_cast<ResolveKeyFn>(Base + ResolveKeyRva);
 
     ReadConfiguration();
 

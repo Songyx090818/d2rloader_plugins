@@ -35,7 +35,7 @@
 //   5. SPAWN BONUSES: Extra Strong 0x496180 is replaced, Extra Fast 0x496300 is
 //      wrapped (vanilla walk speed, then attack and cast rate), Mana Burn's spawn
 //      routine 0x496CE0 starts with `ret` (the drain happens per hit in
-//      FinalizeDamage instead).
+//      FinalizeDamage instead, at most once per cooldown for each player).
 //
 //   6. LOCKOUT: after a cast the affix is locked for the cast skill's localdelay,
 //      a calc at skill record +0x238 evaluated through 0x3B5160, or for the
@@ -368,7 +368,8 @@ struct Settings {
 	std::array<std::int32_t, MaxCursedSkills> cursedSkills {};
 	std::uint32_t                             cursedCount = 0;
 
-	std::int32_t manaBurnPercent = 10;
+	std::int32_t manaBurnPercent        = 10;
+	std::int32_t manaBurnCooldownFrames = 25;
 
 	std::int32_t teleportSkill          = 184;
 	std::int32_t teleportChance         = 25;
@@ -433,6 +434,7 @@ std::atomic<std::uint64_t> CursedDelegated { 0 };
 std::atomic<std::uint64_t> CursedMinionCasts { 0 };
 std::atomic<std::uint64_t> SpectralRerolls { 0 };
 std::atomic<std::uint64_t> ManaBurnHits { 0 };
+std::atomic<std::uint64_t> ManaBurnBlocked { 0 };
 
 // The struck and landed-hit dispatchers do not receive the other unit;
 // FinalizeDamage and ExecuteEvents do. Saved and restored around every call,
@@ -532,7 +534,10 @@ auto GameFrame(void* game) noexcept -> std::int32_t {
 }
 
 // ---------------------------------------------------------------------------
-// Lockout, keyed by game, monster GUID, affix and (Spectral Hit) skill
+// Lockout, keyed by game, monster GUID, affix and (Spectral Hit) skill.
+// Mana Burn is the one exception: its cooldown is keyed by the PLAYER's GUID
+// under affix 25, which never keys a monster lockout (Mana Burn casts
+// nothing), so player and monster GUIDs cannot meet in one key.
 // ---------------------------------------------------------------------------
 
 auto LockoutKey(std::uint32_t guid, std::int32_t affix, std::uint32_t sub) noexcept -> std::uint64_t {
@@ -759,6 +764,12 @@ void ProcessCursed(void* game, void* unit, std::uint64_t affix, std::uint64_t un
 	CastAffixSkill(game, unit, AffixCursed, CursedPool[index], target, level, UseLocalDelay, WholeAffix);
 }
 
+// Burns mana_burn_percent of the player's maximum mana. The cooldown belongs to
+// the player, not to the monster: after a burn, no Mana Burn hit burns that
+// player again until mana_burn_cooldown_frames have passed, whichever monster
+// lands it. Multi-hit missiles (many hits a second) and packs of burners get
+// one burn per window. The window is fixed from the burn; hits inside it do
+// not extend it. A hit that finds no mana burns nothing and starts nothing.
 void ApplyManaBurn(void* game, void* attacker, void* defender) noexcept {
 	if (game == nullptr || attacker == nullptr || defender == nullptr) return;
 	if (UnitType(defender) != UnitTypePlayer) return;
@@ -772,10 +783,19 @@ void ApplyManaBurn(void* game, void* attacker, void* defender) noexcept {
 	const std::int64_t mana = GetUnitStat(defender, StatMana, 0);
 	if (mana <= 0) return;
 
+	const bool          cooldown = Config.manaBurnCooldownFrames > 0;
+	const std::int32_t  frame    = GameFrame(game);
+	const std::uint32_t player   = UnitId(defender, __FILE__, __LINE__);
+	if (cooldown && IsLockedOut(game, player, AffixManaBurn, WholeAffix, frame)) {
+		ManaBurnBlocked.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+
 	std::int64_t left = mana - maxMana * Config.manaBurnPercent / 100;
 	if (left < 0) left = 0;
 	SetUnitStat(defender, StatMana, static_cast<std::int32_t>(left), 0);
 	ManaBurnHits.fetch_add(1, std::memory_order_relaxed);
+	if (cooldown) SetLockout(game, player, AffixManaBurn, WholeAffix, frame, Config.manaBurnCooldownFrames);
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,11 +1192,17 @@ fast_cast_rate_hell = 75
 fast_cast_rate_stat = 105
 
 # MANA BURN (when the monster lands a hit)
-#   No mana drain damage any more. Instead every successful hit on a player
+#   No mana drain damage any more. Instead a successful hit on a player
 #   burns mana_burn_percent of that player's maximum mana from the current
 #   mana. Missiles count, and minions that inherit the affix burn too.
-#   -1 keeps the stock mana drain.
+#   -1 keeps the stock mana drain (and ignores the cooldown below).
+#   mana_burn_cooldown_frames: after a burn, that player's mana cannot be
+#   burned again for this many frames (25 = 1 second), whichever Mana Burn
+#   monster lands the hit. Hits in between burn nothing and do not extend
+#   the wait. So multi-hit missiles and a whole pack of burners take at most
+#   one burn per window. 0 = every successful hit burns.
 mana_burn_percent = 10
+mana_burn_cooldown_frames = 25
 
 # RESISTANCE (always on, nothing to configure)
 #   No affix grants resistance any more. Removed: Fire / Cold / Lightning
@@ -1239,7 +1265,9 @@ void LoadSettings() noexcept {
 			c.fastCastRate[2]   = ReadNumber(text, "fast_cast_rate_hell", -1'000, 1'000, c.fastCastRate[2]);
 			c.fastCastRateStat  = ReadNumber(text, "fast_cast_rate_stat", 0, 0xFFFF, c.fastCastRateStat);
 
-			c.manaBurnPercent = ReadNumber(text, "mana_burn_percent", -1, 100, c.manaBurnPercent);
+			c.manaBurnPercent        = ReadNumber(text, "mana_burn_percent", -1, 100, c.manaBurnPercent);
+			c.manaBurnCooldownFrames = ReadNumber(text, "mana_burn_cooldown_frames", 0, 1'000'000,
+			                                      c.manaBurnCooldownFrames);
 		}
 	}
 
@@ -1434,15 +1462,15 @@ void InstallAll() noexcept {
 	char message[512] {};
 	std::snprintf(message, sizeof(message),
 	              "Struck skills: fire %d (%s), cold %d (%s), lightning %d (%s), stone skin %d (%s), teleport %d at "
-	              "%d%% every %d frames (%s). Spectral Hit: %u skill%s (%s). Cursed: %u skill%s (%s). Mana Burn %d%% "
-	              "(%s). Death effects: fire %s, cold %s.",
+	              "%d%% every %d frames (%s). Spectral Hit: %u skill%s (%s). Cursed: %u skill%s (%s). Mana Burn %d%%, "
+	              "once per %d frames per player (%s). Death effects: fire %s, cold %s.",
 	              Config.fireSkill, FireActive ? "on" : "off", Config.coldSkill, ColdActive ? "on" : "off",
 	              Config.lightningSkill, LightningActive ? "on" : "off", Config.stoneSkinSkill,
 	              StoneSkinActive ? "on" : "off", Config.teleportSkill, Config.teleportChance,
 	              Config.teleportCooldownFrames, TeleportActive ? "on" : "off", SpectralPoolSize,
 	              SpectralPoolSize == 1 ? "" : "s", SpectralActive ? "on" : "off", CursedPoolSize,
 	              CursedPoolSize == 1 ? "" : "s", CursedActive ? "on" : "off", Config.manaBurnPercent,
-	              ManaBurnActive ? "on" : "off", FireDeathPatched ? "removed" : "STOCK",
+	              Config.manaBurnCooldownFrames, ManaBurnActive ? "on" : "off", FireDeathPatched ? "removed" : "STOCK",
 	              ColdDeathPatched ? "removed" : "STOCK");
 	LogInfo(message);
 }
@@ -1462,7 +1490,7 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
 	char line[512] {};
 	std::snprintf(line, sizeof(line),
-	              "Monster Affixes 1.4.0: config %s | hooks: resist %s, minion flag %s, finalize %s, events %s, "
+	              "Monster Affixes 1.4.1: config %s | hooks: resist %s, minion flag %s, finalize %s, events %s, "
 	              "struck %s, mode %s, landed %s, strong %s, fast %s",
 	              ConfigFileRead ? "loaded" : "NOT READ (defaults)", OnOff(ResistRoutineInstalled),
 	              OnOff(MinionMagicResist), OnOff(StruckCaptureInstalled), OnOff(HitCaptureInstalled),
@@ -1479,10 +1507,13 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 	plugin->WriteConsoleMessage(line);
 
 	std::snprintf(line, sizeof(line),
-	              "magic resistant applied %llu (minions at spawn %llu) | mana burn hits %llu | lockouts held %llu",
+	              "magic resistant applied %llu (minions at spawn %llu) | mana burn hits %llu, blocked by the %d-frame "
+	              "cooldown %llu | lockouts held %llu",
 	              static_cast<unsigned long long>(MagicResistApplied.load(std::memory_order_relaxed)),
 	              static_cast<unsigned long long>(MinionMagicResistApplied.load(std::memory_order_relaxed)),
 	              static_cast<unsigned long long>(ManaBurnHits.load(std::memory_order_relaxed)),
+	              Config.manaBurnCooldownFrames,
+	              static_cast<unsigned long long>(ManaBurnBlocked.load(std::memory_order_relaxed)),
 	              static_cast<unsigned long long>(LockoutCount()));
 	plugin->WriteConsoleMessage(line);
 
@@ -1526,7 +1557,7 @@ constexpr D2RL::PluginInfo MonsterAffixesInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.monster-affixes",
 	.name        = "Monster Affixes",
-	.version     = "1.4.0",
+	.version     = "1.4.1",
 	.author      = "CelestialRayOne",
 	.description = "Monster affix rework: skills cast when struck (enchanted, Stone Skin, Teleportation), no enchanted "
 	               "death effects, Spectral Hit skills on attack and cast with per-skill lockouts, Cursed skill pool "

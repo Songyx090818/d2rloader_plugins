@@ -9,6 +9,7 @@
 //   proc_start_fix             a proc keeps the caster's used skill and mode
 //   dual_wield_same_target     both weapons may strike the same target
 //   cyclone                    Whirlwind follows the cursor while held
+//                              (the movement stick on a controller)
 //   death_while_whirlwinding   a lethal hit kills during Whirlwind
 //   potions_while_whirlwinding potions can be used during Whirlwind
 //   whirlwind_with_bows        sequence skills work with bows and crossbows
@@ -16,6 +17,8 @@
 //                              speed the client does
 //   pets_follow_whirlwind      summons, pets and hirelings follow a
 //                              Whirlwinding player
+//   gold_while_whirlwinding    Auto Gold Pickup keeps picking up gold during
+//                              Whirlwind
 //
 // Every address is an RVA against the executable base. Nothing is written
 // unless the bytes at the site, and at every game function the part calls,
@@ -272,6 +275,117 @@ constexpr Witness PetTrailWitnesses[] = {
 	{0x34BA40ULL, W_GetUsedSkill_34BA40, 14, "GetUsedSkill"},
 	{0x33CBC0ULL, W_SkillRecFlags_33CBC0, 76, "SkillRecFlags"},
 };
+// Gold while Whirlwinding (client). 000FE656..000FE6AE, inside the click
+// dispatcher 000FE3B0, on the path of actions 7 and 0: the press (001023D0), the
+// left skill (0034A540), then the "can act now" gate 0009A8C0 called at 000FE689
+// with rcx = player and rdx = left skill. A refusal (000FE690 je 000FE6A9) skips
+// the click. The call itself is the redirected site, checked by the patch.
+constexpr std::uint8_t W_ClickGate_FE656[] = {0x8B,0x54,0x24,0x58,0x83,0xCA,0x05,0x48,0x8D,0x4C,0x24,0x58,0x89,0x54,0x24,0x58,0xE8,0x65,0x3D,0x00,0x00,0x85,0xC0,0x0F,0x84,0xD3,0x01,0x00,0x00,0x48,0x8B,0x4C,0x24,0x60,0xE8,0xC3,0xBE,0x24,0x00,0x48,0x8B,0x4C,0x24,0x60,0x48,0x8B,0xD0,0x48,0x89,0x45,0x80};
+constexpr std::uint8_t W_ClickGate_FE68E[] = {0x85,0xC0,0x74,0x17,0x81,0x4C,0x24,0x58,0x80,0x00,0x00,0x00,0x48,0x8D,0x4C,0x24,0x58,0xE8,0xEC,0x3D,0x00,0x00,0xE9,0x9D,0x01,0x00,0x00,0xE8,0x62,0x0B,0x05,0x00};
+// 0009A8C0, the gate: refuses while the player is in a skill mode, Whirlwind's
+// mode 18 included. It reads only rcx.
+constexpr std::uint8_t W_CanAct_9A8C0[] = {0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xEC,0x20,0x41,0xB8,0xE8,0x0A,0x00,0x00,0x48,0x8D,0x15,0x24,0x2B,0xC2,0x01,0x48,0x8B,0xD9,0xE8,0x7C,0xFA,0x2A,0x00,0x48,0x8B,0xC8,0xE8,0x84,0xE1,0x2E,0x00,0x48,0x85,0xC0};
+// 001932A2..001932DC, Auto Gold tick 00193010: the gold being picked up becomes
+// the Auto Gold target (+18h) at 001932BE, the click (action 7) is issued at
+// 001932CC, and the target is cleared at 001932D1. The 5-byte call at 001932CC
+// is left out: yin's StatGoldPickup and AutoGoldPickup redirect it. Their
+// handler still calls 000FE3B0 for every mode but neutral and cast, so a
+// Whirlwinding player's click reaches 000FE689 either way.
+constexpr std::uint8_t W_AutoGoldClick_1932A2[] = {0x66,0x89,0x44,0x24,0x30,0xBA,0x07,0x00,0x00,0x00,0xF3,0x44,0x0F,0x2C,0xCE,0xC6,0x44,0x24,0x30,0x00,0x49,0x8B,0xCE,0x0F,0xB7,0x44,0x24,0x30,0x48,0x89,0x7E,0x18,0x66,0x89,0x44,0x24,0x20,0xF3,0x44,0x0F,0x2C,0xC7};
+constexpr std::uint8_t W_AutoGoldClick_1932D1[] = {0x48,0xC7,0x46,0x18,0x00,0x00,0x00,0x00,0x40,0xB5,0x01};
+// 00144640, the client context getter. Auto Gold sits at context+1918h.
+constexpr std::uint8_t W_ClientContext_144640[] = {0x40,0x53,0x48,0x83,0xEC,0x20,0x65,0x48,0x8B,0x04,0x25,0x58,0x00,0x00,0x00,0x8B,0x0D,0x73,0xFE,0x46,0x03,0xBA,0x6C,0x12,0x00,0x00,0x48,0x8B,0x0C,0xC8,0x8B,0x04,0x0A,0x39,0x05,0x61,0x40,0x94,0x02,0x7F,0x0D,0x48,0x8D,0x05,0x40,0xA4,0x90,0x02};
+// 00192B20: mov rax,[rcx+18h] / ret, the getter the game uses for the Auto
+// Gold target.
+constexpr std::uint8_t W_AutoGoldTarget_192B20[] = {0x48,0x8B,0x41,0x18,0xC3};
+// 00101A38..00101AE8, in the click on a unit 00101910: with Auto Gold Pickup on
+// and the item being the Auto Gold target, the native click sends the pickup
+// (000FABE0 with 16h, player, unit type, unit id at 00101ADF) and returns.
+constexpr std::uint8_t W_AutoGoldNative_101A38[] = {0xE8,0x73,0xE8,0xFD,0xFF,0x48,0x8B,0xC8,0xE8,0x4B,0xCA,0xC2,0x00,0x85,0xC0,0x74,0x26,0xE8,0xF2,0x2B,0x04,0x00,0x48,0x8D,0x88,0x18,0x19,0x00,0x00,0xE8,0xC6,0x10,0x09,0x00,0x8B,0xD5,0x8B,0xCE,0x48,0x8B,0xD8,0xE8,0x6A,0x8B,0xF9,0xFF,0x48,0x3B,0xD8,0x75,0x04,0xB3,0x01,0xEB,0x02,0x32,0xDB,0x45,0x84,0xF6,0x74,0x5A,0x84,0xDB,0x75,0x56,0x8B,0xD6,0x8B,0xCD,0xE8,0xCD,0x07,0x00,0x00,0x85,0xC0,0x75,0x39,0x48,0x8B,0x57,0x08,0x44,0x8B,0xCE,0x8B,0x4F,0x24,0x44,0x8B,0xC5,0xE8,0x47,0x91,0xFF,0xFF,0xB1,0x01,0xE8,0x30,0xBF,0xF8,0xFF,0x48,0x8B,0x57,0x08,0x45,0x33,0xF6,0x44,0x89,0x74,0x24,0x20,0x44,0x8B,0xCE,0x44,0x8B,0xC5,0x41,0x8D,0x4E,0x16,0xE8,0xC5,0x7B,0xFF,0xFF,0xE8,0xE0,0xFA,0xF8,0xFF,0x4C,0x8B,0x7C,0x24,0x70,0x48,0x83,0xC4,0x30,0x41,0x5E,0x5F,0x5E,0x5D,0x5B,0xC3,0x48,0x8B,0x57,0x08,0x44,0x8B,0xCE,0x44,0x8B,0xC5,0xB9,0x16,0x00,0x00,0x00,0xE8,0xFC,0x90,0xFF,0xFF,0x84,0xDB,0x75,0xD8};
+// 000FA180..000FA2BB, the item interaction sender 000FA180 (cx = unit type,
+// edx = unit id). For the Auto Gold target it skips the stop 000FF010 and
+// 000FE080 (000FA24B / 000FA258 jump over them) and goes on to the send.
+constexpr std::uint8_t W_InteractUnit_FA180[] = {0x40,0x53,0x56,0x57,0x41,0x56,0x41,0x57,0x48,0x81,0xEC,0x90,0x00,0x00,0x00,0x48,0x8B,0x05,0x32,0x11,0x8D,0x02,0x48,0x33,0xC4,0x48,0x89,0x84,0x24,0x88,0x00,0x00,0x00,0x44,0x8B,0xF2,0x44,0x0F,0xB7,0xF9,0xE8,0x23,0x11,0xF9,0xFF,0x8B,0xC8,0xE8,0xCC,0x02,0xFA,0xFF,0x41,0x8B,0xD7,0x41,0x8B,0xCE,0x48,0x8B,0xF0,0x41,0x8B,0xDF,0xE8,0x0B,0x04,0xFA,0xFF,0x48,0x8B,0xF8,0x48,0x85,0xC0,0x0F,0x84,0x34,0x07,0x00,0x00,0x48,0x89,0xAC,0x24,0xD0,0x00,0x00,0x00,0x48,0x8B,0xCE,0x4C,0x89,0xA4,0x24,0xD8,0x00,0x00,0x00,0xE8,0xF7,0xFE,0x24,0x00,0x0F,0xB6,0xE8,0x85,0xDB,0x0F,0x84,0x21,0x06,0x00,0x00,0x83,0xEB,0x01,0x0F,0x84,0xDE,0x05,0x00,0x00,0x83,0xEB,0x01,0x0F,0x84,0x86,0x02,0x00,0x00,0x83,0xEB,0x02,0x74,0x18,0x83,0xFB,0x01,0x0F,0x85,0x85,0x06,0x00,0x00,0x41,0x8B,0xD6,0xB1,0x40,0xE8,0xC2,0x24,0xFF,0xFF,0xE9,0xD2,0x06,0x00,0x00,0xE8,0x18,0xA4,0x04,0x00,0x48,0x8B,0xD8,0xE8,0x80,0x60,0xFE,0xFF,0x48,0x8B,0xC8,0xE8,0x58,0x42,0xC3,0x00,0x85,0xC0,0x74,0x34,0x48,0x8D,0x8B,0x18,0x19,0x00,0x00,0xE8,0xD8,0x88,0x09,0x00,0x48,0x3B,0xC7,0x75,0x23,0x48,0x8B,0xCF,0xE8,0x3B,0x8A,0x27,0x00,0x83,0xF8,0x04,0x74,0x5A,0x48,0x8D,0x4C,0x24,0x40,0xC6,0x44,0x24,0x40,0x00,0xE8,0x67,0xF2,0xFF,0xFF,0x84,0xC0,0x74,0x47,0xCC,0xEB,0x44,0x48,0x8B,0xCE,0xE8,0xE8,0x08,0x25,0x00,0x83,0xF8,0x06,0x74,0x1A,0x48,0x8B,0xCE,0xE8,0xDB,0x08,0x25,0x00,0x83,0xF8,0x02,0x74,0x0D,0x48,0x8B,0xCE,0xE8,0xCE,0x08,0x25,0x00,0x83,0xF8,0x03,0x75,0x15,0x41,0xB9,0x01,0x00,0x00,0x00,0x45,0x33,0xC0,0x48,0x8B,0xD6,0x41,0x8D,0x49,0x06,0xE8,0x64,0x4D,0x00,0x00,0x48,0x8B,0xCE,0xE8,0xCC,0x3D,0x00,0x00,0xE8,0x57,0xDB,0xF7,0xFF,0x84,0xC0};
+// 000FA405..000FA48C: the send of message 16h (unit id, x, y, flag) through
+// 000EC7D0.
+constexpr std::uint8_t W_InteractSend_FA405[] = {0xB9,0x01,0x00,0x00,0x00,0xE8,0xF1,0x40,0xFD,0xFF,0x8B,0x17,0x33,0xED,0x84,0xC0,0x8B,0xF5,0x8B,0xCA,0x40,0x0F,0x94,0xC6,0x83,0xE9,0x02,0x74,0x22,0x83,0xE9,0x02,0x74,0x1D,0x83,0xF9,0x01,0x74,0x18,0x48,0x8B,0x4F,0x38,0x48,0x85,0xC9,0x74,0x0B,0xE8,0xF6,0x75,0x24,0x00,0x8B,0x17,0x8B,0xD8,0xEB,0x0B,0x8B,0xDD,0xEB,0x07,0x48,0x8B,0x47,0x38,0x8B,0x58,0x14,0x83,0xEA,0x02,0x74,0x1C,0x83,0xEA,0x02,0x74,0x17,0x83,0xFA,0x01,0x74,0x12,0x48,0x8B,0x4F,0x38,0x48,0x85,0xC9,0x74,0x10,0xE8,0xB8,0x75,0x24,0x00,0x8B,0xE8,0xEB,0x07,0x48,0x8B,0x47,0x38,0x8B,0x68,0x10,0x44,0x8B,0xCB,0x89,0x74,0x24,0x20,0x44,0x8B,0xC5,0x41,0x8B,0xD6,0xB1,0x16,0xE8,0x49,0x23,0xFF,0xFF,0xE9,0x69,0x04,0x00,0x00};
+// 0034A330 UNITS_GetUnitId: [rcx+8], or -1 for a null unit.
+constexpr std::uint8_t W_GetUnitId_34A330[] = {0x48,0x83,0xEC,0x28,0x48,0x85,0xC9,0x75,0x1D,0x88,0x4C,0x24,0x30,0x48,0x8D,0x4C,0x24,0x30,0xE8,0x39,0xCA,0xFF,0xFF,0x84,0xC0,0x74,0x01,0xCC,0xB8,0xFF,0xFF,0xFF,0xFF,0x48,0x83,0xC4,0x28,0xC3,0x8B,0x41,0x08,0x48,0x83,0xC4,0x28,0xC3};
+// 00372C90 ITEMS_GetItemType: the item type of an item unit, 0 for any other
+// unit.
+constexpr std::uint8_t W_GetItemType_372C90[] = {0x40,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x85,0xC9,0x75,0x13,0x88,0x4C,0x24,0x30,0x48,0x8D,0x4C,0x24,0x30,0xE8,0x24,0x4E,0xFF,0xFF,0x84,0xC0,0x74,0x01,0xCC,0x48,0x8B,0xCF,0xE8,0x17,0x8D,0xFD,0xFF,0x83,0xF8,0x04,0x74,0x08,0x33,0xC0,0x48,0x83,0xC4,0x20,0x5F,0xC3,0x41,0xB8,0x9D,0x07,0x00,0x00};
+constexpr Witness GoldClientWitnesses[] = {
+	{0x0FE656ULL, W_ClickGate_FE656, 51, "ClickGate"},
+	{0x0FE68EULL, W_ClickGate_FE68E, 32, "ClickGate"},
+	{0x09A8C0ULL, W_CanAct_9A8C0, 47, "CanAct"},
+	{0x1932A2ULL, W_AutoGoldClick_1932A2, 42, "AutoGoldClick"},
+	{0x1932D1ULL, W_AutoGoldClick_1932D1, 11, "AutoGoldClick"},
+	{0x144640ULL, W_ClientContext_144640, 48, "ClientContext"},
+	{0x192B20ULL, W_AutoGoldTarget_192B20, 5, "AutoGoldTarget"},
+	{0x101A38ULL, W_AutoGoldNative_101A38, 176, "AutoGoldNative"},
+	{0x0FA180ULL, W_InteractUnit_FA180, 315, "InteractUnit"},
+	{0x0FA405ULL, W_InteractSend_FA405, 135, "InteractSend"},
+	{0x34A330ULL, W_GetUnitId_34A330, 46, "GetUnitId"},
+	{0x372C90ULL, W_GetItemType_372C90, 60, "GetItemType"},
+	{0x34BA40ULL, W_GetUsedSkill_34BA40, 14, "GetUsedSkill"},
+	{0x33CBC0ULL, W_SkillRecFlags_33CBC0, 76, "SkillRecFlags"},
+};
+// Gold while Whirlwinding (server). 004B9DF0, handler of message 16h (pick up
+// a ground item): exactly 17 bytes (004B9E2A), packet copied to rbp-1
+// (004B9E4B), item GUID read from +1 (004B9E76).
+constexpr std::uint8_t W_PickupGround_4B9DF0[] = {0x48,0x89,0x5C,0x24,0x08,0x55,0x56,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x8D,0x6C,0x24,0xD9,0x48,0x81,0xEC,0xD0,0x00,0x00,0x00,0x48,0x8B,0x05,0xB5,0x14,0x51,0x02,0x48,0x33,0xC4,0x48,0x89,0x45,0x17,0x49,0x63,0xD9,0x49,0x8B,0xF8,0x48,0x89,0x55,0xBF,0x4C,0x8B,0xF2,0x4C,0x8B,0xF9,0x83,0xFB,0x11,0x74,0x12,0x48,0x8D,0x4D,0xB7,0xC6,0x45,0xB7,0x00,0xE8,0x34,0x31,0x01,0x00,0x84,0xC0,0x74,0x01,0xCC,0x4C,0x8B,0xC3,0x48,0x8D,0x4D,0xFF,0x48,0x8B,0xD7,0xE8,0x10,0x98,0xE1,0x00,0x45,0x33,0xE4,0x49,0x8B,0xCE,0x4C,0x89,0x65,0xCF,0x44,0x89,0x65,0xBB,0xE8,0xDD,0x15,0xE9,0xFF,0x48,0x8B,0xC8,0x4C,0x8D,0x45,0xBB,0x48,0x8D,0x55,0xCF,0xE8,0x6D,0x5F,0xE3,0xFF,0x41,0x8B,0xFC,0x44,0x8B,0x6D,0x00,0x41,0x8B,0xF4};
+// 004BB600, handler of message 5Fh (pick up into an inventory position, sent in
+// controller play): exactly 25 bytes (004BB631), item GUID at +1 (004BB6E9).
+constexpr std::uint8_t W_PickupToInventory_4BB600[] = {0x40,0x55,0x53,0x56,0x57,0x41,0x56,0x48,0x8D,0x6C,0x24,0xD0,0x48,0x81,0xEC,0x30,0x01,0x00,0x00,0x48,0x8B,0x05,0xAE,0xFC,0x50,0x02,0x48,0x33,0xC4,0x48,0x89,0x45,0x00,0x49,0x63,0xD9,0x49,0x8B,0xF8,0x48,0x89,0x4C,0x24,0x78,0x48,0x89,0x54,0x24,0x68,0x83,0xFB,0x19,0x74,0x14,0x48,0x8D,0x4C,0x24,0x60,0xC6,0x44,0x24,0x60,0x00,0xE8,0xDB,0x79,0x01,0x00,0x84,0xC0,0x74,0x01,0xCC,0x4C,0x89,0xA4,0x24,0x28,0x01,0x00,0x00,0x48,0x8D,0x4D,0xE0,0x4C,0x89,0xAC,0x24,0x20,0x01,0x00,0x00,0x4C,0x8B,0xC3,0x48,0x8B,0xD7,0x4C,0x89,0xBC,0x24,0x18,0x01,0x00,0x00,0xE8,0xEF,0x7F,0xE1,0x00,0x48,0x8B,0x4C,0x24,0x68,0x45,0x33,0xF6,0x4C,0x89,0x75,0x90,0x44,0x89,0x75,0x80,0xE8,0xBA,0xFD,0xE8,0xFF,0x48,0x8B,0xC8,0x4C,0x8D,0x45,0x80,0x48,0x8D,0x55,0x90,0xE8,0x4A,0x47,0xE3,0xFF,0x41,0x8B,0xFE,0x41,0x8B,0xF6,0x44,0x39,0x75,0x80,0x0F,0x86,0x43,0x06,0x00,0x00,0x66,0x66,0x0F,0x1F,0x84,0x00,0x00,0x00,0x00,0x00,0x48,0x8B,0x4D,0x90,0x8B,0xC6,0x48,0x8B,0x0C,0xC1,0xE8,0xD1,0x46,0xE3,0xFF,0x48,0x8B,0xD8,0x48,0x85,0xC0,0x74,0x39,0x48,0x8B,0xCB,0xE8,0x01,0x03,0xE9,0xFF,0x83,0xF8,0x04,0x75,0x1C,0x41,0xB8,0x51,0x0B,0x00,0x00,0x48,0x8D,0x15,0xDF,0x83,0x87,0x01,0x48,0x8B,0xCB,0xE8,0x47,0xEC,0xE8,0xFF,0x3B,0x45,0xE1,0x48,0x0F,0x44,0xFB};
+// The dispatcher hook and its Uninterruptible-check redirect, shared by the
+// potion and the gold parts.
+constexpr Witness ServerMessageGateWitnesses[] = {
+	{0x4F2FA0ULL, W_Dispatcher_4F2FA0, 206, "Dispatcher"},
+	{0x4F3073ULL, W_Dispatcher_4F3073, 21, "Dispatcher"},
+};
+// The dispatcher's own bytes are verified by InstallServerMessageGate, before
+// it hooks them, so they are not repeated here: the potion part may already
+// have hooked the dispatcher when this list is checked. W_UseItem_4F4145
+// proves the item lookup 0048FE80(game, 4, guid) as the use-item handler makes
+// it (004F4170).
+constexpr Witness GoldServerWitnesses[] = {
+	{0x4B9DF0ULL, W_PickupGround_4B9DF0, 141, "PickupGround"},
+	{0x4BB600ULL, W_PickupToInventory_4BB600, 240, "PickupToInventory"},
+	{0x4F4145ULL, W_UseItem_4F4145, 51, "UseItem"},
+	{0x372C90ULL, W_GetItemType_372C90, 60, "GetItemType"},
+	{0x34BA40ULL, W_GetUsedSkill_34BA40, 14, "GetUsedSkill"},
+	{0x33CBC0ULL, W_SkillRecFlags_33CBC0, 76, "SkillRecFlags"},
+};
+
+// Cyclone (controller). 0014B889..0014B8B0, ControllerManager::Update 0014B720:
+// every frame, for each of the 8 player slots that has a player (0009A480),
+// the per-player controller update 0014C540 runs with rcx = manager,
+// edx = slot, r8d = elapsed ms. The call itself (0014B89D) is the redirected
+// site, checked by the patch.
+constexpr std::uint8_t W_ControllerLoop_14B889[] = {0x8B,0xCF,0xE8,0xF0,0xEB,0xF4,0xFF,0x48,0x85,0xC0,0x74,0x0D,0x44,0x8B,0xC5,0x8B,0xD7,0x48,0x8B,0xCB};
+constexpr std::uint8_t W_ControllerLoop_14B8A2[] = {0xFF,0xC7,0x48,0xFF,0xC6,0x83,0xFF,0x08,0x0F,0x8C,0x50,0xFF,0xFF,0xFF};
+// 0014C615..0014C804, in 0014C540: in controller mode (00077E10) the movement
+// stick (0013CF10) is stored per player slot (stride B8h) at +1954h/+1958h,
+// clamped to length 1; its world direction, rotated by the camera, at
+// +195Ch/+1960h; the stick counts as pushed when its length is above the dead
+// zone at manager+1F94h (0014C7F8).
+constexpr std::uint8_t W_Stick_14C615[] = {0xE8,0xF6,0xB7,0xF2,0xFF,0x45,0x0F,0x57,0xE4,0x84,0xC0,0x74,0x45,0xE8,0x69,0x08,0xFF,0xFF,0x48,0x8B,0xC8,0xE8,0x31,0x18,0xFF,0xFF,0x84,0xC0,0x74,0x1F,0xE8,0x58,0x08,0xFF,0xFF,0x44,0x8B,0xC3,0x48,0x8D,0x55,0x98,0x48,0x8B,0xC8,0xE8,0xC9,0x08,0xFF,0xFF,0xF3,0x0F,0x10,0x00,0xF3,0x0F,0x10,0x48,0x04,0xEB,0x2B,0x48,0x8D,0x44,0x24,0x40,0x4C,0x89,0x64,0x24,0x40,0xF3,0x0F,0x10,0x00,0xF3,0x0F,0x10,0x48,0x04,0xEB,0x16,0xE8,0xF4,0xE2,0xF3,0xFF,0x48,0x89,0x44,0x24,0x48,0xF3,0x0F,0x10,0x44,0x24,0x48,0xF3,0x0F,0x10,0x4C,0x24,0x4C,0xF3,0x41,0x0F,0x11,0x84,0x37,0x54,0x19,0x00,0x00,0x0F,0x28,0xD9,0xF3,0x41,0x0F,0x11,0x8C,0x37,0x58,0x19,0x00,0x00,0x0F,0x28,0xC3,0xF3,0x45,0x0F,0x10,0x8C,0x37,0x54,0x19,0x00,0x00,0xF3,0x44,0x0F,0x10,0x15,0x5A,0xE2,0xB6,0x01,0x41,0x0F,0x28,0xC9,0xF3,0x41,0x0F,0x59,0xC9,0xF3,0x0F,0x59,0xC3,0xF3,0x0F,0x58,0xC8,0xF3,0x0F,0x51,0xD1,0x41,0x0F,0x2F,0xD2,0x76,0x25,0x41,0x0F,0x28,0xC2,0xF3,0x0F,0x5E,0xC2,0xF3,0x44,0x0F,0x59,0xC8,0xF3,0x0F,0x59,0xD8,0xF3,0x45,0x0F,0x11,0x8C,0x37,0x54,0x19,0x00,0x00,0xF3,0x41,0x0F,0x11,0x9C,0x37,0x58,0x19,0x00,0x00,0xF3,0x42,0x0F,0x10,0x84,0x3E,0x58,0x19,0x00,0x00,0x49,0x8D,0x8F,0x5C,0x19,0x00,0x00,0x0F,0x57,0x05,0xEE,0x7E,0xB7,0x01,0x48,0x03,0xCE,0xF3,0x0F,0x10,0x35,0x73,0xFF,0xB7,0x01,0xF3,0x42,0x0F,0x11,0x84,0x3E,0x60,0x19,0x00,0x00,0x0F,0x28,0xC6,0x48,0x89,0x4C,0x24,0x40,0xE8,0x2C,0x2D,0x19,0x01,0x0F,0x28,0xF8,0x44,0x0F,0x28,0xC0,0x0F,0x28,0xC6,0xF3,0x41,0x0F,0x59,0xFC,0xE8,0x58,0x8B,0x19,0x01,0x48,0x8B,0x44,0x24,0x40,0x0F,0x28,0xD0,0x0F,0x28,0xE0,0xF3,0x41,0x0F,0x59,0xD4,0x44,0x88,0x64,0x24,0x30,0x0F,0x28,0xDF,0x0F,0x28,0xCF,0xF3,0x0F,0x10,0x68,0x04,0x0F,0x28,0xF7,0xF3,0x41,0x0F,0x59,0xC9,0x0F,0x28,0xC5,0xF3,0x41,0x0F,0x59,0xF4,0xF3,0x0F,0x59,0xC4,0xF3,0x0F,0x59,0xDD,0xF3,0x0F,0x5C,0xD9,0x41,0x0F,0x28,0xC8,0xF3,0x41,0x0F,0x59,0xC9,0xF3,0x0F,0x5C,0xCE,0xF3,0x0F,0x58,0xDA,0xF3,0x0F,0x58,0xC8,0x41,0x0F,0x28,0xC0,0xF3,0x0F,0x59,0xC5,0xF3,0x0F,0x59,0xDF,0xF3,0x0F,0x5C,0xF0,0xF3,0x41,0x0F,0x59,0xC8,0x0F,0x28,0xD3,0xF3,0x0F,0x5C,0xD1,0x41,0x0F,0x28,0xC9,0xF3,0x0F,0x59,0xCC,0xF3,0x0F,0x58,0xF1,0xF3,0x0F,0x58,0xD2,0xF3,0x41,0x0F,0x59,0xF0,0xF3,0x41,0x0F,0x58,0xD1,0xF3,0x0F,0x5C,0xF3,0xF3,0x0F,0x11,0x10,0xF3,0x0F,0x58,0xF6,0xF3,0x0F,0x58,0xF5,0xF3,0x0F,0x11,0x70,0x04,0xF3,0x41,0x0F,0x10,0x84,0x37,0x58,0x19,0x00,0x00,0xF3,0x41,0x0F,0x10,0x8C,0x37,0x54,0x19,0x00,0x00,0xF3,0x0F,0x59,0xC0,0xF3,0x0F,0x59,0xC9,0xF3,0x0F,0x58,0xC8,0xF3,0x0F,0x51,0xC1,0x0F,0x2F,0x86,0x94,0x1F,0x00,0x00,0x0F,0x97,0x44,0x24,0x35};
+// 001495AB..001495F8, the press/release matcher 00149550: the held skill
+// button of a player slot is at +1968h, -1 when none is held.
+constexpr std::uint8_t W_Matcher_1495AB[] = {0x4C,0x69,0x64,0x24,0x58,0xB8,0x00,0x00,0x00,0x48,0x89,0x9C,0x24,0x88,0x03,0x00,0x00,0x4C,0x89,0xAC,0x24,0x30,0x03,0x00,0x00,0x41,0x83,0xBC,0x3C,0x68,0x19,0x00,0x00,0xFF,0x74,0x18,0x40,0x84,0xF6,0x0F,0x85,0xBF,0x06,0x00,0x00,0x41,0x8B,0xDF,0x41,0x38,0xB4,0x3C,0x64,0x19,0x00,0x00,0x74,0x24,0xEB,0x1E,0x40,0x84,0xF6,0x0F,0x84,0xA7,0x06,0x00,0x00,0x41,0x8B,0xDF,0xE8,0x48,0x39,0x00,0x00};
+// 0011A9E0..0011AA4E, the release handler of skill button 1: 00117D20 returns
+// the skill id on a skill button (ecx = button).
+constexpr std::uint8_t W_ReleaseSlot1_11A9E0[] = {0x48,0x83,0xEC,0x28,0xE8,0xE7,0x29,0xF7,0xFF,0x85,0xC0,0x75,0x6B,0xE8,0xDE,0x08,0xF7,0xFF,0x8B,0xC8,0xE8,0x67,0xF1,0xF7,0xFF,0x84,0xC0,0x75,0x5B,0xB9,0x03,0x00,0x00,0x00,0xE8,0xF9,0x3A,0xFB,0xFF,0x84,0xC0,0x75,0x4D,0xB9,0x01,0x00,0x00,0x00,0x48,0x89,0x5C,0x24,0x20,0xE8,0x06,0xD3,0xFF,0xFF,0x8B,0xD8,0xE8,0x3F,0x72,0xFC,0xFF,0x48,0x8B,0xC8,0xE8,0x67,0x3A,0xC1,0x00,0x85,0xC0,0x74,0x26,0xE8,0x0E,0x9C,0x02,0x00,0x8B,0xD3,0x48,0x8B,0xC8,0xE8,0x34,0xFF,0x02,0x00,0x84,0xC0,0x75,0x13,0x33,0xD2,0x8D,0x4A,0x01,0x48,0x8B,0x5C,0x24,0x20,0x48,0x83,0xC4,0x28};
+constexpr Witness CycloneControllerWitnesses[] = {
+	{0x14B889ULL, W_ControllerLoop_14B889, 20, "ControllerLoop"},
+	{0x14B8A2ULL, W_ControllerLoop_14B8A2, 14, "ControllerLoop"},
+	{0x14C615ULL, W_Stick_14C615, 495, "Stick"},
+	{0x1495ABULL, W_Matcher_1495AB, 77, "Matcher"},
+	{0x11A9E0ULL, W_ReleaseSlot1_11A9E0, 110, "ReleaseSlot1"},
+	{0x34BA40ULL, W_GetUsedSkill_34BA40, 14, "GetUsedSkill"},
+	{0x33CBC0ULL, W_SkillRecFlags_33CBC0, 76, "SkillRecFlags"},
+};
+
 constexpr std::uint8_t P_Executor[] = {0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x41,0x54,0x41,0x55,0x41,0x56,0x41,0x57,0x48,0x83,0xEC,0x50};
 constexpr std::uint8_t P_HeldRight[] = {0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x8B,0xDA};
 constexpr std::uint8_t P_HeldLeft[] = {0x40,0x55,0x57,0x48,0x83,0xEC,0x38,0x48,0x8B,0xF9,0x33,0xED,0x48,0x8B,0x49,0x08};
@@ -303,6 +417,9 @@ enum class Part : std::size_t {
 	WhirlwindWithBows,
 	WhirlwindSpeedSync,
 	PetsFollowWhirlwind,
+	GoldWhileWhirlwindingServer,
+	GoldWhileWhirlwindingClient,
+	CycloneController,
 	Count,
 };
 
@@ -321,6 +438,9 @@ constexpr std::array<const char*, static_cast<std::size_t>(Part::Count)> PartNam
 	"Whirlwind with bows and crossbows",
 	"Whirlwind speed sync (server start)",
 	"Pets follow during Whirlwind",
+	"Gold while Whirlwinding (server)",
+	"Gold while Whirlwinding (client)",
+	"Cyclone (controller)",
 };
 
 std::array<PartState, static_cast<std::size_t>(Part::Count)> g_parts {};
@@ -339,7 +459,7 @@ auto PartIs(Part part, PartState state) noexcept -> bool {
 
 constexpr const char* DefaultConfigToml = R"toml(# Whirlwind - Whirlwind rework for Diablo II: Resurrected 3.3
 #
-# Nine parts, each behind its own switch:
+# Ten parts, each behind its own switch:
 #   [ctc_while_uninterruptible]  item procs (chance to cast) fire while the
 #                                caster is Uninterruptible, optionally filtered
 #   [proc_start_fix]             a proc no longer takes over the caster's skill
@@ -347,8 +467,9 @@ constexpr const char* DefaultConfigToml = R"toml(# Whirlwind - Whirlwind rework 
 #                                Whirlwind after a Corpse Explosion proc)
 #   [dual_wield_same_target]     both dual-wielded weapons may strike the same
 #                                target in one Whirlwind hit
-#   [cyclone]                    Whirlwind follows the cursor for as long as
-#                                the button is held, and only that long
+#   [cyclone]                    Whirlwind follows the cursor, or the movement
+#                                stick on a controller, for as long as the
+#                                button is held, and only that long
 #   [death_while_whirlwinding]   a lethal hit kills the character during
 #                                Whirlwind instead of waiting for it to end
 #   [potions_while_whirlwinding] potions can be used during Whirlwind
@@ -357,6 +478,8 @@ constexpr const char* DefaultConfigToml = R"toml(# Whirlwind - Whirlwind rework 
 #                                movement speed the client does
 #   [pets_follow_whirlwind]      summons, pets and hirelings follow the
 #                                character during Whirlwind
+#   [gold_while_whirlwinding]    Auto Gold Pickup keeps picking up gold during
+#                                Whirlwind
 #
 # Safety: the plugin verifies the original bytes of every site it touches, and
 # of every game function it calls, before it installs anything. On a game build
@@ -455,15 +578,26 @@ enabled = true
 # Default: 120
 hold_grace_ms = 120
 
-# What to do when the cursor is on or very close to the character.
-#   "keep_heading"  - keep moving in the last direction the cursor gave.
-#   "spin_in_place" - stop moving and spin until the cursor moves away.
+# What to do when the cursor is on or very close to the character, or, with
+# a controller, while the movement stick is not pushed.
+#   "keep_heading"  - keep moving in the last direction the cursor (or the
+#                     stick) gave.
+#   "spin_in_place" - stop moving and spin until the cursor moves away (or
+#                     the stick is pushed again).
 # Default: "keep_heading"
 near_cursor = "keep_heading"
 
 # How close, in subtiles, counts as "very close" for near_cursor.
 # Default: 3
 near_cursor_radius = 3
+
+# With a controller, Whirlwind follows the stick you move with (the left
+# stick unless you rebound it) for as long as the skill button is held,
+# from the moment it is pressed. The game's own controller aim (a point 2
+# subtiles ahead, or the enemy it docks to) only picks where the first spin
+# starts. A stick that is not pushed counts as "very close" for near_cursor
+# above, so keep_heading and spin_in_place work the same way as with a mouse.
+# Site: RVA 0014B89D (client).
 
 # While the button is held, Whirlwind pays its normal cost again every this
 # many game frames (25 frames is one second). Mana skills pay mana, skills cast
@@ -561,6 +695,24 @@ enabled = true
 # the same way as RVA 00429B8E (walk/run frame handler).
 # Default: true
 enabled = true
+
+
+[gold_while_whirlwinding]
+
+# The game's Auto Gold Pickup option does nothing during Whirlwind. The game
+# still finds the gold, but it picks gold up with a click, and every click is
+# refused while Whirlwind runs. The server also ignores pickup messages from an
+# Uninterruptible character. With this on, Auto Gold Pickup works during
+# Whirlwind the same way it works while walking: same option, same radius,
+# same delays, same server distance check. Like walking, it picks up gold while
+# the character is moving, not while it spins in place.
+# Only gold is affected. Clicks, every other item and the Whirlwind itself are
+# untouched. Nothing happens when Auto Gold Pickup is off in the game options.
+# Players only.
+# Sites: RVA 000FE689 (client); RVA 004F2FA0, 004F306E (server, shared with
+# potions_while_whirlwinding).
+# Default: true
+enabled = true
 )toml";
 
 struct Config {
@@ -580,6 +732,7 @@ struct Config {
 	bool whirlwindWithBows = true;
 	bool whirlwindSpeedSync = true;
 	bool petsFollowWhirlwind = true;
+	bool goldWhileWhirlwinding = true;
 };
 
 Config                      g_config {};
@@ -702,16 +855,17 @@ void LoadConfiguration(const D2RL::PluginContext* context) noexcept {
 		ReadBool(t, "whirlwind_with_bows", "enabled", g_config.whirlwindWithBows);
 		ReadBool(t, "whirlwind_speed_sync", "enabled", g_config.whirlwindSpeedSync);
 		ReadBool(t, "pets_follow_whirlwind", "enabled", g_config.petsFollowWhirlwind);
+		ReadBool(t, "gold_while_whirlwinding", "enabled", g_config.goldWhileWhirlwinding);
 	}
 	// The server keeps a Whirlwind alive a little longer than the client does,
 	// so a client aim can never reach a server whose Whirlwind already ended.
 	g_serverGraceFrames = static_cast<std::uint32_t>((g_config.holdGraceMs + 39) / 40 + 2);
 	D2RL::LogInfoF(
 		context,
-		"config: enabled=%d ctc=%d chance=%d allow_list=%d proc_fix=%d dual_wield=%d cyclone=%d grace_ms=%d keep_heading=%d radius=%d mana_frames=%d spin_melee=%d death=%d potions=%d bows=%d speed_sync=%d pets=%d",
+		"config: enabled=%d ctc=%d chance=%d allow_list=%d proc_fix=%d dual_wield=%d cyclone=%d grace_ms=%d keep_heading=%d radius=%d mana_frames=%d spin_melee=%d death=%d potions=%d bows=%d speed_sync=%d pets=%d gold=%d",
 		g_config.enabled, g_config.ctcEnabled, g_config.ctcChancePercent, g_ctcAllowListActive, g_config.procStartFix,
 		g_config.dualWieldSameTarget, g_config.cycloneEnabled, g_config.holdGraceMs, g_config.keepHeading,
-		g_config.nearCursorRadius, g_config.manaIntervalFrames, g_config.spinAtMeleeTargets, g_config.deathWhileWhirlwinding, g_config.potionsWhileWhirlwinding, g_config.whirlwindWithBows, g_config.whirlwindSpeedSync, g_config.petsFollowWhirlwind);
+		g_config.nearCursorRadius, g_config.manaIntervalFrames, g_config.spinAtMeleeTargets, g_config.deathWhileWhirlwinding, g_config.potionsWhileWhirlwinding, g_config.whirlwindWithBows, g_config.whirlwindSpeedSync, g_config.petsFollowWhirlwind, g_config.goldWhileWhirlwinding);
 }
 
 // ---------------------------------------------------------------------------
@@ -742,6 +896,8 @@ constexpr std::size_t RelayDispatchState    = 0x0E0;
 constexpr std::size_t RelayUseItemState     = 0x100;
 constexpr std::size_t RelayItemLockState    = 0x120;
 constexpr std::size_t RelaySequenceFallback = 0x140;
+constexpr std::size_t RelayClickGate        = 0x160;
+constexpr std::size_t RelayControllerUpdate = 0x180;
 
 std::uint8_t* g_relayPage = nullptr;
 
@@ -813,7 +969,23 @@ constexpr int           MaskPathfind         = 0x0C01; // 0056A540
 constexpr int           MaskMoveTest         = 0x0401; // 0056A5CC
 constexpr int           CollisionPlayer      = 0x80;   // 0056A62F: (1 xor 1)+1 << 7
 constexpr std::uint64_t ClientAimIntervalMs  = 40;     // one game frame
+constexpr std::uint32_t ControllerPlayers       = 8;      // 0014B8A7: cmp edi,8
+constexpr std::size_t   ControllerStride        = 0xB8;   // 0014B831 / 001495AB: imul ...,0B8h
+constexpr std::size_t   ControllerHeldButton    = 0x1968; // 001495C4: -1 when no skill button is held
+constexpr std::size_t   ControllerStickX        = 0x1954; // 0014C67D: movement stick, length <= 1
+constexpr std::size_t   ControllerStickY        = 0x1958; // 0014C68A
+constexpr std::size_t   ControllerStickWorldX   = 0x195C; // 0014C7C3: camera-rotated, world subtiles
+constexpr std::size_t   ControllerStickWorldY   = 0x1960; // 0014C7CF
+constexpr std::size_t   ControllerStickDeadzone = 0x1F94; // 0014C7F8: on the manager, not per slot
+constexpr int           StickRunway             = 10;     // subtiles ahead along the stick
 constexpr int           MaxAimDistance       = 40;     // server accepts up to 50 (004FE1F0)
+constexpr std::int32_t  ItemTypeGold         = 4;      // itemtypes.txt row 4 (gold): 000FA255, 00471B04
+constexpr std::size_t   AutoGoldManager      = 0x1918; // client context+1918h: 00101A4E, 000FA23C
+constexpr std::uint8_t  PacketPickupGround      = 0x16; // 004B9DF0
+constexpr std::uint32_t PickupGroundSize        = 17;   // 004B9E2A: cmp ebx,11h
+constexpr std::uint8_t  PacketPickupToInventory = 0x5F; // 004BB600
+constexpr std::uint32_t PickupToInventorySize   = 25;   // 004BB631: cmp ebx,19h
+constexpr std::size_t   PickupItemGuid          = 1;    // 004B9E76, 004BB6E9: GUID at +1
 
 inline auto U32(void* object, std::size_t offset) noexcept -> std::uint32_t& {
 	return *static_cast<std::uint32_t*>(static_cast<void*>(static_cast<std::uint8_t*>(object) + offset));
@@ -880,6 +1052,17 @@ struct Native {
 	std::int32_t (*checkItemTypeId)(void*, std::int32_t)                = nullptr; // 00373890
 	void* (*getPlayerData)(void*)                                       = nullptr; // 0034B240
 	std::int32_t (*squaredDistance)(std::int32_t, std::int32_t, std::int32_t, std::int32_t) = nullptr; // 003412C0
+	// Gold while Whirlwinding.
+	std::int64_t (*canActNow)(void*, void*)                             = nullptr; // 0009A8C0
+	void* (*clientContext)()                                            = nullptr; // 00144640
+	void* (*autoGoldTarget)(void*)                                      = nullptr; // 00192B20
+	std::int64_t (*interactWithUnit)(std::uint32_t, std::uint32_t)      = nullptr; // 000FA180
+	std::uint32_t (*getUnitId)(void*)                                   = nullptr; // 0034A330
+	std::int32_t (*getItemType)(void*)                                  = nullptr; // 00372C90
+	// Cyclone (controller).
+	bool (*isControllerMode)()                                          = nullptr; // 00077E10
+	std::int32_t (*buttonSkill)(std::uint32_t)                          = nullptr; // 00117D20
+	std::int64_t (*controllerPlayerUpdate)(void*, std::uint32_t, std::uint32_t) = nullptr; // 0014C540
 	// Originals of redirected calls.
 	std::int32_t (*serverPathStatus)(void*, void*)                      = nullptr; // 00491AC0
 	std::int32_t (*clientPathStep)(void*, std::int32_t)                 = nullptr; // 000F9A00
@@ -930,6 +1113,15 @@ void BindNatives(std::uintptr_t base) noexcept {
 	Bind(g_native.checkItemTypeId, base, 0x373890);
 	Bind(g_native.getPlayerData, base, 0x34B240);
 	Bind(g_native.squaredDistance, base, 0x3412C0);
+	Bind(g_native.canActNow, base, 0x09A8C0);
+	Bind(g_native.clientContext, base, 0x144640);
+	Bind(g_native.autoGoldTarget, base, 0x192B20);
+	Bind(g_native.interactWithUnit, base, 0x0FA180);
+	Bind(g_native.getUnitId, base, 0x34A330);
+	Bind(g_native.getItemType, base, 0x372C90);
+	Bind(g_native.isControllerMode, base, 0x077E10);
+	Bind(g_native.buttonSkill, base, 0x117D20);
+	Bind(g_native.controllerPlayerUpdate, base, 0x14C540);
 	Bind(g_native.serverPathStatus, base, 0x491AC0);
 	Bind(g_native.clientPathStep, base, 0x0F9A00);
 	Bind(g_native.procStart, base, 0x217640);
@@ -944,6 +1136,13 @@ auto IsWhirlwindSkill(void* skill) noexcept -> bool {
 	}
 	void* record = SkillRecord(skill);
 	return record != nullptr && RecordSrvDoFunc(record) == WhirlwindSrvDoFunc;
+}
+
+// The unit's used skill is a Whirlwind and its path is active, the same test
+// the potion parts make.
+auto IsWhirlwinding(void* unit) noexcept -> bool {
+	void* const used = g_native.getUsedSkill(unit);
+	return IsWhirlwindSkill(used) && (g_native.getSkillFlags(used) & TokenActive) != 0;
 }
 
 // The same endpoint bookkeeping the native starts do (0056A5E0..0056A678 on the
@@ -1330,6 +1529,9 @@ std::int32_t __fastcall OnClientPathStep(void* unit, std::int32_t flag) noexcept
 	return 0;
 }
 
+// Set once the controller steering is installed (OnControllerPlayerUpdate).
+bool g_cycloneControllerActive = false;
+
 auto HandleCycloneAim(SkillCommand* command, void* skill) noexcept -> bool {
 	if (command == nullptr || skill == nullptr || (command->flags & CommandHeld) == 0) {
 		return false;
@@ -1355,6 +1557,14 @@ auto HandleCycloneAim(SkillCommand* command, void* skill) noexcept -> bool {
 		return true;
 	}
 	s.lastAimMs = now;
+	// With a controller the held command carries the game's controller aim
+	// (a point 2 subtiles ahead, or a docked enemy), which is inside the near
+	// radius and would only ever spin in place. The held command still proves
+	// the button is down; the steering comes from the stick, in
+	// OnControllerPlayerUpdate.
+	if (g_cycloneControllerActive && g_native.isControllerMode()) {
+		return true;
+	}
 	if (s.lastSendMs != 0 && now - s.lastSendMs < ClientAimIntervalMs) {
 		return true;
 	}
@@ -1423,6 +1633,110 @@ std::int64_t __fastcall OnHeldLeftCommand(SkillCommand* command) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Cyclone: controller (local player only)
+// ---------------------------------------------------------------------------
+
+std::atomic<std::uint64_t> g_controllerAims {0};
+
+// Where the stick sends Whirlwind: StickRunway subtiles ahead of the character
+// along the stick's world direction, the vector the game's own stick movement
+// walks along (0014CC17), while the stick is pushed past the game's dead zone.
+// A released stick is the controller's "cursor on the character": it keeps the
+// last stick heading or spins in place, as near_cursor says.
+void StickAim(const std::uint8_t* manager, const std::uint8_t* slot, std::int32_t px, std::int32_t py, ClientSession& s, std::int32_t& ax, std::int32_t& ay) noexcept {
+	float rawX     = 0.0F;
+	float rawY     = 0.0F;
+	float worldX   = 0.0F;
+	float worldY   = 0.0F;
+	float deadzone = 0.0F;
+	std::memcpy(&rawX, slot + ControllerStickX, sizeof(rawX));
+	std::memcpy(&rawY, slot + ControllerStickY, sizeof(rawY));
+	std::memcpy(&worldX, slot + ControllerStickWorldX, sizeof(worldX));
+	std::memcpy(&worldY, slot + ControllerStickWorldY, sizeof(worldY));
+	std::memcpy(&deadzone, manager + ControllerStickDeadzone, sizeof(deadzone));
+	ax = px;
+	ay = py;
+	const float worldLength = std::sqrt(worldX * worldX + worldY * worldY);
+	if (std::sqrt(rawX * rawX + rawY * rawY) > deadzone && worldLength > 0.0001F) {
+		s.headingX    = worldX / worldLength;
+		s.headingY    = worldY / worldLength;
+		s.haveHeading = true;
+	} else if (!g_config.keepHeading || !s.haveHeading) {
+		return;
+	}
+	ax = px + static_cast<std::int32_t>(std::lround(s.headingX * static_cast<float>(StickRunway)));
+	ay = py + static_cast<std::int32_t>(std::lround(s.headingY * static_cast<float>(StickRunway)));
+}
+
+// Steering for a Whirlwind held on a controller skill button. The hold is the
+// controller's own: the button held on this player slot (+1968h, set by the
+// press itself) carries the skill that is Whirlwinding. That is true from the
+// press on, so steering and the hold renewal start at once instead of after
+// the controller's tapWindowMS, which is longer than the hold grace. Same
+// session, same retarget, same aim message and the same send spacing as the
+// cursor path; only the target comes from the stick.
+void SteerByStick(std::uint8_t* manager, std::uint32_t index, void* player) noexcept {
+	void* const used = g_native.getUsedSkill(player);
+	if (!IsWhirlwindSkill(used)) {
+		return;
+	}
+	const std::uint32_t flags = g_native.getSkillFlags(used);
+	if ((flags & TokenActive) == 0 || (flags & TokenFinishing) != 0) {
+		return;
+	}
+	std::uint8_t* const slot = manager + ControllerStride * index;
+	std::int32_t        held = -1;
+	std::memcpy(&held, slot + ControllerHeldButton, sizeof(held));
+	if (held < 0) {
+		return;
+	}
+	void* const record = SkillRecord(used);
+	if (record == nullptr || g_native.buttonSkill(static_cast<std::uint32_t>(held)) != RecordSkillId(record)) {
+		return;
+	}
+	const std::uint64_t now = GetTickCount64();
+	ClientSession&      s   = ClientSessionFor(player, now);
+	if (now - s.lastAimMs > static_cast<std::uint64_t>(g_config.holdGraceMs)) {
+		return; // a lapsed hold is never revived, exactly as on the cursor path
+	}
+	s.lastAimMs = now;
+	if (s.lastSendMs != 0 && now - s.lastSendMs < ClientAimIntervalMs) {
+		return;
+	}
+	void* const path = g_native.getDynamicPath(player);
+	if (path == nullptr) {
+		return;
+	}
+	std::int32_t ax = 0;
+	std::int32_t ay = 0;
+	StickAim(manager, slot, g_native.pathGetX(path), g_native.pathGetY(path), s, ax, ay);
+	if (ax <= 0 || ay <= 0 || ax > 0xFFFF || ay > 0xFFFF) {
+		return;
+	}
+	ClientRetarget(player, used, ax, ay);
+	const std::int32_t opcode = used == g_native.getLeftSkill(player) ? 0x05 : 0x0C;
+	g_native.sendCommand(opcode, player, ax, ay);
+	s.lastSendMs = now;
+	g_controllerAims.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Replaces the call to the per-player controller update 0014C540 at 0014B89D
+// inside ControllerManager::Update 0014B720. The update runs first, unchanged:
+// it refreshes the stick and runs the controller's own skill hold, which
+// reaches HandleCycloneAim through the held-button handlers. Then, in
+// controller mode, the local player's Whirlwind is steered by the stick.
+std::int64_t __fastcall OnControllerPlayerUpdate(void* manager, std::uint32_t index, std::uint32_t elapsed) noexcept {
+	const std::int64_t result = g_native.controllerPlayerUpdate(manager, index, elapsed);
+	if (g_cycloneControllerActive && manager != nullptr && index < ControllerPlayers && g_native.isControllerMode()) {
+		void* const player = g_native.playerFromIndex(index);
+		if (player != nullptr && UnitType(player) == 0 && player == LocalPlayer()) {
+			SteerByStick(static_cast<std::uint8_t*>(manager), index, player);
+		}
+	}
+	return result;
+}
+
+// ---------------------------------------------------------------------------
 // Proc start fix (client)
 // ---------------------------------------------------------------------------
 
@@ -1475,12 +1789,39 @@ std::int64_t __fastcall OnProcTail(void* unit, std::int32_t flag) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// Gold while Whirlwinding (server)
+// ---------------------------------------------------------------------------
+
+// The player whose gold pickup is being let past the Uninterruptible check.
+// Server game thread only.
+void*                      g_goldPlayer       = nullptr;
+bool                       g_goldServerActive = false;
+std::atomic<std::uint64_t> g_goldServerPasses {0};
+
+// A pickup message (16h, or 5Fh in controller play) from a Whirlwinding player
+// for an item that is gold. Everything else about the pickup (distance,
+// position, the gold itself) stays with the native handler.
+auto IsGoldPickupWhileWhirlwinding(void* game, void* player, const std::uint8_t* packet, std::uint32_t size) noexcept -> bool {
+	if (packet == nullptr || !((packet[0] == PacketPickupGround && size == PickupGroundSize) || (packet[0] == PacketPickupToInventory && size == PickupToInventorySize))) {
+		return false;
+	}
+	if (game == nullptr || player == nullptr || UnitType(player) != 0 || !IsWhirlwinding(player)) {
+		return false;
+	}
+	std::uint32_t guid = 0;
+	std::memcpy(&guid, packet + PickupItemGuid, sizeof(guid));
+	void* const item = g_native.getServerUnit(game, UnitTypeItem, guid);
+	return item != nullptr && g_native.getItemType(item) == ItemTypeGold;
+}
+
+// ---------------------------------------------------------------------------
 // Potions while Whirlwinding (server)
 // ---------------------------------------------------------------------------
 
 // The player whose potion use is being let past the Uninterruptible checks.
 // Server game thread only.
-void* g_potionPlayer = nullptr;
+void* g_potionPlayer       = nullptr;
+bool  g_potionServerActive = false;
 
 auto IsPotionUseWhileWhirlwinding(void* game, void* player, const std::uint8_t* packet) noexcept -> bool {
 	if (game == nullptr || player == nullptr || packet == nullptr || packet[0] != PacketUseItem || UnitType(player) != 0) {
@@ -1502,15 +1843,25 @@ PacketDispatchFn g_originalPacketDispatch = nullptr;
 UseItemFn        g_originalUseItem        = nullptr;
 
 // Entry hook on the server message dispatcher 004F2FA0. Its default branch
-// ignores every message while the player is Uninterruptible (004F306E).
+// ignores every message while the player is Uninterruptible (004F306E). The
+// hook serves the potion part (message 26h) and the gold part (messages 16h
+// and 5Fh); each opens its scope only once that part is installed.
 std::int64_t __fastcall OnPacketDispatch(void* game, void* player, std::uint8_t* packet, std::uint32_t size) noexcept {
-	const bool open = g_potionPlayer == nullptr && size == 36 && IsPotionUseWhileWhirlwinding(game, player, packet);
-	if (open) {
+	const bool potion = g_potionServerActive && g_potionPlayer == nullptr && size == 36 && IsPotionUseWhileWhirlwinding(game, player, packet);
+	const bool gold   = !potion && g_goldServerActive && g_goldPlayer == nullptr && IsGoldPickupWhileWhirlwinding(game, player, packet, size);
+	if (potion) {
 		g_potionPlayer = player;
 	}
+	if (gold) {
+		g_goldPlayer = player;
+	}
 	const std::int64_t result = g_originalPacketDispatch(game, player, packet, size);
-	if (open) {
+	if (potion) {
 		g_potionPlayer = nullptr;
+	}
+	if (gold) {
+		g_goldPlayer = nullptr;
+		g_goldServerPasses.fetch_add(1, std::memory_order_relaxed);
 	}
 	return result;
 }
@@ -1519,7 +1870,7 @@ std::int64_t __fastcall OnPacketDispatch(void* game, void* player, std::uint8_t*
 // directly and when a queued use is processed later. It refuses the use while
 // the player is Uninterruptible (004F4140).
 std::int64_t __fastcall OnUseItem(void* game, void* player, std::uint8_t* packet, std::uint8_t queued) noexcept {
-	const bool open = g_potionPlayer == nullptr && IsPotionUseWhileWhirlwinding(game, player, packet);
+	const bool open = g_potionServerActive && g_potionPlayer == nullptr && IsPotionUseWhileWhirlwinding(game, player, packet);
 	if (open) {
 		g_potionPlayer = player;
 	}
@@ -1531,9 +1882,10 @@ std::int64_t __fastcall OnUseItem(void* game, void* player, std::uint8_t* packet
 }
 
 // Replaces the two STATES_CheckState(player, 54) calls above. Identical to the
-// native call except for the potion use currently being processed.
+// native call except for the potion use or the gold pickup currently being
+// processed.
 std::int32_t __fastcall OnUseItemStateCheck(void* unit, std::int32_t state) noexcept {
-	if (g_potionPlayer != nullptr && unit == g_potionPlayer && state == StateUninterruptable) {
+	if (state == StateUninterruptable && unit != nullptr && (unit == g_potionPlayer || unit == g_goldPlayer)) {
 		return 0;
 	}
 	return g_native.checkState(unit, state);
@@ -1587,6 +1939,45 @@ std::int32_t __fastcall OnItemUseLockStateCheck(void* unit, std::int32_t state) 
 		return 0;
 	}
 	return g_native.checkState(unit, state);
+}
+
+// ---------------------------------------------------------------------------
+// Gold while Whirlwinding (client)
+// ---------------------------------------------------------------------------
+
+bool                       g_goldClientActive = false;
+std::atomic<std::uint64_t> g_goldClientSends {0};
+
+// Replaces the call to the "can act now" gate 0009A8C0 at 000FE689 inside the
+// click dispatcher 000FE3B0. Auto Gold Pickup (tick 00193010) picks gold up by
+// issuing a click (action 7) on the gold it holds as its target. While
+// Whirlwind runs the gate refuses every click, so vanilla sends nothing. When
+// the gate refuses during a Whirlwind and the click is Auto Gold's own, the
+// item interaction 000FA180 runs for that gold. That is the routine the native
+// click ends in (00101ADF -> 000FABE0 -> 000FA180), without the command start
+// 000FF010 in between: that start ends the caster's current skill, so it would
+// end the Whirlwind (and 000FABE0 itself refuses a caster in a skill mode at
+// 000FFAC0). For the Auto Gold target, 000FA180 never stops the character; it
+// only sends the pickup message. The gate's answer is returned unchanged, so
+// the dispatcher carries on exactly as vanilla.
+std::int64_t __fastcall OnClickGate(void* player, void* skill) noexcept {
+	const std::int64_t canAct = g_native.canActNow(player, skill);
+	if (static_cast<std::uint32_t>(canAct) != 0 || !g_goldClientActive || player == nullptr || UnitType(player) != 0 || !IsWhirlwinding(player)) {
+		return canAct;
+	}
+	auto* const context = static_cast<std::uint8_t*>(g_native.clientContext());
+	if (context == nullptr) {
+		return canAct;
+	}
+	// The target is set only while the Auto Gold tick's own click runs
+	// (001932BE..001932D1), so a target here means this click is Auto Gold's.
+	void* const gold = g_native.autoGoldTarget(context + AutoGoldManager);
+	if (gold == nullptr || UnitType(gold) != static_cast<std::uint32_t>(UnitTypeItem) || g_native.getItemType(gold) != ItemTypeGold) {
+		return canAct;
+	}
+	g_native.interactWithUnit(static_cast<std::uint32_t>(UnitTypeItem), g_native.getUnitId(gold));
+	g_goldClientSends.fetch_add(1, std::memory_order_relaxed);
+	return canAct;
 }
 
 // ---------------------------------------------------------------------------
@@ -1664,6 +2055,8 @@ constexpr CallSite SiteProcTail         {0x231334, {0xE8, 0x57, 0xD4, 0x11, 0x00
 constexpr CallSite SiteDispatchState    {0x4F306E, {0xE8, 0x3D, 0x21, 0xE4, 0xFF}, RelayDispatchState};
 constexpr CallSite SiteUseItemState     {0x4F4140, {0xE8, 0x6B, 0x10, 0xE4, 0xFF}, RelayUseItemState};
 constexpr CallSite SiteItemLockState    {0x1C738C, {0xE8, 0x1F, 0xDE, 0x16, 0x00}, RelayItemLockState};
+constexpr CallSite SiteClickGate        {0x0FE689, {0xE8, 0x32, 0xC2, 0xF9, 0xFF}, RelayClickGate};
+constexpr CallSite SiteControllerUpdate {0x14B89D, {0xE8, 0x9E, 0x0C, 0x00, 0x00}, RelayControllerUpdate};
 
 auto PrepareRelayPage(const D2RL::PluginContext* context) noexcept -> bool {
 	const auto base = static_cast<std::uintptr_t>(context->exeBase);
@@ -1682,6 +2075,8 @@ auto PrepareRelayPage(const D2RL::PluginContext* context) noexcept -> bool {
 	WriteAbsoluteJump(g_relayPage + RelayDispatchState, reinterpret_cast<std::uint64_t>(&OnUseItemStateCheck));
 	WriteAbsoluteJump(g_relayPage + RelayUseItemState, reinterpret_cast<std::uint64_t>(&OnUseItemStateCheck));
 	WriteAbsoluteJump(g_relayPage + RelayItemLockState, reinterpret_cast<std::uint64_t>(&OnItemUseLockStateCheck));
+	WriteAbsoluteJump(g_relayPage + RelayClickGate, reinterpret_cast<std::uint64_t>(&OnClickGate));
+	WriteAbsoluteJump(g_relayPage + RelayControllerUpdate, reinterpret_cast<std::uint64_t>(&OnControllerPlayerUpdate));
 	// Dual wield: entered from the loop back-edge 005694B7 with rdi = &token+30h
 	// (reloaded at 005694B2). dec dword [rdi] turns "search after the GUID just
 	// struck" into "search from that GUID", then resume the loop at 00569220.
@@ -1835,6 +2230,25 @@ void InstallPetTrail(const D2RL::PluginContext* context) noexcept {
 	SetPart(Part::PetsFollowWhirlwind, frame);
 }
 
+// The dispatcher hook at 004F2FA0 and the Uninterruptible-check redirect at
+// 004F306E serve the potion and the gold parts, and are installed once for
+// whichever of them asks first. The redirect behaves exactly like the native
+// call until a hook opens a scope, so it goes in first.
+auto InstallServerMessageGate(const D2RL::PluginContext* context) noexcept -> PartState {
+	static PartState state = PartState::NotAttempted;
+	if (state != PartState::NotAttempted) {
+		return state;
+	}
+	if (!VerifyAll(context, ServerMessageGateWitnesses, "Server message gate")) {
+		state = PartState::UnsupportedBuild;
+	} else {
+		const bool ok = RedirectCall(context, SiteDispatchState)
+			&& context->InstallInlineHook(0x4F2FA0, P_Dispatcher, sizeof(P_Dispatcher), reinterpret_cast<void*>(&OnPacketDispatch), reinterpret_cast<void**>(&g_originalPacketDispatch));
+		state = ok ? PartState::Installed : PartState::InstallFailed;
+	}
+	return state;
+}
+
 void InstallPotions(const D2RL::PluginContext* context) noexcept {
 	if (!g_config.potionsWhileWhirlwinding) {
 		SetPart(Part::PotionsWhileWhirlwinding, PartState::DisabledByConfig);
@@ -1846,9 +2260,10 @@ void InstallPotions(const D2RL::PluginContext* context) noexcept {
 	if (!VerifyAll(context, PotionWitnesses, PartNames[static_cast<std::size_t>(Part::PotionsWhileWhirlwinding)])) {
 		SetPart(Part::PotionsWhileWhirlwinding, PartState::UnsupportedBuild);
 	} else {
-		const bool ok = RedirectCall(context, SiteUseItemState) && RedirectCall(context, SiteDispatchState)
+		const bool ok = RedirectCall(context, SiteUseItemState)
 			&& context->InstallInlineHook(0x4F40C0, P_UseItem, sizeof(P_UseItem), reinterpret_cast<void*>(&OnUseItem), reinterpret_cast<void**>(&g_originalUseItem))
-			&& context->InstallInlineHook(0x4F2FA0, P_Dispatcher, sizeof(P_Dispatcher), reinterpret_cast<void*>(&OnPacketDispatch), reinterpret_cast<void**>(&g_originalPacketDispatch));
+			&& InstallServerMessageGate(context) == PartState::Installed;
+		g_potionServerActive = ok;
 		SetPart(Part::PotionsWhileWhirlwinding, ok ? PartState::Installed : PartState::InstallFailed);
 	}
 	if (!VerifyAll(context, PotionClientWitnesses, PartNames[static_cast<std::size_t>(Part::PotionsWhileWhirlwindingClient)])) {
@@ -1884,6 +2299,31 @@ void InstallSequenceFallback(const D2RL::PluginContext* context) noexcept {
 	SetPart(Part::WhirlwindWithBows, ok ? PartState::Installed : PartState::InstallFailed);
 }
 
+// Server: the shared message gate. Client: the redirect of the click gate at
+// 000FE689, which behaves exactly like the native call unless Auto Gold's own
+// click is refused during a Whirlwind.
+void InstallGold(const D2RL::PluginContext* context) noexcept {
+	if (!g_config.goldWhileWhirlwinding) {
+		SetPart(Part::GoldWhileWhirlwindingServer, PartState::DisabledByConfig);
+		SetPart(Part::GoldWhileWhirlwindingClient, PartState::DisabledByConfig);
+		return;
+	}
+	if (!VerifyAll(context, GoldServerWitnesses, PartNames[static_cast<std::size_t>(Part::GoldWhileWhirlwindingServer)])) {
+		SetPart(Part::GoldWhileWhirlwindingServer, PartState::UnsupportedBuild);
+	} else {
+		const PartState gate = InstallServerMessageGate(context);
+		g_goldServerActive   = gate == PartState::Installed;
+		SetPart(Part::GoldWhileWhirlwindingServer, gate);
+	}
+	if (!VerifyAll(context, GoldClientWitnesses, PartNames[static_cast<std::size_t>(Part::GoldWhileWhirlwindingClient)])) {
+		SetPart(Part::GoldWhileWhirlwindingClient, PartState::UnsupportedBuild);
+	} else {
+		const bool ok      = RedirectCall(context, SiteClickGate);
+		g_goldClientActive = ok;
+		SetPart(Part::GoldWhileWhirlwindingClient, ok ? PartState::Installed : PartState::InstallFailed);
+	}
+}
+
 // No relay needed: an entry hook through the loader.
 void InstallSpeedSync(const D2RL::PluginContext* context) noexcept {
 	if (!g_config.whirlwindSpeedSync) {
@@ -1903,6 +2343,7 @@ void InstallCyclone(const D2RL::PluginContext* context) noexcept {
 	if (!g_config.cycloneEnabled) {
 		SetPart(Part::CycloneServer, PartState::DisabledByConfig);
 		SetPart(Part::CycloneClient, PartState::DisabledByConfig);
+		SetPart(Part::CycloneController, PartState::DisabledByConfig);
 		SetPart(Part::MeleeSpinServer, PartState::DisabledByConfig);
 		SetPart(Part::MeleeSpinClient, PartState::DisabledByConfig);
 		return;
@@ -1937,6 +2378,21 @@ void InstallCyclone(const D2RL::PluginContext* context) noexcept {
 		SetPart(Part::CycloneClient, PartState::UnsupportedBuild);
 		SetPart(Part::MeleeSpinClient, PartState::UnsupportedBuild);
 	}
+
+	// Controller steering rides on the client part: it shares its session,
+	// retarget and aim message.
+	if (!g_config.cycloneEnabled) {
+		return;
+	}
+	if (!PartIs(Part::CycloneClient, PartState::Installed)) {
+		SetPart(Part::CycloneController, PartState::InstallFailed);
+	} else if (!VerifyAll(context, CycloneControllerWitnesses, PartNames[static_cast<std::size_t>(Part::CycloneController)])) {
+		SetPart(Part::CycloneController, PartState::UnsupportedBuild);
+	} else {
+		const bool ok             = RedirectCall(context, SiteControllerUpdate);
+		g_cycloneControllerActive = ok;
+		SetPart(Part::CycloneController, ok ? PartState::Installed : PartState::InstallFailed);
+	}
 }
 
 auto StateText(PartState state) noexcept -> const char* {
@@ -1962,6 +2418,13 @@ auto WhirlwindCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext* com
 	std::snprintf(line, sizeof(line), "Pet trail points written during Whirlwind: %llu",
 		static_cast<unsigned long long>(g_petTrailWrites.load(std::memory_order_relaxed)));
 	context->WriteConsoleMessage(line);
+	std::snprintf(line, sizeof(line), "Controller Whirlwind aims sent: %llu",
+		static_cast<unsigned long long>(g_controllerAims.load(std::memory_order_relaxed)));
+	context->WriteConsoleMessage(line);
+	std::snprintf(line, sizeof(line), "Gold pickups during Whirlwind: %llu sent (client), %llu let through (server)",
+		static_cast<unsigned long long>(g_goldClientSends.load(std::memory_order_relaxed)),
+		static_cast<unsigned long long>(g_goldServerPasses.load(std::memory_order_relaxed)));
+	context->WriteConsoleMessage(line);
 	return D2RL::ConsoleCommandResult::Handled;
 }
 
@@ -1970,9 +2433,9 @@ constexpr D2RL::PluginInfo WhirlwindInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "celestialrayone.whirlwind",
 	.name        = "Whirlwind",
-	.version     = "0.5.0",
+	.version     = "0.7.1",
 	.author      = "CelestialRayOne",
-	.description = "Whirlwind rework: procs while Uninterruptible, proc start fix, dual wield same target, cyclone steering, death and potions while Whirlwinding, Whirlwind with bows, movement speed sync, pets follow during Whirlwind.",
+	.description = "Whirlwind rework: procs while Uninterruptible, proc start fix, dual wield same target, cyclone steering (cursor and controller stick), death and potions while Whirlwinding, Whirlwind with bows, movement speed sync, pets follow during Whirlwind, Auto Gold Pickup during Whirlwind.",
 	.flags       = D2RL::PluginFlags::Shared | D2RL::PluginFlags::NativeHooks,
 };
 
@@ -2015,11 +2478,13 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		InstallPotions(context);
 		InstallSequenceFallback(context);
 		InstallPetTrail(context);
+		InstallGold(context);
 	} else {
 		SetPart(Part::ProcStartFix, PartState::InstallFailed);
 		SetPart(Part::DualWield, PartState::InstallFailed);
 		SetPart(Part::CycloneServer, PartState::InstallFailed);
 		SetPart(Part::CycloneClient, PartState::InstallFailed);
+		SetPart(Part::CycloneController, PartState::InstallFailed);
 		SetPart(Part::MeleeSpinServer, PartState::InstallFailed);
 		SetPart(Part::MeleeSpinClient, PartState::InstallFailed);
 		SetPart(Part::DeathWhileWhirlwinding, PartState::InstallFailed);
@@ -2027,6 +2492,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 		SetPart(Part::PotionsWhileWhirlwindingClient, PartState::InstallFailed);
 		SetPart(Part::WhirlwindWithBows, PartState::InstallFailed);
 		SetPart(Part::PetsFollowWhirlwind, PartState::InstallFailed);
+		SetPart(Part::GoldWhileWhirlwindingServer, PartState::InstallFailed);
+		SetPart(Part::GoldWhileWhirlwindingClient, PartState::InstallFailed);
 	}
 	for (std::size_t i = 0; i < g_parts.size(); ++i) {
 		D2RL::LogInfoF(context, "%s: %s", PartNames[i], StateText(g_parts[i]));

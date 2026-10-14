@@ -2,8 +2,10 @@
 //
 // A "Transfer to Stash" button on the inventory panel, shown only while the
 // stash is open, that sends every Advanced Stash item in the inventory and in
-// the Horadric Cube to the stash. Where the gold display sits is up to the
-// mod's own inventory layout; the plugin does not move it.
+// the Horadric Cube to the stash. Shift + left click (or holding A on a
+// controller) also sends everything else to the shared stash afterwards.
+// Where the gold display sits is up to the mod's own inventory layout; the
+// plugin does not move it.
 //
 // Everything below was read out of the D2RLoader 1.3.1 process image, and
 // every entry used here is checked byte for byte at load. Nothing is installed
@@ -104,7 +106,67 @@
 //   is open queues the same transfer as the button; a key held down counts as
 //   one press. The input service runs the handler during input processing, so
 //   the handler only reads the stash UI state (0CE500, a byte read) and queues
-//   the work on the UI thread.
+//   the work on the UI thread. The key always sends materials only.
+//
+// ---------------------------------------------------------------------------
+// 7. Shift + left click: everything else goes to the shared stash
+// ---------------------------------------------------------------------------
+//   The press first does section 1 (materials to their Advanced Stash tabs),
+//   then moves every other inventory and cube item into the shared stash, the
+//   way Ctrl+click moves an item into a shared page, one item at a time.
+//   Shift is read with GetAsyncKeyState when the click message arrives, the
+//   same test the game's own item widgets make (120A100 with VK_SHIFT).
+//
+//   Shared stash pages. Each page is a hidden player unit (a proxy, state 186)
+//   listed in the local player's inventory at +68h, the list the Advanced Stash
+//   owner is in too. Per entry: 2EF880 the proxy id (+0), 38CD60 remove-only
+//   (+8), 38CD50 active (+9), 38CD80 type (+0Ah, 1 = the Advanced Stash),
+//   38CD70 next (+10h). A page can take items when it is not the Advanced
+//   Stash, not remove-only and active; the server refuses the other two kinds
+//   (4C5570 / 4C7690 log "remove-only" and "inactive"). Pages are numbered
+//   in that list order, skipping the Advanced Stash and remove-only entries,
+//   and only the first 388C70() of them are shared tabs (388C70 is the shared
+//   tab count the bank and the gold limit use). That is exactly how D2RCore
+//   numbers the normal shared tabs (D2RCore 41C250), so page 1 here is tab 1
+//   in game. Pages are filled in that order. 09A5D0(id, 0) gives the proxy
+//   unit on this client.
+//
+//   The request. 15F8B0 sends opcode 55h (CCMD_GRIDSHAREDSTASHTRANSACTION)
+//   through 0EC8F0(55h, item id, proxy id, source page, source position,
+//   destination page 4, destination position, 0), but always with the proxy
+//   of the page on screen (UI model key 8D4D18A675312BD4), so the plugin calls
+//   0EC8F0 itself with each page's own id. Source position is 1601E0(item),
+//   the destination cell is INVENTORY_FindFreePosition 3865B0 on the proxy's
+//   page 4 grid (34A410(proxy, 4, !08D3B0())). Then 1C6AC0 marks the item busy,
+//   as 15F8B0 does. The server handler 4C7690 runs the same 3865B0 search on its
+//   own copy of the page and refuses the request unless the cell matches, so
+//   only one shared request is in flight at a time: the next item is placed
+//   once the server has answered (the item left the inventory or cube, or its
+//   busy mark was cleared). That keeps every request identical to Ctrl+click.
+//
+//   Items that stay where they are: Tome of Town Portal (tbk), Tome of
+//   Identify (ibk), the Horadric Cube itself (box), items 424550(player, item)
+//   refuses for the shared stash (the game's own rule, items.txt record +13Ah)
+//   and anything still on its way somewhere (busy). The cursor must be empty;
+//   the server refuses 55h while the player holds an item (4C7690, 388A70).
+//
+//   Multiplayer. Both requests are the client's own Ctrl+click requests (63h
+//   and 55h), so the host checks them as usual: the plugin is needed only by
+//   the player who presses the button, on the host or on a TCP/IP client.
+//
+// ---------------------------------------------------------------------------
+// 8. Controller: tap and hold
+// ---------------------------------------------------------------------------
+//   ButtonWidget input 8F0F00 (hooked) activates a focused button on the
+//   InputMessage command 1E439768F7DD4594 with payload action +10h = 0. The
+//   payload byte +19h is the hold flag: the item widgets (2A98B0) use it for
+//   their "hold" variants of the same action. The hook only notes, for the
+//   plugin's controller button, whether the activation was a tap or a hold,
+//   then runs the original. The controller button sends its own click text,
+//   so the UI message listener knows the note belongs to it: tap sends the
+//   materials, hold sends everything. This hook is optional: when its byte
+//   check or install fails, the rest of the plugin still works and a hold
+//   counts as a tap.
 
 #include <D2RLPlugin/api.h>
 
@@ -128,11 +190,12 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace {
 
 constexpr char PluginIdText[]  = "celestialrayone.transfer-to-stash";
-constexpr char PluginVersion[] = "1.4.0";
+constexpr char PluginVersion[] = "1.5.0";
 constexpr char SourceFile[]    = "transfer-to-stash";
 
 const D2RL::PluginContext* Context{};
@@ -144,6 +207,7 @@ std::uintptr_t             Base{};
 
 // Hooked
 constexpr std::uint64_t InventoryUpdateRva     = 0x22BA70;
+constexpr std::uint64_t ButtonInputRva         = 0x8F0F00;   // ButtonWidget input message handler
 
 // Called
 constexpr std::uint64_t LocalDataContextRva    = 0x08B2D0;
@@ -164,6 +228,25 @@ constexpr std::uint64_t FindChildRva           = 0x856220;
 constexpr std::uint64_t WidgetRectRva          = 0x8562A0;
 constexpr std::uint64_t SetWidgetPositionRva   = 0x856FB0;
 constexpr std::uint64_t ButtonTypeRva          = 0x86F0B0;
+
+// Called by the shared stash transfer (section 7)
+constexpr std::uint64_t OnlineStateRva         = 0x08D3B0;
+constexpr std::uint64_t ClientUnitRva          = 0x09A5D0;
+constexpr std::uint64_t SharedRequestRva       = 0x0EC8F0;
+constexpr std::uint64_t ItemPositionRva        = 0x1601E0;
+constexpr std::uint64_t MarkBusyRva            = 0x1C6AC0;
+constexpr std::uint64_t RecordIdRva            = 0x2EF880;
+constexpr std::uint64_t InventoryGridRva       = 0x34A410;
+constexpr std::uint64_t ItemCodeRva            = 0x36EF50;
+constexpr std::uint64_t FindFreePositionRva    = 0x3865B0;
+constexpr std::uint64_t CursorItemRva          = 0x388A70;
+constexpr std::uint64_t SharedTabCountRva      = 0x388C70;
+constexpr std::uint64_t FirstRecordRva         = 0x388E00;
+constexpr std::uint64_t RecordActiveRva        = 0x38CD50;
+constexpr std::uint64_t RecordRemoveOnlyRva    = 0x38CD60;
+constexpr std::uint64_t NextRecordRva          = 0x38CD70;
+constexpr std::uint64_t RecordTypeRva          = 0x38CD80;
+constexpr std::uint64_t SharedAllowedRva       = 0x424550;
 
 // Checked only: the Ctrl+click copied here and the ButtonWidget flag setters
 constexpr std::uint64_t QuickMoveActionRva     = 0x2AAAA0;
@@ -205,6 +288,26 @@ constexpr std::int32_t QuickMoveSound          = 3;
 constexpr std::size_t  MaxItemsWalked          = 4096;
 constexpr std::size_t  MaxBatch                = 1024;
 
+// Section 7
+constexpr std::uint8_t  SharedRequestCommand   = 0x55;     // CCMD_GRIDSHAREDSTASHTRANSACTION
+constexpr std::uint8_t  StashPage              = 4;
+constexpr std::uint32_t PlayerUnitType         = 0;
+constexpr std::uint8_t  AdvancedStashRecord    = 1;        // registry entry type of the Advanced Stash owner
+constexpr std::size_t   UnitIdOffset           = 0x08;     // unit id: UNITS_GetUnitId 34A330 reads [unit+8]
+constexpr std::size_t   MaxRecords             = 4096;
+constexpr std::size_t   MaxSharedPages         = 1024;
+constexpr std::uint64_t SharedAnswerTimeoutMs  = 5000;     // per request; TCP/IP latency included
+constexpr std::uint32_t TownPortalTomeCode     = 0x206B6274;   // "tbk "
+constexpr std::uint32_t IdentifyTomeCode       = 0x206B6269;   // "ibk "
+constexpr std::uint32_t HoradricCubeCode       = 0x20786F62;   // "box "
+
+// Section 8
+constexpr std::uint64_t ControllerActionCommand = 0x1E439768F7DD4594ULL;
+constexpr std::size_t   MessageCommandOffset    = 0x88;
+constexpr std::size_t   MessagePayloadOffset    = 0x110;
+constexpr std::size_t   PayloadActionOffset     = 0x10;
+constexpr std::size_t   PayloadHoldOffset       = 0x19;
+
 // Widget names
 constexpr char GridName[]        = "grid";
 constexpr char GoldButtonName[]  = "gold_button";
@@ -216,10 +319,12 @@ constexpr char GoldAmountName[]  = "gold_amount";
 
 constexpr std::string_view ClickTarget  = "PanelManager";
 constexpr std::string_view ClickCommand = "OpenPanel";
-constexpr std::string_view ClickText    = "CelestialRayOneTransferToStash";
+constexpr std::string_view ClickText           = "CelestialRayOneTransferToStash";
+constexpr std::string_view ControllerClickText = "CelestialRayOneTransferToStashController";
 
 // Text in the game's font over the plugin's own sprite. Normal and pressed use
-// the gold of the inventory's gold amount; hover is lighter. The position is
+// the gold of the inventory's gold amount; hover is lighter. The keyboard/mouse
+// tooltip is the plugin string TransferButtonTooltip (see TooltipStrings). The position is
 // set at run time (section 4). "filename" is the sprite's resource path
 // relative to data/hd/global/ui, without the extension.
 constexpr char DesktopLayout[] = R"json({
@@ -237,6 +342,7 @@ constexpr char DesktopLayout[] = R"json({
         "textHoverColor": { "r": 240, "g": 226, "b": 160, "a": 255 },
         "textDisabledColor": { "r": 110, "g": 105, "b": 95, "a": 255 },
         "pressLabelOffset": { "x": 0, "y": 2 },
+        "tooltipString": "@celestialrayone.transfer-to-stash:TransferButtonTooltip",
         "onClickMessage": "PanelManager:OpenPanel:CelestialRayOneTransferToStash"
     }
 }
@@ -263,10 +369,38 @@ constexpr char ControllerLayout[] = R"json({
         "textHoverColor": { "r": 240, "g": 226, "b": 160, "a": 255 },
         "textDisabledColor": { "r": 110, "g": 105, "b": 95, "a": 255 },
         "pressLabelOffset": { "x": 0, "y": 2 },
-        "onClickMessage": "PanelManager:OpenPanel:CelestialRayOneTransferToStash"
+        "onClickMessage": "PanelManager:OpenPanel:CelestialRayOneTransferToStashController"
     }
 }
 )json";
+
+// The keyboard/mouse tooltip, as a string of the plugin's own namespace. A
+// layout field shows its text as written, so a color code there is drawn as
+// plain characters; strings loaded from a string table have their color codes
+// turned into the renderer's marker (U+E07E) by D2RCore's string loader, like
+// the game's own strings. Two lines, each starting with the tooltip gray (color
+// code 5). Every game language gets the same English text, since a missing
+// translation shows nothing. A mod can replace it from its own string files
+// with the full key celestialrayone.transfer-to-stash:TransferButtonTooltip.
+constexpr char TooltipStringsPath[] = "data/local/lng/strings/d2rloader/celestialrayone.transfer-to-stash/strings.json";
+constexpr char TooltipGray[]        = "\xC3\xBF" "c5";   // the color code for gray, UTF-8
+constexpr const char* TooltipLanguages[]{
+    "enUS", "zhTW", "deDE", "esES", "frFR", "itIT", "koKR", "plPL", "esMX", "jaJP", "ptBR", "ruRU", "zhCN" };
+
+auto TooltipStrings() -> std::string {
+    const std::string text = std::string(TooltipGray) + "Shift + Left Click to transfer\\n" + TooltipGray
+                           + "everything to shared stash";
+    std::string json = "[\n  {\n    \"Key\": \"TransferButtonTooltip\"";
+    for (const char* language : TooltipLanguages) {
+        json += ",\n    \"";
+        json += language;
+        json += "\": \"";
+        json += text;
+        json += "\"";
+    }
+    json += "\n  }\n]\n";
+    return json;
+}
 
 struct ButtonSpec {
     const char*                    label;            // for the log and the console
@@ -374,6 +508,55 @@ constexpr std::uint8_t ButtonTypeBytes[]{
 constexpr std::uint8_t ButtonSetEnabledBytes[]{ 0x88,0x51,0x50,0xC3 };   // mov [rcx+50h],dl / ret
 constexpr std::uint8_t ButtonSetVisibleBytes[]{ 0x88,0x51,0x51,0xC3 };   // mov [rcx+51h],dl / ret
 
+// 8F0F00: mov r11,rsp / mov [r11+18h],rbx / mov [r11+20h],rsi / push rdi / sub rsp,0E0h
+constexpr std::uint8_t ButtonInputBytes[]{
+    0x4C,0x8B,0xDC,0x49,0x89,0x5B,0x18,0x49,0x89,0x73,0x20,0x57,0x48,0x81,0xEC,0xE0,
+    0x00,0x00,0x00 };
+// 08D3B0: the whole function (client state byte +5Ch == 1)
+constexpr std::uint8_t OnlineStateBytes[]{
+    0x48,0x8B,0x05,0x29,0x63,0x99,0x02,0x48,0x85,0xC0,0x74,0x08,0x80,0x78,0x5C,0x01,
+    0x0F,0x94,0xC0,0xC3,0xC3 };
+constexpr std::uint8_t ClientUnitBytes[]{
+    0x4C,0x63,0xCA,0x48,0x8D,0x05,0x36,0x93,0x98,0x02,0x8B,0xD1,0x44,0x8B,0xC1,0x49,
+    0x8B,0xC9,0x83,0xE2,0x7F,0x48,0xC1,0xE1,0x0A,0x48,0x03,0xC8,0xE9,0x7F,0x4C,0x00 };
+// 0EC8F0: arguments 5..8 to packet +0Dh/+11h/+15h/+19h, length 1Dh
+constexpr std::uint8_t SharedRequestBytes[]{
+    0x48,0x83,0xEC,0x58,0x48,0x8B,0x05,0xCD,0xE9,0x8D,0x02,0x48,0x33,0xC4,0x48,0x89,
+    0x44,0x24,0x40,0x8B,0x84,0x24,0x80,0x00,0x00,0x00,0x89,0x44,0x24,0x2D,0x8B,0x84 };
+constexpr std::uint8_t ItemPositionBytes[]{
+    0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x74,0x24,0x18,0x57,0x48,0x83,0xEC,0x20,0x48,
+    0x8B,0xD9,0x48,0x85,0xC9,0x75,0x13,0x88,0x4C,0x24,0x30,0x48,0x8D,0x4C,0x24,0x30 };
+// 1C6AC0: mov edx,36h (state 54)
+constexpr std::uint8_t MarkBusyBytes[]{
+    0x40,0x57,0x48,0x83,0xEC,0x20,0xBA,0x36,0x00,0x00,0x00,0x48,0x8B,0xF9,0xE8,0x6D,
+    0xEE,0x12,0x00,0x48,0x85,0xC0,0x75,0x71,0x41,0xB8,0xC1,0x0C,0x00,0x00,0x48,0x89 };
+constexpr std::uint8_t RecordIdBytes[]{ 0x8B,0x01,0xC3 };                    // mov eax,[rcx]
+constexpr std::uint8_t InventoryGridBytes[]{
+    0x48,0x89,0x5C,0x24,0x10,0x48,0x89,0x6C,0x24,0x18,0x48,0x89,0x74,0x24,0x20,0x57,
+    0x48,0x83,0xEC,0x20,0x0F,0xB6,0xEA,0x41,0x8B,0xF0,0x48,0x8B,0xF9,0xBB,0xFF,0xFF };
+constexpr std::uint8_t ItemCodeBytes[]{
+    0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xF9,0x48,0x85,0xC9,
+    0x75,0x13,0x88,0x4C,0x24,0x30,0x48,0x8D,0x4C,0x24,0x30,0xE8,0x80,0x83,0xFF,0xFF };
+constexpr std::uint8_t FindFreePositionBytes[]{
+    0x40,0x55,0x53,0x56,0x57,0x41,0x54,0x41,0x56,0x41,0x57,0x48,0x8B,0xEC,0x48,0x83,
+    0xEC,0x60,0x48,0x8B,0x05,0xFF,0x4C,0x64,0x02,0x48,0x33,0xC4,0x48,0x89,0x45,0xF0 };
+// 388A70: the cursor item, inventory +40h
+constexpr std::uint8_t CursorItemBytes[]{
+    0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0xD9,0x48,0x85,0xC9,0x75,0x1B,0x88,0x4C,
+    0x24,0x30,0x48,0x8D,0x4C,0x24,0x30,0xE8,0xD4,0xB4,0xFF,0xFF,0x84,0xC0,0x74,0x2D };
+// 388C70: shared tab count (setting +0C96h, plus 3, plus the mode extras)
+constexpr std::uint8_t SharedTabCountBytes[]{
+    0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0xE8,0x91,0xD3,0xCE,0xFF,0x8B,
+    0x98,0x96,0x0C,0x00,0x00,0xE8,0x76,0x7D,0xFF,0x00,0x8B,0xF8,0xE8,0x7F,0xD3,0xCE };
+constexpr std::uint8_t FirstRecordBytes[]{ 0x48,0x8B,0x41,0x68,0xC3 };        // mov rax,[rcx+68h]
+constexpr std::uint8_t RecordActiveBytes[]{ 0x0F,0xB6,0x41,0x09,0xC3 };       // movzx eax,byte [rcx+9]
+constexpr std::uint8_t RecordRemoveOnlyBytes[]{ 0x0F,0xB6,0x41,0x08,0xC3 };   // movzx eax,byte [rcx+8]
+constexpr std::uint8_t NextRecordBytes[]{ 0x48,0x8B,0x41,0x10,0xC3 };         // mov rax,[rcx+10h]
+constexpr std::uint8_t RecordTypeBytes[]{ 0x0F,0xB6,0x41,0x0A,0xC3 };         // movzx eax,byte [rcx+0Ah]
+constexpr std::uint8_t SharedAllowedBytes[]{
+    0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0xC2,0x48,0x8B,0xF9,
+    0x48,0x8B,0xC8,0x48,0x8D,0x15,0x06,0x45,0x8F,0x01,0x41,0xB8,0xCC,0x04,0x00,0x00 };
+
 struct Witness {
     std::uint64_t       rva;
     const std::uint8_t* bytes;
@@ -386,7 +569,7 @@ constexpr auto W(std::uint64_t rva, const std::uint8_t (&bytes)[Size], const cha
     return Witness{ rva, bytes, static_cast<std::uint32_t>(Size), name };
 }
 
-const std::array<Witness, 21> Witnesses{
+const Witness Witnesses[]{
     W(InventoryUpdateRva, InventoryUpdateBytes, "inventory panel update"),
     W(QuickMoveActionRva, QuickMoveActionBytes, "Ctrl+click Advanced Stash action"),
     W(LocalDataContextRva, LocalDataContextBytes, "local data context"),
@@ -408,6 +591,23 @@ const std::array<Witness, 21> Witnesses{
     W(ButtonTypeRva, ButtonTypeBytes, "ButtonWidget type"),
     W(ButtonSetEnabledRva, ButtonSetEnabledBytes, "ButtonWidget set enabled"),
     W(ButtonSetVisibleRva, ButtonSetVisibleBytes, "ButtonWidget set visible"),
+    W(OnlineStateRva, OnlineStateBytes, "online state"),
+    W(ClientUnitRva, ClientUnitBytes, "client unit by id"),
+    W(SharedRequestRva, SharedRequestBytes, "shared stash request"),
+    W(ItemPositionRva, ItemPositionBytes, "item position"),
+    W(MarkBusyRva, MarkBusyBytes, "mark item busy"),
+    W(RecordIdRva, RecordIdBytes, "stash entry id"),
+    W(InventoryGridRva, InventoryGridBytes, "inventory grid"),
+    W(ItemCodeRva, ItemCodeBytes, "item code"),
+    W(FindFreePositionRva, FindFreePositionBytes, "find free position"),
+    W(CursorItemRva, CursorItemBytes, "cursor item"),
+    W(SharedTabCountRva, SharedTabCountBytes, "shared tab count"),
+    W(FirstRecordRva, FirstRecordBytes, "first stash entry"),
+    W(RecordActiveRva, RecordActiveBytes, "stash entry active"),
+    W(RecordRemoveOnlyRva, RecordRemoveOnlyBytes, "stash entry remove-only"),
+    W(NextRecordRva, NextRecordBytes, "next stash entry"),
+    W(RecordTypeRva, RecordTypeBytes, "stash entry type"),
+    W(SharedAllowedRva, SharedAllowedBytes, "shared stash item rule"),
 };
 
 // ---------------------------------------------------------------------------
@@ -454,6 +654,26 @@ using SetWidgetPositionFn  = void(__fastcall*)(void* widget, const std::int32_t*
 using InventoryUpdateFn    = std::uint64_t(__fastcall*)(void* panel);
 using WidgetBoolFn         = void(__fastcall*)(void* widget, bool value);
 using WidgetTypeFn         = void*(__fastcall*)(void* widget);
+using ButtonInputFn        = std::uint64_t(__fastcall*)(void* widget, void* message);
+using OnlineStateFn        = bool(__fastcall*)();
+using ClientUnitFn         = void*(__fastcall*)(std::uint32_t id, std::uint32_t type);
+using SharedRequestFn      = void(__fastcall*)(std::uint8_t command, std::uint32_t item, std::uint32_t proxy,
+                                               std::uint32_t sourcePage, std::uint32_t sourcePosition,
+                                               std::uint32_t destinationPage, std::uint32_t destinationPosition,
+                                               std::uint32_t fromShared);
+using ItemPositionFn       = std::uint32_t(__fastcall*)(void* unit);
+using MarkBusyFn           = void(__fastcall*)(void* item);
+using RecordIdFn           = std::uint32_t(__fastcall*)(void* record);
+using InventoryGridFn      = std::int32_t(__fastcall*)(void* unit, std::uint32_t page, std::uint32_t expansion);
+using ItemCodeFn           = std::uint32_t(__fastcall*)(void* item);
+using FindFreePositionFn   = std::int32_t(__fastcall*)(void* inventory, void* item, std::int32_t grid,
+                                                       std::int32_t* x, std::int32_t* y, std::uint8_t page);
+using CursorItemFn         = void*(__fastcall*)(void* inventory);
+using SharedTabCountFn     = std::int32_t(__fastcall*)();
+using FirstRecordFn        = void*(__fastcall*)(void* inventory);
+using NextRecordFn         = void*(__fastcall*)(void* record);
+using RecordByteFn         = std::uint8_t(__fastcall*)(void* record);
+using SharedAllowedFn      = bool(__fastcall*)(void* player, void* item);
 
 LocalDataContextFn   LocalDataContext{};
 LocalPlayerFn        LocalPlayer{};
@@ -474,6 +694,24 @@ FindWidgetFn         FindChild{};
 WidgetRectFn         GetWidgetRect{};
 SetWidgetPositionFn  SetWidgetPosition{};
 InventoryUpdateFn    OriginalInventoryUpdate{};
+ButtonInputFn        OriginalButtonInput{};
+OnlineStateFn        OnlineState{};
+ClientUnitFn         ClientUnit{};
+SharedRequestFn      SharedRequest{};
+ItemPositionFn       ItemPosition{};
+MarkBusyFn           MarkBusy{};
+RecordIdFn           RecordId{};
+InventoryGridFn      InventoryGrid{};
+ItemCodeFn           ItemCode{};
+FindFreePositionFn   FindFreePosition{};
+CursorItemFn         CursorItem{};
+SharedTabCountFn     SharedTabCount{};
+FirstRecordFn        FirstRecord{};
+NextRecordFn         NextRecord{};
+RecordByteFn         RecordActive{};
+RecordByteFn         RecordRemoveOnly{};
+RecordByteFn         RecordType{};
+SharedAllowedFn      SharedAllowed{};
 
 template <typename Function>
 auto At(std::uint64_t rva) noexcept -> Function {
@@ -499,6 +737,23 @@ void BindNatives() {
     FindChild          = At<FindWidgetFn>(FindChildRva);
     GetWidgetRect      = At<WidgetRectFn>(WidgetRectRva);
     SetWidgetPosition  = At<SetWidgetPositionFn>(SetWidgetPositionRva);
+    OnlineState        = At<OnlineStateFn>(OnlineStateRva);
+    ClientUnit         = At<ClientUnitFn>(ClientUnitRva);
+    SharedRequest      = At<SharedRequestFn>(SharedRequestRva);
+    ItemPosition       = At<ItemPositionFn>(ItemPositionRva);
+    MarkBusy           = At<MarkBusyFn>(MarkBusyRva);
+    RecordId           = At<RecordIdFn>(RecordIdRva);
+    InventoryGrid      = At<InventoryGridFn>(InventoryGridRva);
+    ItemCode           = At<ItemCodeFn>(ItemCodeRva);
+    FindFreePosition   = At<FindFreePositionFn>(FindFreePositionRva);
+    CursorItem         = At<CursorItemFn>(CursorItemRva);
+    SharedTabCount     = At<SharedTabCountFn>(SharedTabCountRva);
+    FirstRecord        = At<FirstRecordFn>(FirstRecordRva);
+    NextRecord         = At<NextRecordFn>(NextRecordRva);
+    RecordActive       = At<RecordByteFn>(RecordActiveRva);
+    RecordRemoveOnly   = At<RecordByteFn>(RecordRemoveOnlyRva);
+    RecordType         = At<RecordByteFn>(RecordTypeRva);
+    SharedAllowed      = At<SharedAllowedFn>(SharedAllowedRva);
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +795,23 @@ std::atomic<std::uint64_t> HotkeyPresses{};    // Controls key presses with the 
 std::atomic<std::uint64_t> QueueFailures{};
 std::atomic<std::uint64_t> ItemsSent{};
 std::atomic<bool>          TransferQueued{};
+std::atomic<std::uint64_t> EverythingPresses{};  // Shift+clicks and controller holds
+std::atomic<std::uint64_t> SharedItemsSent{};
+
+// What a press asks for. A press while a transfer is queued joins it, keeping
+// the larger request.
+enum class TransferMode : std::uint8_t {
+    None       = 0,
+    Materials  = 1,   // section 1 only
+    Everything = 2,   // section 1, then section 7
+};
+std::atomic<std::uint8_t> QueuedMode{};
+
+// Section 8: the controller button and how it was last activated.
+enum class ControllerPress : std::uint8_t { None = 0, Tap = 1, Hold = 2 };
+std::atomic<void*>        ControllerButton{};
+std::atomic<std::uint8_t> LastControllerPress{};
+bool                      ControllerHoldReady{};
 
 auto Count(const std::atomic<std::uint64_t>& counter) noexcept -> unsigned long long {
     return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed));
@@ -561,6 +833,21 @@ struct PlacementView {
     const char*  problem{};
 };
 
+// What the shared stash transfer did, for the console command.
+struct SharedView {
+    bool          ran{};
+    bool          running{};
+    const char*   stopped{};      // why it ended early, or null
+    std::uint32_t pages{};        // shared pages that take items
+    std::uint32_t sent{};
+    std::uint32_t landed{};
+    std::uint32_t refused{};      // the server kept them where they were
+    std::uint32_t noRoom{};
+    std::uint32_t tomes{};
+    std::uint32_t cube{};
+    std::uint32_t notAllowed{};
+};
+
 // What the last press did, for the console command.
 struct TransferView {
     bool          ran{};
@@ -575,6 +862,7 @@ struct TransferView {
 std::mutex    ViewMutex;
 PlacementView LastPlacement;
 TransferView  LastTransfer;
+SharedView    LastShared;
 
 // One warning per problem per session.
 std::atomic<bool> WarnedNotButton{};
@@ -601,18 +889,24 @@ constexpr char DefaultConfigToml[] =
     "#       keyboard/mouse  right edge 27 px (at 1080p) inside the grid's right edge\n"
     "#       controller      right edge on the grid frame's outer edge; a bigger\n"
     "#                       button with the next font size up\n"
-    "#   - Pressing it does what Ctrl+click does with the stash open, for every item\n"
-    "#     in the inventory and in the Horadric Cube at once. The game picks the\n"
-    "#     stash tab for each item.\n"
+    "#   - Left click: does what Ctrl+click does with the stash open, for every\n"
+    "#     Advanced Stash item in the inventory and in the Horadric Cube at once.\n"
+    "#     The game picks the stash tab for each item.\n"
+    "#   - Shift + left click: the same, then every other item in the inventory and\n"
+    "#     in the cube goes to the shared stash (see below). Hovering the button\n"
+    "#     shows this as a tooltip, in two gray lines. Its text is the string\n"
+    "#     celestialrayone.transfer-to-stash:TransferButtonTooltip; a mod can change\n"
+    "#     it from its own string files with that full key.\n"
+    "#   - Controller: tap A on the button for a left click, hold A for a\n"
+    "#     Shift + left click.\n"
     "#   - The position comes from the inventory layout the game loaded, so a mod's\n"
     "#     own inventory layout needs no numbers here. Where the gold display sits\n"
     "#     is up to the mod's layout; the plugin does not move it.\n"
     "#   - On a controller the d-pad reaches the button from the gold button, once\n"
     "#     the mod's controller inventory layout points gold_button's \"right\"\n"
-    "#     navigation at celestialrayone.transfer-to-stash/TransferButtonController;\n"
-    "#     A presses it.\n"
+    "#     navigation at celestialrayone.transfer-to-stash/TransferButtonController.\n"
     "#   - Keyboard key: Options > Controls > Stash > Transfer to Stash, no default\n"
-    "#     key. It does the same as the button, and only while the stash is open.\n"
+    "#     key. It does the same as a left click, and only while the stash is open.\n"
     "#     Holding it down counts as one press.\n"
     "#   - The button art is inside the DLL. A mod can replace it with its own files\n"
     "#     under data/hd/global/ui/d2rloader/celestialrayone.transfer-to-stash/:\n"
@@ -622,7 +916,7 @@ constexpr char DefaultConfigToml[] =
     "#         4 frames of 404x82 (202x41 for lowend)\n"
     "#     Frame order: normal, pressed, disabled, hovered.\n"
     "#\n"
-    "# Which items move\n"
+    "# Which items move on a left click\n"
     "#   - Items whose misc.txt row has AdvancedStashStackable = 1 and that have a\n"
     "#     slot in the stash layout (bankexpansionlayouthd.json). That is the same\n"
     "#     rule Ctrl+click uses.\n"
@@ -631,13 +925,38 @@ constexpr char DefaultConfigToml[] =
     "#   - The server still checks every item. A stash slot that is full keeps its\n"
     "#     items where they are.\n"
     "#\n"
+    "# Shift + left click (and a controller hold)\n"
+    "#   - First everything a left click does, then the rest of the inventory and\n"
+    "#     the cube goes to the shared stash, the way Ctrl+click moves an item into\n"
+    "#     a shared page.\n"
+    "#   - One item at a time: the server picks the free spot itself and refuses a\n"
+    "#     request for any other spot, so each item waits for the server's answer\n"
+    "#     to the one before it. A full inventory takes a couple of seconds, a bit\n"
+    "#     more in a TCP/IP game.\n"
+    "#   - Shared tabs are filled in order, from the first one. An item that does not\n"
+    "#     fit on a tab tries the next one. Remove-only and inactive tabs are\n"
+    "#     skipped.\n"
+    "#   - Materials whose Advanced Stash slot is full go to the shared stash too.\n"
+    "#   - These stay where they are:\n"
+    "#       equipped items and the belt (only the inventory and the cube are read)\n"
+    "#       Tome of Town Portal and Tome of Identify\n"
+    "#       the Horadric Cube itself (what is inside it does move)\n"
+    "#       items the game does not allow in the shared stash, such as quest items\n"
+    "#       items that fit on no shared tab\n"
+    "#   - The cursor must be empty: while an item is on it the server refuses every\n"
+    "#     shared stash request, so the transfer stops.\n"
+    "#   - Closing the stash stops the transfer. What was already sent stays sent.\n"
+    "#\n"
     "# Limits\n"
-    "#   - Works in single player and in TCP/IP games: the requests are the game's\n"
-    "#     own Ctrl+click requests, so the host checks them as usual.\n"
+    "#   - Works in single player and in TCP/IP games, on the host and on the\n"
+    "#     clients. Every request is one of the game's own Ctrl+click requests, so\n"
+    "#     the host checks them as usual, and only the player who presses the\n"
+    "#     button needs the plugin.\n"
     "#\n"
     "# Console command\n"
     "#   transfertostash   status, where the button was placed, the Controls key,\n"
-    "#                     and what the last press sent\n"
+    "#                     the controller hold, and what the last press sent to the\n"
+    "#                     Advanced Stash and to the shared stash\n"
     "#\n"
     "[transfer_to_stash]\n"
     "\n"
@@ -824,7 +1143,11 @@ void Arrange(void* panel) {
             break;
         }
     }
-    if (button == nullptr) return;   // neither button is loaded in this panel
+    if (button == nullptr) {         // neither button is loaded in this panel
+        ControllerButton.store(nullptr, std::memory_order_relaxed);
+        return;
+    }
+    ControllerButton.store(spec == &Buttons[1] ? button : nullptr, std::memory_order_relaxed);
     if (!IsA(button, ButtonType()) || Read<void*>(button, WidgetParentOffset) != panel) {
         WarnOnce(WarnedNotButton, "TransferToStash: the widget named after the button is not the plugin's button; "
                                   "nothing is placed.");
@@ -883,9 +1206,29 @@ void Arrange(void* panel) {
     LastPlacement = view;
 }
 
+void PumpSharedTransfer();
+
 std::uint64_t __fastcall HookedInventoryUpdate(void* panel) {
-    if (Active.load(std::memory_order_relaxed) && panel != nullptr) Arrange(panel);
+    if (Active.load(std::memory_order_relaxed) && panel != nullptr) {
+        Arrange(panel);
+        PumpSharedTransfer();
+    }
     return OriginalInventoryUpdate(panel);
+}
+
+// Section 8. Only notes how the plugin's controller button was activated;
+// the original always runs and does the activation itself.
+std::uint64_t __fastcall HookedButtonInput(void* widget, void* message) {
+    if (widget != nullptr && message != nullptr
+            && widget == ControllerButton.load(std::memory_order_relaxed)
+            && Read<std::uint64_t>(message, MessageCommandOffset) == ControllerActionCommand) {
+        const void* payload = Read<const void*>(message, MessagePayloadOffset);
+        if (payload != nullptr && Read<std::uint32_t>(payload, PayloadActionOffset) == 0) {
+            const bool hold = Read<std::uint8_t>(payload, PayloadHoldOffset) != 0;
+            LastControllerPress.store(static_cast<std::uint8_t>(hold ? ControllerPress::Hold : ControllerPress::Tap));
+        }
+    }
+    return OriginalButtonInput(widget, message);
 }
 
 // ---------------------------------------------------------------------------
@@ -909,10 +1252,210 @@ void FinishTransfer(TransferView& view, const char* stopped) {
         view.notStashable);
 }
 
-// Section 1, for every item on page 0 or 3. Runs on the UI thread.
+// ---------------------------------------------------------------------------
+// Section 7: the shared stash transfer (UI thread only)
+// ---------------------------------------------------------------------------
+
+struct SharedPageRef {
+    void*         proxy;
+    std::uint32_t id;
+};
+
+struct SharedJob {
+    bool                       active{};
+    bool                       soundPlayed{};
+    std::uint32_t              inFlight{};        // item id waiting for the server, 0 = none
+    std::uint64_t              inFlightSince{};
+    std::uint64_t              lastProgress{};
+    std::vector<std::uint32_t> done;              // item ids handled in this run
+    SharedView                 view{};
+};
+
+SharedJob                                  Job;
+std::array<SharedPageRef, MaxSharedPages> PageScratch{};
+
+auto UnitIdOf(void* unit) noexcept -> std::uint32_t {
+    return Read<std::uint32_t>(unit, UnitIdOffset);
+}
+
+auto Handled(std::uint32_t id) noexcept -> bool {
+    return std::find(Job.done.begin(), Job.done.end(), id) != Job.done.end();
+}
+
+void PublishShared() {
+    std::lock_guard lock(ViewMutex);
+    LastShared = Job.view;
+}
+
+void FinishShared(const char* stopped) {
+    Job.active       = false;
+    Job.view.running = false;
+    Job.view.stopped = stopped;
+    PublishShared();
+    const SharedView& v = Job.view;
+    if (stopped != nullptr) {
+        D2RL::LogInfoF(Context, "TransferToStash: shared stash transfer stopped, %s (%u sent, %u arrived).", stopped,
+            v.sent, v.landed);
+        return;
+    }
+    D2RL::LogInfoF(Context, "TransferToStash: shared stash transfer done: %u sent, %u arrived, %u refused by the "
+        "server, %u without room; kept %u tomes, %u cube, %u not allowed in the shared stash; %u shared pages take "
+        "items.", v.sent, v.landed, v.refused, v.noRoom, v.tomes, v.cube, v.notAllowed, v.pages);
+}
+
+// An inventory or cube item of the player, by id.
+auto FindCarried(void* inventory, std::uint32_t id) -> void* {
+    std::size_t walked = 0;
+    for (void* item = FirstItem(inventory); item != nullptr && ++walked <= MaxItemsWalked; item = NextItem(item)) {
+        if (UnitType(item) != ItemUnitType) continue;
+        const std::uint8_t page = ItemPage(item);
+        if (page != InventoryPage && page != CubePage) continue;
+        if (UnitIdOf(item) == id) return item;
+    }
+    return nullptr;
+}
+
+// The shared pages that take items, in tab order: the stash list entries that
+// are neither the Advanced Stash nor remove-only are tabs 1, 2, 3 and so on, up
+// to the shared tab count; of those, the active ones take items.
+auto CollectSharedPages(void* inventory) -> std::size_t {
+    const std::int32_t tabs   = SharedTabCount();
+    std::int32_t       tab    = 0;
+    std::size_t        count  = 0;
+    std::size_t        walked = 0;
+    for (void* record = FirstRecord(inventory); record != nullptr && ++walked <= MaxRecords;
+            record = NextRecord(record)) {
+        if (RecordType(record) == AdvancedStashRecord || RecordRemoveOnly(record) != 0) continue;
+        if (++tab > tabs) break;
+        if (RecordActive(record) == 0) continue;
+        const std::uint32_t id    = RecordId(record);
+        void* const         proxy = ClientUnit(id, PlayerUnitType);
+        if (proxy == nullptr || count >= PageScratch.size()) continue;
+        PageScratch[count++] = SharedPageRef{ proxy, id };
+    }
+    return count;
+}
+
+// One step: check the request in flight, then send the next item. Runs from
+// the inventory panel update (every frame while it is open) and right after a
+// press.
+void PumpSharedTransfer() {
+    if (!Job.active) return;
+    const std::uint64_t now = GetTickCount64();
+    if (UiStateOpen(StashUiState) == 0) return FinishShared("the stash was closed");
+    void* const player = LocalPlayer(LocalDataContext());
+    if (player == nullptr) return FinishShared("there is no local player");
+    void* const inventory = UnitInventory(player, SourceFile, __LINE__);
+    if (inventory == nullptr) return FinishShared("the player has no inventory");
+
+    if (Job.inFlight != 0) {
+        void* const item = FindCarried(inventory, Job.inFlight);
+        if (item == nullptr) {
+            ++Job.view.landed;
+        } else if (InteractionBlocked(item) == 0) {
+            ++Job.view.refused;
+        } else if (now - Job.inFlightSince > SharedAnswerTimeoutMs) {
+            return FinishShared("the server did not answer in time");
+        } else {
+            return;   // still on its way
+        }
+        Job.inFlight     = 0;
+        Job.lastProgress = now;
+        PublishShared();
+    }
+
+    if (CursorItem(inventory) != nullptr) return FinishShared("an item is on the cursor");
+    const std::size_t pageCount = CollectSharedPages(inventory);
+    Job.view.pages = static_cast<std::uint32_t>(pageCount);
+    if (pageCount == 0) return FinishShared("no shared stash page takes items");
+    const std::uint32_t expansion = OnlineState() ? 0u : 1u;
+
+    bool        waiting = false;
+    std::size_t walked  = 0;
+    for (void* item = FirstItem(inventory); item != nullptr; item = NextItem(item)) {
+        if (++walked > MaxItemsWalked) return FinishShared("the item list did not end");
+        if (UnitType(item) != ItemUnitType) continue;
+        const std::uint8_t page = ItemPage(item);
+        if (page != InventoryPage && page != CubePage) continue;
+        const std::uint32_t id = UnitIdOf(item);
+        if (Handled(id)) continue;
+        if (InteractionBlocked(item) != 0) {   // on its way somewhere, for example to an Advanced Stash tab
+            waiting = true;
+            continue;
+        }
+        const std::uint32_t code = ItemCode(item);
+        if (code == TownPortalTomeCode || code == IdentifyTomeCode) {
+            Job.done.push_back(id);
+            ++Job.view.tomes;
+            continue;
+        }
+        if (code == HoradricCubeCode) {
+            Job.done.push_back(id);
+            ++Job.view.cube;
+            continue;
+        }
+        if (!SharedAllowed(player, item)) {
+            Job.done.push_back(id);
+            ++Job.view.notAllowed;
+            continue;
+        }
+        for (std::size_t i = 0; i < pageCount; ++i) {
+            void* const proxyInventory = UnitInventory(PageScratch[i].proxy, SourceFile, __LINE__);
+            if (proxyInventory == nullptr) continue;
+            const std::int32_t grid = InventoryGrid(PageScratch[i].proxy, StashPage, expansion);
+            std::int32_t x = 0;
+            std::int32_t y = 0;
+            if (FindFreePosition(proxyInventory, item, grid, &x, &y, StashPage) == 0) continue;
+            const std::uint32_t cell = (static_cast<std::uint32_t>(x) & 0xFFFFu)
+                                     | ((static_cast<std::uint32_t>(y) & 0xFFFFu) << 16);
+            SharedRequest(SharedRequestCommand, id, PageScratch[i].id, page, ItemPosition(item), StashPage, cell, 0);
+            MarkBusy(item);
+            if (!Job.soundPlayed) {
+                PlaySound(QuickMoveSound, nullptr, 0, 0, 0);
+                Job.soundPlayed = true;
+            }
+            Job.done.push_back(id);
+            Job.inFlight      = id;
+            Job.inFlightSince = now;
+            Job.lastProgress  = now;
+            ++Job.view.sent;
+            SharedItemsSent.fetch_add(1, std::memory_order_relaxed);
+            PublishShared();
+            return;
+        }
+        Job.done.push_back(id);
+        ++Job.view.noRoom;
+    }
+    if (waiting && now - Job.lastProgress <= SharedAnswerTimeoutMs) {
+        PublishShared();
+        return;   // wait for items still on their way, they may come back
+    }
+    FinishShared(waiting ? "some items stayed busy" : nullptr);
+}
+
+void StartSharedTransfer(bool soundPlayed) {
+    if (Job.active) {
+        Context->LogInfo("TransferToStash: a shared stash transfer is already running; the press joins it.");
+        return;
+    }
+    Job              = SharedJob{};
+    Job.active       = true;
+    Job.soundPlayed  = soundPlayed;
+    Job.lastProgress = GetTickCount64();
+    Job.view.ran     = true;
+    Job.view.running = true;
+    Job.done.reserve(256);
+    PublishShared();
+    PumpSharedTransfer();
+}
+
+// Section 1, for every item on page 0 or 3, then section 7 when asked for.
+// Runs on the UI thread.
 void __cdecl RunTransfer(const D2RL::PluginContext*, void*) noexcept {
     TransferQueued.store(false);
+    const auto mode = static_cast<TransferMode>(QueuedMode.exchange(0));
     if (!Active.load(std::memory_order_relaxed)) return;
+    const bool everything = mode == TransferMode::Everything;
 
     TransferView view{};
     if (UiStateOpen(StashUiState) == 0) return FinishTransfer(view, "the stash is closed");
@@ -921,7 +1464,11 @@ void __cdecl RunTransfer(const D2RL::PluginContext*, void*) noexcept {
     void* const inventory = UnitInventory(player, SourceFile, __LINE__);
     if (inventory == nullptr) return FinishTransfer(view, "the player has no inventory");
     void* const destination = StashDestination(player);
-    if (destination == nullptr) return FinishTransfer(view, "the Advanced Stash is not loaded");
+    if (destination == nullptr) {
+        FinishTransfer(view, "the Advanced Stash is not loaded");
+        if (everything) StartSharedTransfer(false);
+        return;
+    }
 
     std::array<void*, MaxBatch> batch{};
     std::size_t batchSize = 0;
@@ -954,6 +1501,7 @@ void __cdecl RunTransfer(const D2RL::PluginContext*, void*) noexcept {
     }
     if (batchSize != 0) PlaySound(QuickMoveSound, nullptr, 0, 0, 0);
     FinishTransfer(view, nullptr);
+    if (everything) StartSharedTransfer(batchSize != 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -976,6 +1524,7 @@ struct ButtonHandles {
     D2RL::Panels::ChildLayoutHandle     child  = D2RL::Panels::InvalidChildLayoutHandle;
 };
 std::array<ButtonHandles, 2>       Handles{};
+D2RL::Resources::RegistrationHandle StringsHandle = D2RL::Resources::InvalidHandle;
 D2RL::SharedEvents::ListenerHandle ClickListener = D2RL::SharedEvents::InvalidHandle;
 
 auto QueryServices() -> bool {
@@ -1003,10 +1552,13 @@ auto QueryServices() -> bool {
     return ok;
 }
 
-// Both the button and the Controls key end here. A press while a transfer is
-// already queued joins that one.
-auto QueueTransfer() noexcept -> bool {
+// Both buttons and the Controls key end here. A press while a transfer is
+// already queued joins that one, keeping the larger request.
+auto QueueTransfer(TransferMode mode) noexcept -> bool {
     if (!Active.load(std::memory_order_relaxed)) return false;
+    const auto   wanted  = static_cast<std::uint8_t>(mode);
+    std::uint8_t current = QueuedMode.load();
+    while (current < wanted && !QueuedMode.compare_exchange_weak(current, wanted)) {}
     if (TransferQueued.exchange(true)) return true;
     if (ThreadSvc->runOnUiThread(Context, &RunTransfer, nullptr) != D2RL::Threads::Result::Success) {
         TransferQueued.store(false);
@@ -1021,12 +1573,26 @@ auto __cdecl OnUiMessage(const D2RL::PluginContext*, const D2RL::SharedEvents::U
         -> D2RL::SharedEvents::UiMessageAction {
     if (event == nullptr || event->structSize < D2RL::SharedEvents::UiMessageEventRequiredSize
             || event->target == nullptr || event->command == nullptr || event->text == nullptr
-            || ClickTarget != event->target || ClickCommand != event->command || ClickText != event->text) {
+            || ClickTarget != event->target || ClickCommand != event->command) {
         return D2RL::SharedEvents::UiMessageAction::Continue;
     }
+    const bool controller = ControllerClickText == event->text;
+    if (!controller && ClickText != event->text) return D2RL::SharedEvents::UiMessageAction::Continue;
+
     // The message is private to this plugin, so it never goes on to PanelManager.
+    // Keyboard/mouse: Shift held asks for everything. Controller: a hold does
+    // (section 8).
     Presses.fetch_add(1, std::memory_order_relaxed);
-    (void)QueueTransfer();
+    TransferMode mode = TransferMode::Materials;
+    if (controller) {
+        if (LastControllerPress.exchange(0) == static_cast<std::uint8_t>(ControllerPress::Hold)) {
+            mode = TransferMode::Everything;
+        }
+    } else if ((GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0) {
+        mode = TransferMode::Everything;
+    }
+    if (mode == TransferMode::Everything) EverythingPresses.fetch_add(1, std::memory_order_relaxed);
+    (void)QueueTransfer(mode);
     return D2RL::SharedEvents::UiMessageAction::Consume;
 }
 
@@ -1048,7 +1614,8 @@ auto __cdecl OnHotkey(const D2RL::PluginContext*, const D2RL::Input::ActionEvent
         return D2RL::Input::ActionResult::Ignored;
     }
     HotkeyPresses.fetch_add(1, std::memory_order_relaxed);
-    return QueueTransfer() ? D2RL::Input::ActionResult::Handled : D2RL::Input::ActionResult::Ignored;
+    return QueueTransfer(TransferMode::Materials) ? D2RL::Input::ActionResult::Handled
+                                                  : D2RL::Input::ActionResult::Ignored;
 }
 
 auto RegisterHotkey() -> bool {
@@ -1086,6 +1653,10 @@ void RemoveButton() {
         (void)EventSvc->unregisterUiMessageListener(Context, ClickListener);
     }
     ClickListener = D2RL::SharedEvents::InvalidHandle;
+    if (StringsHandle != D2RL::Resources::InvalidHandle && ResourceSvc != nullptr) {
+        (void)ResourceSvc->unregisterResource(Context, StringsHandle);
+    }
+    StringsHandle = D2RL::Resources::InvalidHandle;
     for (ButtonHandles& handles : Handles) {
         if (handles.child != D2RL::Panels::InvalidChildLayoutHandle && PanelSvc != nullptr) {
             (void)PanelSvc->unregisterChildLayout(Context, handles.child);
@@ -1138,6 +1709,23 @@ auto RegisterSprite(int id, const char* path, D2RL::Resources::RegistrationHandl
 }
 
 auto AddButton() -> bool {
+    // The strings go first: the keyboard/mouse layout refers to them.
+    const std::string strings = TooltipStrings();
+    const D2RL::Resources::ResourceRegistration stringFile{
+        .structSize = D2RL::Resources::ResourceRegistrationSize,
+        .flags      = 0,
+        .path       = TooltipStringsPath,
+        .bytes      = strings.data(),
+        .byteCount  = strings.size(),
+    };
+    const auto stringsResult = ResourceSvc->registerResource(Context, &stringFile, &StringsHandle);
+    if (stringsResult != D2RL::Resources::Result::Success) {
+        D2RL::LogErrorF(Context, "TransferToStash: the tooltip strings could not be registered (result %u).",
+            static_cast<unsigned>(stringsResult));
+        RemoveButton();
+        return false;
+    }
+
     for (std::size_t i = 0; i < Buttons.size(); ++i) {
         const ButtonSpec& spec    = Buttons[i];
         ButtonHandles&    handles = Handles[i];
@@ -1217,10 +1805,12 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
 
     PlacementView placement;
     TransferView  transfer;
+    SharedView    shared;
     {
         std::lock_guard lock(ViewMutex);
         placement = LastPlacement;
         transfer  = LastTransfer;
+        shared    = LastShared;
     }
 
     if (!placement.seen) {
@@ -1252,12 +1842,26 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
             transfer.carried, transfer.busy, transfer.notStashable);
         say(line);
     }
+    if (!shared.ran) {
+        say("  shared stash: not used yet (Shift + left click, or hold A on a controller).");
+    } else {
+        std::snprintf(line, sizeof(line), "  shared stash%s: %u pages take items; %u sent, %u arrived, %u refused by "
+            "the server, %u without room; kept %u tomes, %u cube, %u not allowed%s%s.",
+            shared.running ? " (running)" : "", shared.pages, shared.sent, shared.landed, shared.refused,
+            shared.noRoom, shared.tomes, shared.cube, shared.notAllowed,
+            shared.stopped != nullptr ? "; stopped: " : "", shared.stopped != nullptr ? shared.stopped : "");
+        say(line);
+    }
     std::snprintf(line, sizeof(line), "  Controls key (Stash > Transfer to Stash): %s, %llu presses with the stash "
         "open.", HotkeyAction.load() != D2RL::Input::InvalidHandle ? "registered" : "not registered",
         Count(HotkeyPresses));
     say(line);
-    std::snprintf(line, sizeof(line), "  totals: %llu button presses, %llu items sent, %llu presses not queued.",
-        Count(Presses), Count(ItemsSent), Count(QueueFailures));
+    std::snprintf(line, sizeof(line), "  controller hold: %s.", ControllerHoldReady
+        ? "ready (tap sends materials, hold sends everything)" : "not available, a hold counts as a tap");
+    say(line);
+    std::snprintf(line, sizeof(line), "  totals: %llu button presses (%llu for everything), %llu items sent to the "
+        "Advanced Stash, %llu to the shared stash, %llu presses not queued.", Count(Presses),
+        Count(EverythingPresses), Count(ItemsSent), Count(SharedItemsSent), Count(QueueFailures));
     say(line);
     return D2RL::ConsoleCommandResult::Handled;
 }
@@ -1269,8 +1873,9 @@ constexpr D2RL::PluginInfo PluginInfoData{
     .name        = "Transfer to Stash",
     .version     = PluginVersion,
     .author      = "CelestialRayOne",
-    .description = "A Transfer to Stash button on the inventory panel, shown while the stash is open, that sends "
-                   "every Advanced Stash item in the inventory and the cube to the stash.",
+    .description = "A Transfer to Stash button on the inventory panel, shown while the stash is open: a click sends "
+                   "every Advanced Stash item in the inventory and the cube to the stash, Shift + click (or holding A "
+                   "on a controller) then also moves everything else to the shared stash.",
     .flags       = D2RL::PluginFlags::Client | D2RL::PluginFlags::NativeHooks,
 };
 
@@ -1321,6 +1926,19 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
         return true;
     }
     Active.store(true);
+
+    // Section 8, optional: without it a controller hold works like a tap.
+    if (!Context->CheckExpectedBytes(ButtonInputRva, ButtonInputBytes, sizeof(ButtonInputBytes))) {
+        Context->LogWarn("TransferToStash: ButtonWidget input (8F0F00) does not match; on a controller a hold works "
+                         "like a tap.");
+    } else if (!Context->InstallInlineHook(ButtonInputRva, ButtonInputBytes, sizeof(ButtonInputBytes),
+            &HookedButtonInput, &OriginalButtonInput)) {
+        Context->LogWarn("TransferToStash: the ButtonWidget input hook could not be installed; on a controller a "
+                         "hold works like a tap.");
+    } else {
+        ControllerHoldReady = true;
+    }
+
     if (!AddButton()) {
         State = PluginState::ButtonFailed;
         return true;
@@ -1328,8 +1946,9 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
     const bool hotkey = RegisterHotkey();
 
     State = PluginState::Active;
-    D2RL::LogInfoF(Context, "TransferToStash %s: active (buttons %s and %s, Controls key %s, grid cell fields %s).",
-        PluginVersion, Buttons[0].widgetName, Buttons[1].widgetName, hotkey ? "Stash > Transfer to Stash" : "none",
+    D2RL::LogInfoF(Context, "TransferToStash %s: active (buttons %s and %s, Controls key %s, controller hold %s, "
+        "grid cell fields %s).", PluginVersion, Buttons[0].widgetName, Buttons[1].widgetName,
+        hotkey ? "Stash > Transfer to Stash" : "none", ControllerHoldReady ? "ready" : "not available",
         CellFieldsValid ? "checked" : "not used");
     return true;
 }

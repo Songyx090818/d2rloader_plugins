@@ -1,0 +1,108 @@
+{
+    "basedOn": "Controller/HUDMonsterHealthHD.json",
+    "type": "MonsterHealthPanel",
+    "name": "HUDMonsterHealth",
+    "children": [
+        {
+            "type": "Widget", "name": "ScreenAnchored",
+            "children": [
+                {
+                    "type": "TextBoxWidget", "name": "Name"
+                },
+                {
+                    "type": "HealthBarWidget", "name": "Health"
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "NormalMonsterBackground"
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "UniqueMonsterBackground",
+                    "children": [
+                        {
+                            "type": "ImageWidget",
+                            "name": "BottomCap"
+                        }
+                    ]
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "BossMonsterBackground",
+                    "children": [
+                        {
+                            "type": "ImageWidget",
+                            "name": "BottomCap"
+                        }
+                    ]
+                },
+                {
+                    "type": "TextBoxWidget", "name": "HPValue"
+                },
+                {
+                    "type": "TextBoxWidget", "name": "HPPercent"
+                },
+                {
+                    "type": "TextBoxWidget", "name": "LevelType"
+                },
+                {
+                    "type": "TextBoxWidget", "name": "Affixes"
+                },
+                {
+                    "type": "TextBoxWidget", "name": "Aura"
+                },
+                {
+                    "type": "TextBoxWidget", "name": "Resistances"
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "ResistancesTopLine",
+                    "children": [
+                        {
+                            "type": "ImageWidget",
+                            "name": "Center"
+                        }
+                    ]
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "ResistancesBottomLine",
+                    "children": [
+                        {
+                            "type": "ImageWidget",
+                            "name": "Center"
+                        }
+                    ]
+                },
+                {
+                    "type": "TextBoxWidget", "name": "Immunities"
+                }
+            ]
+        },
+        {
+            "type": "Widget", "name": "TargetAttached",
+            "children": [
+                {
+                    "type": "GrowableImageWidget", "name": "UniqueMonsterBackground",
+                    "children": [
+                        {
+                            "type": "ImageWidget",
+                            "name": "BottomCap"
+                        }
+                    ]
+                },
+                {
+                    "type": "GrowableImageWidget", "name": "NormalMonsterBackground"
+                },
+                {
+                    "type": "HealthBarWidget", "name": "Health",
+                    "children": [
+                        {
+                            "type": "TextBoxWidget", "name": "Name",
+                            "fields": {
+                                "style": {
+                                    "pointSize": "$SmallFontSize"
+                                }
+                            }
+                        },
+                    ]
+                },
+            ]
+        }
+    ]
+}

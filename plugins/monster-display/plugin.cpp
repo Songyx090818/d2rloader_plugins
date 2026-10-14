@@ -10,7 +10,8 @@
 //     name and its final level (both auras for Heralds)
 //   - the resistances the hovering player's hits actually meet, including the
 //     Summon Resist Cap for allied monsters
-//   - the stock immunity line
+//   - the immunity line, built the way the game builds it but from the same
+//     values as the resistance row, so the Summon Resist Cap is respected
 //
 // Everything below was read out of the D2RLoader 1.3.1 process image
 // (D2R 3.3.93847). Every entry, call site and layout used here is checked byte
@@ -63,10 +64,22 @@
 //   (mov ecx,-100 at 4524C4). Physical resistance is 0 against undead while
 //   the attacker has state 47. The switch 092A10 that would let -enemy
 //   resistance reduce immunities returns 0 in this build.
-//   Allied monsters (monstats Align = 1) are capped the way players are when
-//   the Summon Resist Cap plugin is live (its jump at the 45249C gate): 75 +
-//   the max-resist stat, ceiling 95 (4524DE), physical 50 (4524D6), floor
-//   -100 (4524E7). No difficulty penalty, as in the engine.
+//   Allied monsters (monstats.txt Align 1: summons, hirelings, town NPCs)
+//   always show their own resistances, without the hovering player's sunder or
+//   -enemy resistance: those steps describe hits the player cannot land on
+//   them, and subtracting them made e.g. a summon's 40% physical show as 25%
+//   for an owner with -15% enemy physical resistance.
+//   Which monsters are capped is asked from the Summon Resist Cap plugin
+//   itself, through its "cap-decision" service (D2RLoader plugin
+//   communication: provider celestialrayone.summon-resist-cap, version 1),
+//   on the game thread with the server unit. That one answer covers its
+//   Align column, its extra_monster_ids and its uncap pairs: a summon whose
+//   owner has a paired stat is reported uncapped and can show 100 or more,
+//   exactly as the engine resolves it. Nothing of that plugin's config is
+//   copied here. A capped monster gets the player cap while the cap plugin's
+//   jump at the 45249C gate is live: 75 + the max-resist stat, ceiling 95
+//   (4524DE), physical 50 (4524D6), floor -100 (4524E7). No difficulty
+//   penalty, as in the engine.
 //
 //   Aura Enchanted (MonUMod 30, callback 495CD0) gives one of the 7 skills in
 //   the table at 1D1DE70 (24-byte records, skill id at +14h) through the
@@ -84,8 +97,46 @@
 //   from the localization service ("UndeadDescriptX", "DemonID",
 //   "skillname<id>").
 //
+//   Minions carry in their own MonUMod list every affix their boss passes on
+//   (monumod.txt xfer = 1), also the ones that do nothing for a minion. The
+//   affixes in minion_hidden_affixes are left out for minions. A minion is
+//   what the stock builder treats as one before it writes its minion line:
+//   type flag 10h set and none of 0Fh (0CED9A 38E0E0, 0CF05D 38E870 ->
+//   1DF830). 38E870 (unit, mask) tests mask against the type flag word at
+//   monster data +1Ah. The stock line for a minion is that minion line, never
+//   an affix line, so a minion left with nothing to show takes it as its type
+//   line, like a minion without affixes.
+//
 //   Bosses are monstats.txt primeevil: flags at record offset 60, bit 7 (the
 //   3.3 column parser 39DB30, descriptor slot rbp+480h).
+//
+// ---------------------------------------------------------------------------
+// 4. Immunity line (1.0.10)
+// ---------------------------------------------------------------------------
+//   The stock builder 0CEA50 makes the line on the client from the client
+//   copy of the monster's resist stats (0CEDCC..0CF7B1). Per element, in the
+//   order Physical 36, Magic 37, Fire 39, Lightning 41, Cold 43, Poison 45:
+//   value = resist stat; if value >= 100 it subtracts the local player's
+//   item_pierce_*_immunity (sunder: 192, 193, 189, 190, 187, 191; the -enemy
+//   resistance branch behind 092A10 is off in this build); value >= 100 adds
+//   the element. Class ids 704..709 never get a line (0CEDB8: sub 2C0h,
+//   cmp 5, jbe). It cannot know about the Summon Resist Cap, which exists only
+//   on the server, so a capped summon past 100 showed "Immune to X" although
+//   its capped value tops out at 95 (physical 50).
+//
+//   The plugin builds the row itself, the same way:
+//     text      d2r strings strScaryMonDesc5, 6, 1, 3, 2, 4, or the
+//               PhysicalImmunityIcon .. PoisonImmunityIcon set while 077E10
+//               (a display setting, read by the stock code at 0CEDEA..) is on
+//     colours   4, 8, 1, 9, 3, 2 through the game's colour function 0CD6E0
+//     separator TargetHealthBarTextSeparator coloured 5 while 846210 is on,
+//               otherwise KeyComma followed by space
+//   but an element counts as immune only when the value the damage code
+//   uses for the hovering player's hit is 100 or more: ResolveResist with the
+//   hovering player as attacker (sunder applied as stock does, Summon Resist
+//   Cap applied), on the server, in both resistance modes. Until the server
+//   data arrives the stock line is shown, except for allied monsters
+//   (monstats.txt Align 1), which may be capped and show nothing yet.
 
 #include <D2RLPlugin/api.h>
 
@@ -102,6 +153,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstdio>
@@ -115,7 +167,7 @@
 namespace {
 
 constexpr char PluginIdText[]  = "celestialrayone.monster-display";
-constexpr char PluginVersion[] = "1.0.7";
+constexpr char PluginVersion[] = "1.0.11";
 constexpr char SourceFile[]    = "monster-display";
 
 const D2RL::PluginContext* Context{};
@@ -164,7 +216,7 @@ constexpr char DefaultConfigToml[] = R"toml(# Monster Display
 # Restart the game after changing this file.
 
 # File format version. Leave this value unchanged.
-config_version = 1
+config_version = 2
 enabled = true
 
 [bar]
@@ -192,13 +244,28 @@ show_hp = true
 show_hp_percent = true
 # Unique affixes, in the game's own wording.
 show_affixes = true
+# Affixes not shown on minions, as monumod.txt ids. A boss passes every affix
+# whose monumod.txt xfer is 1 on to its minions, also the ones that do nothing
+# for a minion; the ones listed here are left out on minions. The boss always
+# shows all of its own. A minion left with no affix to show gets the game's
+# own type line, like a minion without affixes. [] shows everything.
+#   5 Extra Strong       6 Extra Fast         7 Cursed
+#   8 Magic Resistant    9 Fire Enchanted    17 Lightning Enchanted
+#  18 Cold Enchanted    25 Mana Burn         26 Teleportation
+#  27 Spectral Hit      28 Stone Skin        29 Multiple Shots
+#  30 Aura Enchanted
+minion_hidden_affixes = [9, 17, 18, 26, 27, 28]
 # D2R colour id of the affix and aura rows (see the list at the bottom).
 affix_color = 4
 # Aura Enchanted on its own row as "Aura Enchanted (Fanaticism Lv. 13)".
 # false keeps it among the other affixes, without the aura or its level.
 separate_aura = true
 aura_level_label = "Lv."
-# The game's immunity line ("Immune to Fire"), last.
+# The immunity line ("Immune to Fire"), last. Same strings, colours and
+# separators as the game's own line, but an element only shows when the
+# resistance your hits really meet is 100 or more, with your sunder applied
+# as the game does and the Summon Resist Cap respected: a capped summon tops
+# out at 95 (physical 50), so it never shows as immune.
 show_immunities = true
 # Space between two rows under the bar, in layout units (10 = 5 px at 1080p).
 # The gap between the bar and the first row comes from the layout.
@@ -208,8 +275,13 @@ row_gap = 10
 show = true
 # effective : what the hovering player's hits meet: sunder and -enemy
 #             resistance are applied, exactly as the damage code does.
+#             Allied monsters (monstats Align 1: your summons, hirelings,
+#             NPCs) always show their own values, since you cannot hit them.
 # monster   : the monster's own values, before anything the attacker has.
-# The Summon Resist Cap is applied in both modes.
+# The Summon Resist Cap is applied in both modes, exactly as the game applies
+# it: the display asks the Summon Resist Cap plugin which monsters it caps, so
+# its Align rule, its extra rows and its uncap pairs all show correctly.
+# There is nothing to set up here for it.
 mode = "effective"
 # Reorder, omit or repeat: {fire} {lightning} {cold} {poison} {magic} {physical}
 # {color:N} sets the colour of the literal text that follows it. Values always
@@ -222,13 +294,6 @@ cold_color = 3
 poison_color = 2
 magic_color = 8
 physical_color = 4
-
-[summon_cap]
-# Mirror of the Summon Resist Cap plugin, so allied monsters show the capped
-# values the engine really uses. The cap is only applied while that plugin is
-# live (checked in the game image every time).
-use_align_column = true
-extra_monster_ids = []
 
 [debug]
 # Writes every data request and answer to the plugin log.
@@ -273,6 +338,7 @@ constexpr std::uint64_t IsDemonRva     = 0x3AF190;
 constexpr std::uint64_t IsUndeadRva    = 0x3AF2C0;
 constexpr std::uint64_t FindChildRva   = 0x856220;
 constexpr std::uint64_t GetUModsRva    = 0x38E310;
+constexpr std::uint64_t MonTypeFlagRva = 0x38E870;  // (unit, mask): mask & type flag word at monster data +1Ah
 constexpr std::uint64_t UModNamesRva   = 0x1DFAE0;
 constexpr std::uint64_t AllocatorRva   = 0x12063C0;
 constexpr std::uint64_t UnitTypeRva    = 0x34B9D0;
@@ -290,6 +356,8 @@ constexpr std::uint64_t PierceRva      = 0x44F8B0;
 constexpr std::uint64_t CheckStateRva  = 0x3351B0;
 constexpr std::uint64_t SkillByIdRva   = 0x33DCD0;
 constexpr std::uint64_t SkillLevelRva  = 0x33D1E0;  // loader thunk
+constexpr std::uint64_t IconKeysRva    = 0x077E10;  // stock immunity line: icon string set on
+constexpr std::uint64_t SeparatorRva   = 0x846210;  // stock immunity line: separator style
 // Read only
 constexpr std::uint64_t AuraTableRva        = 0x1D1DE70;
 constexpr std::uint64_t HeraldTableRva      = 0x1D1DF20;
@@ -298,6 +366,7 @@ constexpr std::uint64_t UncappedFloorRva    = 0x4524C4;  // mov ecx, imm32
 constexpr std::uint64_t PhysicalCapOpRva    = 0x4524D5;  // mov eax, imm32
 constexpr std::uint64_t ElementalCapOpRva   = 0x4524DD;  // mov eax, imm32
 constexpr std::uint64_t CappedFloorRva      = 0x4524E7;  // mov ecx, imm32
+constexpr std::uint64_t ImmuneClassRva      = 0x0CEDB8;  // mov eax,2C0h / sub r14w,ax / cmp r14w,5 / jbe
 
 // Message and payload
 constexpr std::uint64_t SetInfoHash        = 0x40FFBA2D98A3FF97ULL;
@@ -321,10 +390,16 @@ constexpr std::size_t TypeDescParentOffset = 0x10;
 constexpr std::int32_t UnitTypePlayer  = 0;
 constexpr std::int32_t UnitTypeMonster = 1;
 constexpr std::size_t  MonStatsFlags   = 60;     // flags holding primeevil
+constexpr std::size_t  MonStatsAlign   = 0x87;   // monstats.txt Align, 1 = ally
+constexpr std::int32_t ImmuneClassFirst = 0x2C0; // 704: classes 704..709 get no immunity line
+constexpr std::int32_t ImmuneClassSpan  = 5;
+constexpr std::int32_t ImmuneValue      = 100;
 constexpr std::uint8_t PrimeEvilMask   = 0x80;   // bit 7
-constexpr std::size_t  MonStatsAlign   = 0x87;   // Align column
 constexpr std::size_t  GameDataContext = 0x106;  // game+106h, read by 44F6D0/44F8B0
 constexpr std::uint8_t AuraEnchanted   = 30;
+constexpr std::int32_t MaximumUMod     = 44;     // 1DFAE0 names ids 1 to 2Ch
+constexpr std::uint16_t MonTypeMinion  = 0x10;
+constexpr std::uint16_t MonTypeBosses  = 0x0F;   // the bits 38E0E0 tests before the minion bit
 constexpr std::int32_t StatLife        = 6;
 constexpr std::int32_t StatMaxLife     = 7;
 constexpr std::int32_t StatLevel       = 12;
@@ -335,7 +410,7 @@ constexpr std::uint64_t RefreshMs        = 120;
 constexpr std::uint64_t HoverTimeoutMs   = 1000;
 constexpr std::uint64_t ConnectRetryMs   = 3000;
 constexpr std::uint16_t ChannelId        = 1;
-constexpr std::uint64_t CompatibilityToken = 0x4D4F4E4453500001ULL;  // "MONDSP" v1
+constexpr std::uint64_t CompatibilityToken = 0x4D4F4E4453500002ULL;  // "MONDSP" v2 (1.0.10: immune mask)
 constexpr std::uint16_t MessageRequest   = 1;
 constexpr std::uint16_t MessageReply     = 2;
 constexpr std::uint32_t MaximumConfigBytes = 32768;
@@ -384,6 +459,13 @@ constexpr std::uint8_t FindChildBytes[]{
 constexpr std::uint8_t GetUModsBytes[]{
     0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x85, 0xC9, 0x74, 0x0A, 0xE8, 0xAD,
     0xD6, 0xFB, 0xFF, 0x83, 0xF8, 0x01, 0x74, 0x19 };
+constexpr std::uint8_t MonTypeFlagBytes[]{
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x20, 0x0F, 0xB7, 0xFA, 0x48, 0x8B, 0xD9,
+    0x48, 0x85, 0xC9, 0x74, 0x0A, 0xE8, 0x46, 0xD1, 0xFB, 0xFF, 0x83, 0xF8, 0x01, 0x74, 0x19, 0x48,
+    0x8D, 0x4C, 0x24, 0x30, 0xC6, 0x44, 0x24, 0x30, 0x00, 0xE8, 0x52, 0x3C, 0xE1, 0xFF, 0x84, 0xC0,
+    0x74, 0x01, 0xCC, 0x48, 0x85, 0xDB, 0x74, 0x29, 0x48, 0x8B, 0xCB, 0xE8, 0x20, 0xD1, 0xFB, 0xFF,
+    0x83, 0xF8, 0x01, 0x75, 0x1C, 0x48, 0x8B, 0x43, 0x10, 0x48, 0x85, 0xC0, 0x74, 0x13, 0x66, 0x85,
+    0x78, 0x1A, 0x74, 0x0D, 0xB0, 0x01 };
 constexpr std::uint8_t UModNamesBytes[]{
     0x48, 0x89, 0x5C, 0x24, 0x10, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
     0x48, 0x8D, 0xAC, 0x24, 0x10, 0xFB, 0xFF, 0xFF };
@@ -432,6 +514,19 @@ constexpr std::uint8_t ColorizeBytes[]{
     0x48, 0x89, 0x5C, 0x24, 0x18, 0x57, 0x48, 0x81, 0xEC, 0x50, 0x04, 0x00, 0x00, 0x48, 0x8B, 0x05,
     0xD4, 0xDB, 0x8F, 0x02, 0x48, 0x33, 0xC4, 0x48, 0x89, 0x84, 0x24, 0x40, 0x04, 0x00, 0x00, 0x80,
     0x39, 0x00, 0x8B, 0xFA, 0x48, 0x8B, 0xD9 };
+// 077E10, whole function: setting byte +DC8h of 076010's block, or 2A23274.
+constexpr std::uint8_t IconKeysBytes[]{
+    0x48, 0x83, 0xEC, 0x28, 0xE8, 0xF7, 0xE1, 0xFF, 0xFF, 0x80, 0xB8, 0xC8, 0x0D, 0x00, 0x00, 0x00,
+    0x75, 0x10, 0x80, 0x3D, 0x4B, 0xB4, 0x9A, 0x02, 0x00, 0x75, 0x07, 0x32, 0xC0, 0x48, 0x83, 0xC4,
+    0x28, 0xC3, 0xB0, 0x01, 0x48, 0x83, 0xC4, 0x28, 0xC3 };
+// 846210, whole function: byte +B9h of the UI settings object, or 650210.
+constexpr std::uint8_t SeparatorBytes[]{
+    0x48, 0x8B, 0x05, 0x59, 0x9F, 0xBF, 0x02, 0x48, 0x85, 0xC0, 0x74, 0x08, 0x0F, 0xB6, 0x80, 0xB9,
+    0x00, 0x00, 0x00, 0xC3, 0xE9, 0xE7, 0x9F, 0xE0, 0xFF };
+// 0CEDB8: the class ids the stock builder leaves without an immunity line.
+constexpr std::uint8_t ImmuneClassBytes[]{
+    0xB8, 0xC0, 0x02, 0x00, 0x00, 0x66, 0x44, 0x2B, 0xF0, 0x66, 0x41, 0x83, 0xFE, 0x05, 0x0F, 0x86,
+    0x8D, 0x0A, 0x00, 0x00 };
 constexpr std::uint8_t SetHealthValueBytes[]{
     0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x85, 0xD2, 0x79, 0x04, 0x33, 0xD2, 0xEB,
     0x0A, 0xB8, 0x64, 0x00, 0x00, 0x00, 0x3B, 0xD0, 0x0F, 0x4F, 0xD0, 0x66, 0x0F, 0x6E, 0xCA, 0x0F,
@@ -456,6 +551,7 @@ using WidgetScaleFn = float(__fastcall*)(void* widget);
 using UnitCheckFn   = std::int32_t(__fastcall*)(void* unit);
 using FindChildFn   = void*(__fastcall*)(void* parent, const char* name);
 using GetUModsFn    = const std::uint8_t*(__fastcall*)(void* unit);
+using MonTypeFlagFn = bool(__fastcall*)(void* unit, std::uint16_t mask);
 using UModNamesFn   = void*(__fastcall*)(void* output, std::uint8_t dataContext, const std::uint8_t* umods,
                           std::int32_t maximum, std::int32_t color, const char* prefix);
 using AllocatorFn   = void*(__fastcall*)();
@@ -478,6 +574,7 @@ using TypeDescFn    = void*(__fastcall*)(void* widget);
 using SetVisibleFn  = void(__fastcall*)(void* widget, std::uint64_t visible);
 using SetHealthValueFn = void(__fastcall*)(void* bar, std::int32_t value);
 using GetRectFn     = void*(__fastcall*)(void* widget, void* out);
+using UiFlagFn      = std::uint8_t(__fastcall*)();
 
 BuilderFn     OriginalBuilder{};
 PanelUpdateFn OriginalPanelUpdate{};
@@ -490,6 +587,7 @@ UnitCheckFn   IsDemon{};
 UnitCheckFn   IsUndead{};
 FindChildFn   FindChild{};
 GetUModsFn    GetUMods{};
+MonTypeFlagFn HasMonTypeFlag{};
 UModNamesFn   UModNames{};
 AllocatorFn   GetAllocator{};
 UnitTypeFn    UnitType{};
@@ -509,6 +607,8 @@ SkillByIdFn   SkillById{};
 SkillLevelFn  SkillLevel{};
 SetHealthValueFn SetHealthValue{};
 GetRectFn     NativeGetRect{};
+UiFlagFn      IconKeys{};
+UiFlagFn      SeparatorStyle{};
 
 template <typename T>
 auto At(std::uint64_t rva) noexcept -> T {
@@ -575,6 +675,7 @@ struct Settings {
     bool         showHp{ true };
     bool         showHpPercent{ true };
     bool         showAffixes{ true };
+    std::vector<std::int32_t> minionHiddenAffixes{ 9, 17, 18, 26, 27, 28 };
     std::int32_t affixColor{ 4 };
     bool         separateAura{ true };
     std::string  auraLevelLabel{ "Lv." };
@@ -585,8 +686,6 @@ struct Settings {
     std::string  resistTemplate{ "{fire} {lightning} {cold} {poison} {magic} {physical}" };
     std::int32_t separatorColor{ 0 };
     std::array<std::int32_t, 6> elementColors{ 1, 9, 3, 2, 8, 4 };
-    bool         capUseAlign{ true };
-    std::vector<std::int32_t> capExtraIds;
     bool         debugLog{ false };
     std::vector<TemplatePart> parts;
 };
@@ -743,6 +842,15 @@ void ApplyConfigLine(Settings& s, std::string_view section, std::string_view key
         else if (key == "show_hp") flag(s.showHp);
         else if (key == "show_hp_percent") flag(s.showHpPercent);
         else if (key == "show_affixes") flag(s.showAffixes);
+        else if (key == "minion_hidden_affixes") {
+            std::vector<std::int32_t> ids;
+            if (ParseIdList(value, ids)
+                    && std::all_of(ids.begin(), ids.end(), [](std::int32_t id) { return id >= 1 && id <= MaximumUMod; })) {
+                s.minionHiddenAffixes = ids;
+            } else {
+                Problem(key, "expected a list of monumod.txt ids from 1 to 44; using the default");
+            }
+        }
         else if (key == "affix_color") color(s.affixColor);
         else if (key == "separate_aura") flag(s.separateAura);
         else if (key == "aura_level_label") { if (!ParseString(value, s.auraLevelLabel)) Problem(key, "expected a quoted string"); }
@@ -770,10 +878,9 @@ void ApplyConfigLine(Settings& s, std::string_view section, std::string_view key
             }
         }
     } else if (section == "summon_cap") {
-        if (key == "use_align_column") flag(s.capUseAlign);
-        else if (key == "extra_monster_ids") {
-            if (!ParseIdList(value, s.capExtraIds)) Problem(key, "expected a list of monstats row ids");
-        }
+        // 1.0.8 kept a copy of the cap plugin's settings here. The cap plugin
+        // is now asked directly, so these keys do nothing.
+        Problem(key, "[summon_cap] is no longer read; the Summon Resist Cap plugin is asked directly");
     } else if (section == "debug") {
         if (key == "log") flag(s.debugLog);
     }
@@ -844,6 +951,8 @@ struct HoverInfo {
     std::array<std::uint8_t, 10> umods{};
     std::size_t   umodCount{};
     bool          auraEnchanted{};
+    bool          minion{};
+    bool          ally{};
     std::uint64_t tick{};
 };
 HoverInfo Hover{};
@@ -856,6 +965,7 @@ struct MonsterData {
     std::int32_t  level{};
     std::array<std::int16_t, 6> resist{};
     std::uint8_t  flags{};  // 1: resistances valid, 2: capped as an ally, 4: effective (attacker applied)
+    std::uint8_t  immune{}; // bit per Element: the value the hovering player's hits meet is 100+
     std::uint8_t  auraCount{};
     std::array<std::uint16_t, 4> auraSkill{};
     std::array<std::uint16_t, 4> auraLevel{};
@@ -873,6 +983,7 @@ struct WireReply {
     std::int32_t  level;
     std::int16_t  resist[6];
     std::uint8_t  flags;
+    std::uint8_t  immune;
     std::uint8_t  auraCount;
     std::uint16_t auraSkill[4];
     std::uint16_t auraLevel[4];
@@ -1031,13 +1142,72 @@ auto CurrentRules() -> ResistRules {
     return rules;
 }
 
-auto IsCappedAlly(std::uint8_t dataContext, std::int32_t classId) -> bool {
-    for (const std::int32_t id : Config.capExtraIds) {
-        if (id == classId) return true;
+// Summon Resist Cap's "cap-decision" service, in the layout its provider
+// publishes (celestialrayone.summon-resist-cap 3.3.0 and later).
+struct CapDecisionService {
+    using MonsterCapStateFn = std::int32_t(__cdecl*)(void* monster) noexcept;
+
+    std::uint32_t     serviceSize;
+    std::uint32_t     serviceVersion;
+    // Game thread, server monster unit: 1 capped, 0 not capped, -1 the cap
+    // plugin is not deciding (disabled, not armed, not a monster).
+    MonsterCapStateFn monsterCapState;
+};
+static_assert(sizeof(CapDecisionService) == 16);
+static_assert(offsetof(CapDecisionService, monsterCapState) == 8);
+
+constexpr char          CapProviderId[]   = "celestialrayone.summon-resist-cap";
+constexpr char          CapServiceName[]  = "cap-decision";
+constexpr std::uint32_t CapServiceVersion = 1;
+constexpr std::uint64_t CapServiceRetryMs = 5000;
+
+// Game thread only, apart from the two atomics the console reads.
+D2RL::PluginCommunication::ServiceLease<CapDecisionService> CapLease;
+std::uint64_t              CapLastAttempt{};
+std::atomic<bool>          CapAcquired{};
+std::atomic<std::uint32_t> CapLastResult{ 0xFFFFFFFFU };
+std::atomic<bool>          CapWarned{};
+
+// Acquires the service on first use and retries every few seconds while it is
+// missing. Held until unload.
+auto CapService() -> const CapDecisionService* {
+    if (CapLease) return CapLease.Get();
+    const std::uint64_t now = Now();
+    if (CapLastAttempt != 0 && now - CapLastAttempt < CapServiceRetryMs) return nullptr;
+    CapLastAttempt = now;
+    const D2RL::PluginCommunicationService* communication = nullptr;
+    if (Context->QueryService(&communication) != D2RL::ServiceQueryResult::Success
+            || !D2RL::HasPluginCommunicationServiceField(communication, D2RL::PluginCommunicationServiceRequiredSize)) {
+        CapLastResult.store(static_cast<std::uint32_t>(D2RL::PluginCommunication::Result::Unavailable));
+        return nullptr;
     }
-    if (!Config.capUseAlign) return false;
-    const std::uint8_t* record = MonStats(dataContext, classId);
-    return record != nullptr && record[MonStatsAlign] == 1;
+    const auto result = D2RL::PluginCommunication::Acquire(Context, communication, CapProviderId, CapServiceName,
+        CapServiceVersion, static_cast<std::uint32_t>(sizeof(CapDecisionService)), &CapLease);
+    CapLastResult.store(static_cast<std::uint32_t>(result));
+    if (result != D2RL::PluginCommunication::Result::Success || !CapLease || CapLease->monsterCapState == nullptr) {
+        CapLease.Reset();
+        return nullptr;
+    }
+    CapAcquired.store(true);
+    Context->LogInfo("MonsterDisplay: using the Summon Resist Cap cap-decision service.");
+    return CapLease.Get();
+}
+
+// Whether the engine caps this server monster's resistances. Asked only while
+// the cap plugin's gate is live.
+auto CappedBySummonResistCap(void* monster) -> bool {
+    const CapDecisionService* service = CapService();
+    if (service == nullptr) {
+        if (!CapWarned.exchange(true)) {
+            D2RL::LogWarnF(Context,
+                "MonsterDisplay: the Summon Resist Cap gate is live but its cap-decision service is not available "
+                "(result %u; it needs Summon Resist Cap 3.3.0 or later). Allied monsters show uncapped "
+                "resistances until it is.",
+                CapLastResult.load());
+        }
+        return false;
+    }
+    return service->monsterCapState(monster) == 1;
 }
 
 auto ResolveResist(void* game, void* monster, void* attacker, const ElementInfo& element, bool physical,
@@ -1148,17 +1318,31 @@ auto ComputeData(std::uint32_t unitId, std::uint32_t viewerId, std::uintptr_t cl
     data.maxLife = static_cast<std::int32_t>(static_cast<std::uint32_t>(ReadStat(monster, StatMaxLife, 0)) >> 8);
     data.level   = ReadStat(monster, StatLevel, 0);
 
-    const std::uint8_t dataContext = DataContext(monster);
-    const std::int32_t classId     = ClassId(monster, SourceFile, __LINE__);
     const ResistRules  rules       = CurrentRules();
-    const bool         capped      = rules.capLive && IsCappedAlly(dataContext, classId);
-    void*              attacker    = Config.effective ? viewer : nullptr;
+    const bool         capped      = rules.capLive && CappedBySummonResistCap(monster);
+    // An ally (monstats Align 1) cannot be hit by the player, so neither the
+    // player's sunder nor his -enemy resistance applies to it: it shows its
+    // own values in both modes, and so does its immunity line.
+    const std::int32_t      classId = ClassId(monster, SourceFile, __LINE__);
+    const std::uint8_t*     record  = classId >= 0 ? MonStats(DataContext(monster), classId) : nullptr;
+    const bool              ally    = record != nullptr && record[MonStatsAlign] == 1;
+    void*                   hitter  = ally ? nullptr : viewer;
+    void*                   attacker = Config.effective ? hitter : nullptr;
     for (std::size_t e = 0; e < Elements.size(); ++e) {
         const bool physical = e == static_cast<std::size_t>(Element::Physical);
         const std::int32_t value = ResolveResist(game, monster, attacker, Elements[e], physical, rules, capped);
         data.resist[e] = static_cast<std::int16_t>(std::clamp(value, -32000, 32000));
     }
     data.flags = static_cast<std::uint8_t>(1U | (capped ? 2U : 0U) | (attacker != nullptr ? 4U : 0U));
+    // Immunities follow what the hovering player's hits meet, as the stock
+    // line does (it subtracts the local player's sunder), in both modes.
+    for (std::size_t e = 0; e < Elements.size(); ++e) {
+        const bool physical = e == static_cast<std::size_t>(Element::Physical);
+        const std::int32_t value = attacker == hitter
+            ? data.resist[e]
+            : ResolveResist(game, monster, hitter, Elements[e], physical, rules, capped);
+        if (value >= ImmuneValue) data.immune = static_cast<std::uint8_t>(data.immune | (1U << e));
+    }
     ReadAuras(monster, data);
     return true;
 }
@@ -1205,6 +1389,7 @@ void __cdecl HostDrain(const D2RL::PluginContext*, void*) noexcept {
         reply.maxLife   = data.maxLife;
         reply.level     = data.level;
         reply.flags     = data.flags;
+        reply.immune    = data.immune;
         reply.auraCount = data.auraCount;
         for (std::size_t i = 0; i < 6; ++i) reply.resist[i] = data.resist[i];
         for (std::size_t i = 0; i < 4; ++i) {
@@ -1243,6 +1428,7 @@ void __cdecl OnClientMessage(const D2RL::PluginContext*, D2RL::Network::ChannelH
     data.maxLife   = reply.maxLife;
     data.level     = reply.level;
     data.flags     = reply.flags;
+    data.immune    = reply.immune;
     data.auraCount = std::min<std::uint8_t>(reply.auraCount, 4);
     for (std::size_t i = 0; i < 6; ++i) data.resist[i] = reply.resist[i];
     for (std::size_t i = 0; i < 4; ++i) {
@@ -1636,6 +1822,11 @@ void HideOurs(const PanelWidgets& widgets) {
     }
 }
 
+auto HiddenOnMinions(std::uint8_t umod) -> bool {
+    const auto& hidden = Config.minionHiddenAffixes;
+    return std::find(hidden.begin(), hidden.end(), static_cast<std::int32_t>(umod)) != hidden.end();
+}
+
 auto ResistRow(const MonsterData& data) -> std::string {
     std::string  text;
     std::int32_t literalColor = Config.separatorColor;
@@ -1654,6 +1845,50 @@ auto ResistRow(const MonsterData& data) -> std::string {
         }
     }
     return text;
+}
+
+// The immunity row from the server mask, written the way 0CEA50 writes the
+// stock line: Physical, Magic, Fire, Lightning, Cold, Poison, each in its own
+// colour, joined by the stock separator. Empty text when a string is missing,
+// so the caller can fall back.
+struct ImmunityText {
+    const char*  scary;
+    const char*  icon;
+    std::int32_t color;
+    Element      element;
+};
+constexpr std::array<ImmunityText, 6> ImmunityOrder{ {
+    { "strScaryMonDesc5", "PhysicalImmunityIcon",  4, Element::Physical },
+    { "strScaryMonDesc6", "MagicImmunityIcon",     8, Element::Magic },
+    { "strScaryMonDesc1", "FireImmunityIcon",      1, Element::Fire },
+    { "strScaryMonDesc3", "LightningImmunityIcon", 9, Element::Lightning },
+    { "strScaryMonDesc2", "ColdImmunityIcon",      3, Element::Cold },
+    { "strScaryMonDesc4", "PoisonImmunityIcon",    2, Element::Poison },
+} };
+
+auto ImmunityRow(std::uint8_t mask, bool& complete) -> std::string {
+    complete = true;
+    std::string row;
+    if (mask == 0) return row;
+    if (Hover.classId - ImmuneClassFirst >= 0 && Hover.classId - ImmuneClassFirst <= ImmuneClassSpan) return row;
+    const bool icons = IconKeys() != 0;
+    std::string separator;
+    if (SeparatorStyle() != 0) {
+        separator = Colorize(Localized("TargetHealthBarTextSeparator"), 5);
+    } else {
+        separator = Localized("KeyComma") + Localized("space");
+    }
+    for (const ImmunityText& text : ImmunityOrder) {
+        if ((mask & (1U << static_cast<std::uint32_t>(text.element))) == 0) continue;
+        const std::string name = Localized(icons ? text.icon : text.scary);
+        if (name.empty()) {
+            complete = false;
+            return {};
+        }
+        if (!row.empty()) row += separator;
+        row += Colorize(name, text.color);
+    }
+    return row;
 }
 
 void Apply(void* container, const std::uint8_t* payload) {
@@ -1766,7 +2001,21 @@ void Apply(void* container, const std::uint8_t* payload) {
     std::array<std::string, 5> rows{};
     const char* stockLine  = Read<const char*>(payload, PayloadLine);
     const char* immunities = Read<const char*>(payload, PayloadImmunities);
-    const bool  hasAffixes = hovering && Hover.umodCount > 0;
+
+    // The affixes shown: the monster's own list, minus minion_hidden_affixes
+    // on a minion.
+    std::array<std::uint8_t, 10> affixes{};
+    std::size_t affixCount = 0;
+    bool        auraShown  = false;
+    if (hovering) {
+        for (std::size_t i = 0; i < Hover.umodCount; ++i) {
+            const std::uint8_t umod = Hover.umods[i];
+            if (Hover.minion && HiddenOnMinions(umod)) continue;
+            affixes[affixCount++] = umod;
+            if (umod == AuraEnchanted) auraShown = true;
+        }
+    }
+    const bool hasAffixes = affixCount > 0;
 
     std::string& levelType = rows[0];
     if (Config.showLevel && have && data.level > 0) levelType = Config.levelLabel + " " + FormatNumber(data.level);
@@ -1785,12 +2034,12 @@ void Apply(void* container, const std::uint8_t* payload) {
     if (hasAffixes) {
         std::array<std::uint8_t, 10> list{};
         std::size_t count = 0;
-        for (std::size_t i = 0; i < Hover.umodCount; ++i) {
-            if (Config.separateAura && Hover.umods[i] == AuraEnchanted) continue;
-            list[count++] = Hover.umods[i];
+        for (std::size_t i = 0; i < affixCount; ++i) {
+            if (Config.separateAura && affixes[i] == AuraEnchanted) continue;
+            list[count++] = affixes[i];
         }
         if (Config.showAffixes && count > 0) rows[1] = AffixNames(Hover.dataContext, list.data(), Config.affixColor);
-        if (Config.separateAura && Hover.auraEnchanted) {
+        if (Config.separateAura && auraShown) {
             const std::array<std::uint8_t, 2> aura{ AuraEnchanted, 0 };
             std::string line = AffixNames(Hover.dataContext, aura.data(), Config.affixColor);
             if (have && data.auraCount > 0) {
@@ -1806,7 +2055,21 @@ void Apply(void* container, const std::uint8_t* payload) {
     }
     for (std::string& row : rows) row = TrimSpaces(row);
     if (Config.showResists && have && (data.flags & 1U) != 0) rows[3] = ResistRow(data);
-    if (Config.showImmunities && immunities != nullptr) rows[4] = immunities;
+    if (Config.showImmunities) {
+        // From the server mask once it is here. Before that the stock line,
+        // except for allied monsters: they may be capped, and the stock line
+        // knows nothing about the cap.
+        const bool fromServer = have && (data.flags & 1U) != 0;
+        if (fromServer) {
+            bool complete = true;
+            rows[4] = ImmunityRow(data.immune, complete);
+            // A string the localization service does not have: a capped
+            // monster still shows nothing, any other the stock line.
+            if (!complete) rows[4] = (data.flags & 2U) != 0 || immunities == nullptr ? std::string() : std::string(immunities);
+        } else if (!(hovering && Hover.ally) && immunities != nullptr) {
+            rows[4] = immunities;
+        }
+    }
 
     // Stack the rows from LevelType's layout position, skipping empty ones,
     // with row_gap between two shown rows. A row's line images keep their
@@ -1874,8 +2137,10 @@ void CaptureHover(void* unit) {
     Hover.tick        = Now();
     const std::uint8_t* record = Hover.classId >= 0 ? MonStats(Hover.dataContext, Hover.classId) : nullptr;
     Hover.boss   = record != nullptr && (record[MonStatsFlags] & PrimeEvilMask) != 0;
+    Hover.ally   = record != nullptr && record[MonStatsAlign] == 1;
     Hover.undead = IsUndead(unit) != 0;
     Hover.demon  = IsDemon(unit) != 0;
+    Hover.minion = HasMonTypeFlag(unit, MonTypeMinion) && !HasMonTypeFlag(unit, MonTypeBosses);
     const std::uint8_t* umods = GetUMods(unit);
     if (umods != nullptr) {
         for (std::size_t i = 0; i < 9 && umods[i] != 0; ++i) {
@@ -1927,7 +2192,7 @@ constexpr auto W(std::uint64_t rva, const std::uint8_t (&bytes)[N], const char* 
     return { rva, bytes, static_cast<std::uint32_t>(N), name };
 }
 
-const std::array<Witness, 29> Witnesses{
+const std::array<Witness, 33> Witnesses{
     W(BuilderRva, BuilderEntryBytes, "panel data builder"),
     W(PanelUpdateRva, PanelUpdateEntryBytes, "panel update"),
     W(PanelWindowRva, PanelWindowBytes, "panel bar sizing window"),
@@ -1939,6 +2204,7 @@ const std::array<Witness, 29> Witnesses{
     W(SetXRva, SetXBytes, "widget x"),
     W(FindChildRva, FindChildBytes, "child widget lookup"),
     W(GetUModsRva, GetUModsBytes, "monster affix list"),
+    W(MonTypeFlagRva, MonTypeFlagBytes, "monster type flag"),
     W(UModNamesRva, UModNamesBytes, "affix names"),
     W(AllocatorRva, AllocatorBytes, "game allocator"),
     W(UnitTypeRva, UnitTypeBytes, "unit type"),
@@ -1957,6 +2223,9 @@ const std::array<Witness, 29> Witnesses{
     W(SkillByIdRva, SkillByIdBytes, "skill lookup"),
     W(SetHealthValueRva, SetHealthValueBytes, "health bar value"),
     W(ColorizeRva, ColorizeBytes, "text colouring"),
+    W(IconKeysRva, IconKeysBytes, "immunity string set"),
+    W(SeparatorRva, SeparatorBytes, "immunity separator style"),
+    W(ImmuneClassRva, ImmuneClassBytes, "immunity line class exclusion"),
 };
 
 constexpr std::uint8_t LoaderThunkBytes[]{ 0xFF, 0x25 };
@@ -1988,6 +2257,7 @@ void ResolveFunctions() {
     IsUndead      = At<UnitCheckFn>(IsUndeadRva);
     FindChild     = At<FindChildFn>(FindChildRva);
     GetUMods      = At<GetUModsFn>(GetUModsRva);
+    HasMonTypeFlag = At<MonTypeFlagFn>(MonTypeFlagRva);
     UModNames     = At<UModNamesFn>(UModNamesRva);
     GetAllocator  = At<AllocatorFn>(AllocatorRva);
     UnitType      = At<UnitTypeFn>(UnitTypeRva);
@@ -2007,6 +2277,8 @@ void ResolveFunctions() {
     SkillLevel    = At<SkillLevelFn>(SkillLevelRva);
     SetHealthValue = At<SetHealthValueFn>(SetHealthValueRva);
     NativeGetRect = At<GetRectFn>(GetRectRva);
+    IconKeys      = At<UiFlagFn>(IconKeysRva);
+    SeparatorStyle = At<UiFlagFn>(SeparatorRva);
 }
 
 void __cdecl OnGameChanged(const D2RL::PluginContext*, const D2RL::Lifecycle::GameplayEvent*, void*) noexcept {
@@ -2077,11 +2349,20 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
         InactiveReason.empty() ? "" : " (", InactiveReason.empty() ? "" : (InactiveReason + ")").c_str(), ModeName());
     say(line);
     const ResistRules rules = CurrentRules();
+    char decision[96];
+    if (CapAcquired.load()) {
+        std::snprintf(decision, sizeof(decision), "asked from Summon Resist Cap");
+    } else if (CapLastResult.load() == 0xFFFFFFFFU) {
+        std::snprintf(decision, sizeof(decision), "not asked yet");
+    } else {
+        std::snprintf(decision, sizeof(decision), "service unavailable (result %u)", CapLastResult.load());
+    }
     std::snprintf(line, sizeof(line),
-        "Resistances: %s; floor %d; Summon Resist Cap %s (base %d, ceiling %d, physical %d, floor %d).",
+        "Resistances: %s; floor %d; Summon Resist Cap %s (base %d, ceiling %d, physical %d, floor %d), cap "
+        "decision %s.",
         Config.effective ? "effective (your sunder and -enemy resistance applied)" : "monster's own",
         rules.uncappedFloor, rules.capLive ? "live" : "not live", rules.base, rules.ceiling, rules.physicalCap,
-        rules.cappedFloor);
+        rules.cappedFloor, decision);
     say(line);
     std::snprintf(line, sizeof(line),
         "Counters: builder %llu, panel updates %llu, game reads queued %llu (last result %u), run %llu, computed "
@@ -2098,10 +2379,11 @@ auto __cdecl StatusCommand(D2R::Game::Client*, const D2RL::ConsoleCommandContext
         std::uint64_t age  = 0;
         const bool    have = LoadData(Hover.unitId, data, age);
         std::snprintf(line, sizeof(line),
-            "Last hovered: unit %u, monstats row %d, %s%s%s, %zu affixes%s. Data: %s life %d/%d level %d, resist "
+            "Last hovered: unit %u, monstats row %d, %s%s%s%s, %zu affixes%s. Data: %s life %d/%d level %d, resist "
             "fire %d light %d cold %d poison %d magic %d physical %d%s, %u auras.",
             Hover.unitId, Hover.classId, Hover.boss ? "prime evil" : "not a prime evil", Hover.undead ? ", undead" : "",
-            Hover.demon ? ", demon" : "", Hover.umodCount, Hover.auraEnchanted ? " incl. Aura Enchanted" : "",
+            Hover.demon ? ", demon" : "", Hover.minion ? ", minion" : "", Hover.umodCount,
+            Hover.auraEnchanted ? " incl. Aura Enchanted" : "",
             have ? "cached," : "none,", data.life, data.maxLife, data.level, data.resist[0], data.resist[1],
             data.resist[2], data.resist[3], data.resist[4], data.resist[5], (data.flags & 2U) != 0 ? " (capped ally)" : "",
             data.auraCount);
@@ -2184,4 +2466,6 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
     Active.store(false);
+    // Hand the cap-decision service back while the context is still valid.
+    CapLease.Reset();
 }
